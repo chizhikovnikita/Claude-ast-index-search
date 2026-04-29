@@ -1463,6 +1463,99 @@ pub fn collect_build_files_from_db(conn: &Connection, root: &Path) -> Result<Vec
     Ok(files)
 }
 
+/// Locate Forma-style `<name>dependencies = wrapper(...) [+ wrapper(...)]*` blocks in a
+/// Gradle file. Returns the byte ranges (start of the assignment, end of the last
+/// chained wrapper call). Used to scope the unanchored `project(...)` fallback so it
+/// does not match comments, string literals, or unrelated code elsewhere in the file.
+fn find_forma_deps_blocks(content: &str) -> Vec<(usize, usize)> {
+    static START_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?m)\b\w*[Dd]ependencies\s*=\s*\w+\s*\(").unwrap()
+    });
+
+    let bytes = content.as_bytes();
+    let mut blocks = Vec::new();
+
+    for m in START_RE.find_iter(content) {
+        let span_start = m.start();
+        let mut i = m.end();
+        let mut depth = 1usize;
+        while i < bytes.len() && depth > 0 {
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+            if depth == 0 {
+                break;
+            }
+        }
+
+        loop {
+            let ws_end = bytes[i..]
+                .iter()
+                .position(|b| !b.is_ascii_whitespace())
+                .map(|p| i + p)
+                .unwrap_or(bytes.len());
+            if ws_end >= bytes.len() || bytes[ws_end] != b'+' {
+                break;
+            }
+            let mut j = ws_end + 1;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let ident_start = j;
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            if j == ident_start {
+                break;
+            }
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j >= bytes.len() || bytes[j] != b'(' {
+                break;
+            }
+            j += 1;
+            let mut d2 = 1usize;
+            while j < bytes.len() && d2 > 0 {
+                match bytes[j] {
+                    b'(' => d2 += 1,
+                    b')' => d2 -= 1,
+                    _ => {}
+                }
+                j += 1;
+                if d2 == 0 {
+                    break;
+                }
+            }
+            i = j;
+        }
+
+        blocks.push((span_start, i));
+    }
+
+    blocks
+}
+
+/// Strip `//` line comments from a Kotlin/Gradle slice. Naive — does not understand
+/// string literals — but the only consumer is regex capture of a quoted path, where
+/// a `//` inside a string would already be malformed Kotlin.
+fn strip_kt_line_comments(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for (i, line) in s.lines().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        match line.find("//") {
+            Some(idx) => out.push_str(&line[..idx]),
+            None => out.push_str(line),
+        }
+    }
+    out
+}
+
 /// Parse module dependencies from collected build files (Gradle, Maven, ya.make, Python)
 pub fn index_module_dependencies(conn: &mut Connection, root: &Path, gradle_files: &[PathBuf], progress: bool) -> Result<usize> {
 
@@ -1473,12 +1566,21 @@ pub fn index_module_dependencies(conn: &mut Connection, root: &Path, gradle_file
     let projects_dep_re = &*PROJECTS_DEP_RE;
 
     // Gradle project(...) deps: implementation(project(":features:payments:api"))
-    // Also matches custom DSL wrappers like deps(project(":path")) used in Forma-like Gradle DSLs.
-    // See https://github.com/formatools/forma for the Forma DSL.
+    // Matches patterns like: implementation(project(":path")) or deps(project(":path"))
     // Capture group 1 is the configuration/wrapper identifier; the leading `:` on the path is optional.
     static GRADLE_PROJECT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?m)\b(\w+)\s*\(\s*project\s*\(\s*["']:?([^"']+)["']\s*\)"#).unwrap());
 
     let gradle_project_re = &*GRADLE_PROJECT_RE;
+
+    // Fallback: match any project(":path") inside a Forma-style `dependencies = wrapper(...)`
+    // block. The wrapper-anchored regex above only fires once per `wrapper(`, missing 2nd+
+    // project() declarations in a single block. Scoping to the assignment block (via
+    // `find_forma_deps_blocks`) prevents matches in top-level comments, string literals,
+    // or unrelated code that happens to contain `project("...")`.
+    // See https://github.com/formatools/forma for the Forma DSL.
+    static PROJECT_ONLY_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?m)project\s*\(\s*["']:?([^"']+)["']\s*\)"#).unwrap());
+
+    let project_only_re = &*PROJECT_ONLY_RE;
 
     // ya.make PEERDIR(...) — accepts one or more whitespace-separated paths
     static PEERDIR_RE: LazyLock<Regex> = LazyLock::new(||
@@ -1670,12 +1772,16 @@ pub fn index_module_dependencies(conn: &mut Connection, root: &Path, gradle_file
                 }
                 _ => {
                     // Gradle
+                    // Track inserted deps to avoid duplicates from overlapping regex patterns
+                    let mut inserted: std::collections::HashSet<(i64, i64)> = std::collections::HashSet::new();
                     for caps in projects_dep_re.captures_iter(&content) {
                         let dep_kind = caps.get(1).map(|m| m.as_str()).unwrap_or("implementation");
                         let dep_name = caps.get(2).map(|m| m.as_str()).unwrap_or("");
                         if let Some(&dep_id) = module_ids.get(dep_name) {
-                            dep_stmt.execute(rusqlite::params![module_id, dep_id, dep_kind])?;
-                            dep_count += 1;
+                            if inserted.insert((module_id, dep_id)) {
+                                dep_stmt.execute(rusqlite::params![module_id, dep_id, dep_kind])?;
+                                dep_count += 1;
+                            }
                         }
                     }
                     for caps in gradle_project_re.captures_iter(&content) {
@@ -1683,8 +1789,32 @@ pub fn index_module_dependencies(conn: &mut Connection, root: &Path, gradle_file
                         let dep_path = caps.get(2).map(|m| m.as_str()).unwrap_or("");
                         let dep_name = dep_path.trim_start_matches(':').replace(':', ".");
                         if let Some(&dep_id) = module_ids.get(&dep_name) {
-                            dep_stmt.execute(rusqlite::params![module_id, dep_id, dep_kind])?;
-                            dep_count += 1;
+                            if inserted.insert((module_id, dep_id)) {
+                                dep_stmt.execute(rusqlite::params![module_id, dep_id, dep_kind])?;
+                                dep_count += 1;
+                            }
+                        }
+                    }
+                    // Fallback: catch project(":path") not matched by main regex
+                    // (e.g., when other deps are between deps( and project()).
+                    // Scoped to Forma-style `dependencies = wrapper(...) [+ wrapper(...)]*`
+                    // blocks so unrelated `project("...")` text (comments, string literals,
+                    // dead code) cannot inflate the dependency graph.
+                    for (b_start, b_end) in find_forma_deps_blocks(&content) {
+                        let block = strip_kt_line_comments(&content[b_start..b_end]);
+                        for caps in project_only_re.captures_iter(&block) {
+                            let dep_path = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                            let dep_name = dep_path.trim_start_matches(':').replace(':', ".");
+                            if let Some(&dep_id) = module_ids.get(&dep_name) {
+                                if inserted.insert((module_id, dep_id)) {
+                                    // Forma's `dependencies = deps(project(...), ...)` carries
+                                    // no per-dep configuration; default to "implementation".
+                                    // The wrapper-anchored regex runs first and preserves real
+                                    // kinds (api/compileOnly/...) when the source uses them.
+                                    dep_stmt.execute(rusqlite::params![module_id, dep_id, "implementation"])?;
+                                    dep_count += 1;
+                                }
+                            }
                         }
                     }
                 }
@@ -3121,6 +3251,133 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM module_deps", [], |r| r.get(0))
             .unwrap();
         assert_eq!(total_edges, 2, "module_deps row count mismatch — duplicate edge inserted?");
+    }
+
+    #[test]
+    fn test_index_deps_gradle_forma_multi_project_per_block() {
+        // Real-world Forma layout: a single `deps(...)` block declares many `project(...)` entries
+        // separated by other deps and newlines. The wrapper-anchored regex
+        // `\b(\w+)\s*\(\s*project\s*\(` only fires once per `deps(` (on the first project),
+        // so without the project-only fallback the second and third project edges are silently
+        // dropped — manifesting as a huge undercount on `ast-index dependents`.
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        for sub in &[
+            "api/callback",
+            "api/dto-common",
+            "api/third",
+            "feature/payments",
+        ] {
+            fs::create_dir_all(root.join(sub)).unwrap();
+        }
+        fs::write(root.join("api/callback/build.gradle.kts"), "").unwrap();
+        fs::write(root.join("api/dto-common/build.gradle.kts"), "").unwrap();
+        fs::write(root.join("api/third/build.gradle.kts"), "").unwrap();
+
+        fs::write(
+            root.join("feature/payments/build.gradle.kts"),
+            r#"
+            androidLibrary(
+                packageName = "tools.forma.sample.payments",
+                dependencies = deps(
+                    aar(Deps.Files.tapandpay),
+                    aar(Deps.Files.saverification),
+                ) + deps(
+                    Deps.Libraries.rxJava,
+                    Deps.Libraries.rxKotlin,
+                ) + deps(
+                    project(":api:callback"),
+                    project(":api:dto-common"),
+                    project(":api:third"),
+                ),
+            )
+            "#,
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        db::init_db(&conn).unwrap();
+
+        let files = vec![
+            root.join("api/callback/build.gradle.kts"),
+            root.join("api/dto-common/build.gradle.kts"),
+            root.join("api/third/build.gradle.kts"),
+            root.join("feature/payments/build.gradle.kts"),
+        ];
+        index_modules_from_files(&conn, root, &files).unwrap();
+        let dep_count = index_module_dependencies(&mut conn, root, &files, false).unwrap();
+
+        let payments_deps = get_module_deps(&conn, "feature.payments").unwrap();
+        let mut payments_names: Vec<&str> =
+            payments_deps.iter().map(|(n, _, _)| n.as_str()).collect();
+        payments_names.sort();
+        assert_eq!(
+            payments_names,
+            vec!["api.callback", "api.dto-common", "api.third"],
+            "feature.payments: expected all three project() edges, got {:?}",
+            payments_names
+        );
+        assert_eq!(dep_count, 3, "expected dep_count == 3, got {}", dep_count);
+
+        let total_edges: i64 = conn
+            .query_row("SELECT COUNT(*) FROM module_deps", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            total_edges, 3,
+            "module_deps row count mismatch — duplicate or missing edge"
+        );
+    }
+
+    #[test]
+    fn test_index_deps_gradle_project_in_comments_or_strings_is_ignored() {
+        // The unanchored project-only fallback must NOT fire on `project("...")` text
+        // outside a `dependencies = wrapper(...)` block: line comments, string literals,
+        // or unrelated code. Otherwise an indexed module with a matching name produces
+        // a phantom edge that silently inflates `ast-index dependents` output.
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        for sub in &["api/foo", "api/bar", "feature/consumer"] {
+            fs::create_dir_all(root.join(sub)).unwrap();
+        }
+        fs::write(root.join("api/foo/build.gradle.kts"), "").unwrap();
+        fs::write(root.join("api/bar/build.gradle.kts"), "").unwrap();
+
+        // Real dep: api.foo. Decoys: api.bar referenced only in a comment / string.
+        fs::write(
+            root.join("feature/consumer/build.gradle.kts"),
+            r#"
+            // Earlier draft used project(":api:bar") — kept as a note.
+            val sample = "project(\":api:bar\")"
+            androidLibrary(
+                packageName = "tools.forma.sample.consumer",
+                dependencies = deps(
+                    project(":api:foo"),
+                ),
+            )
+            // Trailing TODO: bring back project(":api:bar")
+            "#,
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        db::init_db(&conn).unwrap();
+        let files = vec![
+            root.join("api/foo/build.gradle.kts"),
+            root.join("api/bar/build.gradle.kts"),
+            root.join("feature/consumer/build.gradle.kts"),
+        ];
+        index_modules_from_files(&conn, root, &files).unwrap();
+        let dep_count = index_module_dependencies(&mut conn, root, &files, false).unwrap();
+
+        let consumer_deps = get_module_deps(&conn, "feature.consumer").unwrap();
+        let names: Vec<&str> = consumer_deps.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["api.foo"],
+            "feature.consumer must not pick up api.bar from comments/strings, got {:?}",
+            names
+        );
+        assert_eq!(dep_count, 1, "expected exactly one edge, got {}", dep_count);
     }
 
     #[test]

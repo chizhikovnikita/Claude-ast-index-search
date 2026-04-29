@@ -492,6 +492,9 @@ exclude:
 
 ## Changelog
 
+### 3.40.3
+- **Fix Gradle `project(":path")` undercount in Forma-style `deps(...)` blocks** — the wrapper-anchored regex `\b(\w+)\s*\(\s*project\s*\(` only matched the *first* `project(...)` per `deps(` block, silently dropping the rest. On real Forma projects this masked the majority of internal edges (e.g. `dependents` returning 0 when the truth was hundreds). The fix scopes a project-only fallback to `<name>dependencies = wrapper(...) [+ wrapper(...)]*` assignment blocks (paren-balanced scan + line-comment strip), so phantom edges from `project("...")` in comments, string literals, or unrelated code cannot leak in. A per-file `(module_id, dep_id)` HashSet keeps the wrapper-anchored regex's real `dep_kind` (api/compileOnly/...) when both fire on the same edge. Regression tests cover (1) `deps(externals) + deps(project, project, project)` chains and (2) decoy `project(...)` text inside comments and Kotlin string literals
+
 ### 3.40.2
 - **Fix Windows release build broken by tree-sitter-scss 1.0.0** — the published crate hardcodes `-Wno-unused-parameter` in `build.rs`, which MSVC `cl.exe` rejects with `error D8021: invalid numeric argument`, killing the entire Windows + matrix build (v3.40.0 and v3.40.1 release artifacts never published). Upstream master has the platform-conditional fix from 2024-04-26 but never cut a 1.0.1; pinned via `[patch.crates-io]` to that commit
 - **Bump GitHub Actions to non-deprecated versions** — `actions/checkout@v4 → v6`, `actions/setup-node@v4 → v6`, `actions/upload-artifact@v4 → v7`, `actions/download-artifact@v4 → v7`. Silences Node.js 20 deprecation warnings (Node.js 20 is removed from runners on September 16th, 2026)
