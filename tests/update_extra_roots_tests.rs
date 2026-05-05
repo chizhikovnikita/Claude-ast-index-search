@@ -93,7 +93,7 @@ fn update_preserves_extra_root_files() {
     assert!(has_file(&conn, "pkgs/Lib.swift"));
 
     let (updated, changed, deleted) =
-        indexer::update_directory_incremental(&mut conn, primary, false).unwrap();
+        indexer::update_directory_incremental(&mut conn, primary, false, None, None).unwrap();
 
     assert_eq!(deleted, 0, "update must not delete extra-root files");
     assert_eq!(updated, 0);
@@ -122,7 +122,7 @@ fn update_detects_deleted_extra_root_file() {
     fs::remove_file(&drop_me).unwrap();
 
     let (_, _, deleted) =
-        indexer::update_directory_incremental(&mut conn, primary, false).unwrap();
+        indexer::update_directory_incremental(&mut conn, primary, false, None, None).unwrap();
 
     assert_eq!(deleted, 1);
     assert!(has_file(&conn, "App.swift"));
@@ -149,7 +149,7 @@ fn update_indexes_new_files_in_both_roots() {
     write_file(&extra.join("pkgs/NewLib.swift"), SWIFT_SAMPLE);
 
     let (updated, _, deleted) =
-        indexer::update_directory_incremental(&mut conn, primary, false).unwrap();
+        indexer::update_directory_incremental(&mut conn, primary, false, None, None).unwrap();
 
     assert_eq!(deleted, 0);
     assert_eq!(updated, 2, "both new files should be parsed and stored");
@@ -179,9 +179,58 @@ fn update_skips_missing_extra_root() {
     assert!(!extra.exists());
 
     let (_, _, deleted) =
-        indexer::update_directory_incremental(&mut conn, primary, false).unwrap();
+        indexer::update_directory_incremental(&mut conn, primary, false, None, None).unwrap();
 
     assert_eq!(deleted, 1, "files under the missing extra root should be marked deleted");
     assert!(has_file(&conn, "App.swift"));
     assert!(!has_file(&conn, "Lib.swift"));
+}
+
+/// Regression: previously `cmd_update` ignored `.ast-index.yaml`, so on a
+/// monorepo configured with `include: [adfox, yabs/adfox]` the walker would
+/// crawl the entire root, hang indefinitely, and pull in files from outside
+/// the configured scope (e.g. `crypta/`, `sim/`). Now `update` accepts an
+/// `include` list and only walks those sub-paths.
+#[test]
+fn update_with_include_skips_files_outside_include() {
+    use ast_index::parsers;
+
+    let primary_dir = TempDir::new().unwrap();
+    let primary = primary_dir.path();
+
+    // Pick an extension we definitely parse to keep the walker honest.
+    assert!(parsers::is_supported_extension("rs"));
+
+    write_file(&primary.join("adfox/src/a.rs"),  "fn a() {}\n");
+    write_file(&primary.join("yabs/adfox/b.rs"), "fn b() {}\n");
+    // Files outside the include — must NOT enter the index after update.
+    write_file(&primary.join("crypta/c.rs"),     "fn c() {}\n");
+    write_file(&primary.join("sim/d.rs"),        "fn d() {}\n");
+
+    let mut conn = open_fresh_db(primary);
+
+    // Seed the DB with only the in-scope files, the way `rebuild` with
+    // `include` would have left it.
+    indexer::index_directory_scoped(
+        &mut conn, primary, &primary.join("adfox"), false, false, None, None,
+    ).unwrap();
+    indexer::index_directory_scoped(
+        &mut conn, primary, &primary.join("yabs/adfox"), false, false, None, None,
+    ).unwrap();
+
+    let before = count_files(&conn);
+    assert_eq!(before, 2, "seed: both in-scope files indexed, nothing else");
+    assert!(has_file(&conn, "adfox/src/a.rs"));
+    assert!(has_file(&conn, "yabs/adfox/b.rs"));
+
+    let include = vec!["adfox".to_string(), "yabs/adfox".to_string()];
+
+    let (_updated, _changed, deleted) =
+        indexer::update_directory_incremental(&mut conn, primary, false, Some(&include), None)
+            .unwrap();
+
+    assert_eq!(deleted, 0, "no in-scope files were removed; nothing should be deleted");
+    assert_eq!(count_files(&conn), 2, "update must not pull in crypta/ or sim/");
+    assert!(!has_file(&conn, "crypta/c.rs"), "crypta/ is outside include — must stay out");
+    assert!(!has_file(&conn, "sim/d.rs"),    "sim/ is outside include — must stay out");
 }

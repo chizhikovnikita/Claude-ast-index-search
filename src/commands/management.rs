@@ -574,8 +574,31 @@ pub fn cmd_update(root: &Path, verbose: bool) -> Result<()> {
 
     let mut conn = db::open_db(root)?;
 
+    // Load .ast-index.yaml so update honours the same include/exclude as rebuild.
+    // Without this, update on a project with `include: [adfox, yabs/adfox]` would
+    // walk the entire repo (e.g. all of a monorepo), hang indefinitely, and silently
+    // pull in files outside the configured scope.
+    let config = indexer::load_config(root).unwrap_or_default();
+    let config_include = config.include.as_deref();
+    let exclude_matcher = build_exclude_matcher(root, config.exclude.as_deref());
+
+    if verbose {
+        if let Some(inc) = config_include {
+            eprintln!("[verbose] update include: {:?}", inc);
+        }
+        if let Some(ref exc) = config.exclude {
+            eprintln!("[verbose] update exclude: {} patterns", exc.len());
+        }
+    }
+
     println!("{}", "Checking for changes...".cyan());
-    let (updated, changed, deleted) = indexer::update_directory_incremental(&mut conn, root, true)?;
+    let (updated, changed, deleted) = indexer::update_directory_incremental(
+        &mut conn,
+        root,
+        true,
+        config_include,
+        exclude_matcher.as_ref(),
+    )?;
 
     if updated == 0 && deleted == 0 {
         println!("{}", "Index is up to date.".green());

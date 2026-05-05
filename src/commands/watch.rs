@@ -147,8 +147,30 @@ pub fn cmd_watch(root: &Path) -> Result<()> {
 
 fn update_index(root: &Path) -> Result<(usize, usize)> {
     let mut conn = db::open_db(root)?;
-    let (updated, changed, deleted) =
-        indexer::update_directory_incremental(&mut conn, root, false)?;
+
+    // Honour .ast-index.yaml so watch stays scoped to the same paths as rebuild/update.
+    let config = indexer::load_config(root).unwrap_or_default();
+    let config_include = config.include.as_deref();
+    let exclude_matcher: Option<ignore::gitignore::Gitignore> = config
+        .exclude
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .map(|patterns| {
+            let mut gb = ignore::gitignore::GitignoreBuilder::new(root);
+            for p in patterns {
+                gb.add_line(None, p).ok();
+            }
+            gb.build().ok()
+        })
+        .flatten();
+
+    let (updated, changed, deleted) = indexer::update_directory_incremental(
+        &mut conn,
+        root,
+        false,
+        config_include,
+        exclude_matcher.as_ref(),
+    )?;
     let _ = changed; // suppress unused
     Ok((updated, deleted))
 }

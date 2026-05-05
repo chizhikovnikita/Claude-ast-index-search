@@ -980,7 +980,22 @@ fn write_batch_to_db(conn: &mut Connection, batch: Vec<ParsedFile>, total_count:
 /// `rebuild` indexed them), so reconciliation against the DB works correctly
 /// for extra_roots — without this, extra-root files were seen as "missing"
 /// during the primary walk and deleted on every `update`.
-pub fn update_directory_incremental(conn: &mut Connection, root: &Path, progress: bool) -> Result<(usize, usize, usize)> {
+///
+/// `include` — optional allow-list (as in `.ast-index.yaml`). When set, the
+/// primary root is replaced with the listed sub-paths; everything else under
+/// `root` is skipped. Paths in the DB stay relative to the outer `root` so
+/// they match what `rebuild` wrote. extra_roots are walked unconditionally.
+///
+/// `exclude_matcher` — optional gitignore-style matcher applied to every
+/// walked entry, mirroring the rebuild path so update doesn't re-index dirs
+/// that rebuild deliberately skipped.
+pub fn update_directory_incremental(
+    conn: &mut Connection,
+    root: &Path,
+    progress: bool,
+    include: Option<&[String]>,
+    exclude_matcher: Option<&ignore::gitignore::Gitignore>,
+) -> Result<(usize, usize, usize)> {
     use ignore::WalkBuilder;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1002,35 +1017,63 @@ pub fn update_directory_incremental(conn: &mut Connection, root: &Path, progress
         eprintln!("Loaded {} files from index", existing_files.len());
     }
 
-    // 2. Build the list of roots to walk: primary + any extra_roots from the
-    //    DB metadata. Extra roots that no longer exist on disk are skipped so
-    //    their prior entries are treated as deleted.
-    let mut roots: Vec<PathBuf> = vec![root.to_path_buf()];
+    // 2. Build the list of (walk_dir, path_anchor) pairs. `path_anchor` is the
+    //    base used for `strip_prefix` when computing rel_path — keeping it equal
+    //    to the outer root for include sub-paths means the DB stays consistent
+    //    with what `rebuild` wrote (paths are relative to the project root, not
+    //    the sub-include). extra_roots are anchored to themselves.
+    let mut walk_specs: Vec<(PathBuf, PathBuf)> = Vec::new();
+    match include {
+        Some(inc) if !inc.is_empty() => {
+            for entry in inc {
+                let walk_dir = root.join(entry);
+                if walk_dir.is_dir() {
+                    walk_specs.push((walk_dir, root.to_path_buf()));
+                } else if progress {
+                    eprintln!("Skipping missing include path: {}", walk_dir.display());
+                }
+            }
+        }
+        _ => {
+            walk_specs.push((root.to_path_buf(), root.to_path_buf()));
+        }
+    }
     if let Ok(extra) = db::get_extra_roots(conn) {
         for e in extra {
             let p = PathBuf::from(&e);
             if p.exists() {
-                roots.push(p);
+                walk_specs.push((p.clone(), p));
             } else if progress {
                 eprintln!("Skipping missing extra root: {}", e);
             }
         }
     }
 
-    // 3. Walk each root and categorize its files. Paths are relative to the
-    //    root they were discovered under, matching `index_directory_with_config`'s
-    //    storage scheme used during rebuild.
-    let mut files_to_parse: Vec<(PathBuf, PathBuf)> = Vec::new(); // (root, file_path)
+    // 3. Walk each (walk_dir, anchor) pair and categorize its files. Paths are
+    //    stored relative to `anchor`, matching `index_directory_scoped`'s scheme.
+    let mut files_to_parse: Vec<(PathBuf, PathBuf)> = Vec::new(); // (anchor, file_path)
     let mut current_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for walk_root in &roots {
-        let is_git = has_git_repo(walk_root);
-        let arc_root = find_arc_root(walk_root);
-        let mut builder = WalkBuilder::new(walk_root);
+    for (walk_dir, anchor) in &walk_specs {
+        let is_git = has_git_repo(walk_dir) || has_git_repo(anchor);
+        let arc_root = find_arc_root(walk_dir).or_else(|| find_arc_root(anchor));
+        let mut builder = WalkBuilder::new(walk_dir);
+        let exclude_matcher_owned = exclude_matcher.cloned();
         builder
             .hidden(true)
             .git_ignore(is_git)
-            .filter_entry(|entry| !is_excluded_dir(entry));
+            .filter_entry(move |entry| {
+                if is_excluded_dir(entry) {
+                    return false;
+                }
+                if let Some(ref m) = exclude_matcher_owned {
+                    let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+                    if m.matched(entry.path(), is_dir).is_ignore() {
+                        return false;
+                    }
+                }
+                true
+            });
         if let Some(ref arc) = arc_root {
             builder.add_custom_ignore_filename(".gitignore");
             builder.add_custom_ignore_filename(".arcignore");
@@ -1054,7 +1097,7 @@ pub fn update_directory_incremental(conn: &mut Connection, root: &Path, progress
 
             let file_path = entry.path().to_path_buf();
             let rel_path = file_path
-                .strip_prefix(walk_root)
+                .strip_prefix(anchor)
                 .unwrap_or(&file_path)
                 .to_string_lossy()
                 .to_string();
@@ -1072,7 +1115,7 @@ pub fn update_directory_incremental(conn: &mut Connection, root: &Path, progress
             };
 
             if need_parse {
-                files_to_parse.push((walk_root.clone(), file_path));
+                files_to_parse.push((anchor.clone(), file_path));
             }
             current_paths.insert(rel_path);
         }
@@ -1106,22 +1149,38 @@ pub fn update_directory_incremental(conn: &mut Connection, root: &Path, progress
     }
 
     // 6. Parse and update changed/new files
+    //    Thread count: AST_INDEX_THREADS env > 32 (high default — update on
+    //    monorepos benefits from higher parallelism than the cautious rebuild
+    //    default; per-file parsing is CPU-bound and the I/O is mostly cached
+    //    after the walker has already touched the inodes).
     let updated_count = if !files_to_parse.is_empty() {
         let total_files = files_to_parse.len();
         let parsed_count = Arc::new(AtomicUsize::new(0));
         let parsed_count_clone = parsed_count.clone();
 
-        let parsed_files: Vec<ParsedFile> = files_to_parse
-            .par_iter()
-            .filter_map(|(file_root, path)| {
-                let result = parse_file(file_root, path).ok();
-                let c = parsed_count_clone.fetch_add(1, Ordering::Relaxed) + 1;
-                if progress && c % 500 == 0 {
-                    eprintln!("Parsed {} / {} changed files...", c, total_files);
-                }
-                result
-            })
-            .collect();
+        let num_threads = std::env::var("AST_INDEX_THREADS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(32);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .build()
+            .map_err(|e| anyhow::anyhow!("Failed to build thread pool: {}", e))?;
+
+        let parsed_files: Vec<ParsedFile> = pool.install(|| {
+            files_to_parse
+                .par_iter()
+                .filter_map(|(file_root, path)| {
+                    let result = parse_file(file_root, path).ok();
+                    let c = parsed_count_clone.fetch_add(1, Ordering::Relaxed) + 1;
+                    if progress && c % 500 == 0 {
+                        eprintln!("Parsed {} / {} changed files...", c, total_files);
+                    }
+                    result
+                })
+                .collect()
+        });
 
         let count = parsed_files.len();
         let mut dummy_total = 0;
