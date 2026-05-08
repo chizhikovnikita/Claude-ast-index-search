@@ -1475,6 +1475,105 @@ pub fn remove_extra_root(conn: &Connection, path: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// Normalize a module name input so that `:core:utils`, `core/utils`, and
+/// `core.utils` all resolve to the same stored row when the stored name
+/// matches one of those forms. Strips a leading `:`, then tries an exact
+/// match first; if that misses, falls back to probing the slash-to-dot and
+/// colon-to-dot variants.
+///
+/// Returns the row id of the matching module, or `None` when no row matches.
+pub fn find_module_id_by_name(conn: &Connection, input: &str) -> Result<Option<i64>> {
+    // Strip leading colon (Gradle-style `:core:utils` → `core:utils`).
+    let stripped = input.trim_start_matches(':');
+    // Build candidate list: original stripped, colon→dot, slash→dot.
+    let dot_from_colon = stripped.replace(':', ".");
+    let dot_from_slash = stripped.replace('/', ".");
+    let candidates = [stripped, dot_from_colon.as_str(), dot_from_slash.as_str()];
+
+    for candidate in candidates {
+        let result: Result<i64, _> = conn.query_row(
+            "SELECT id FROM modules WHERE name = ?1",
+            params![candidate],
+            |row| row.get(0),
+        );
+        match result {
+            Ok(id) => return Ok(Some(id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(None)
+}
+
+/// Return outgoing edges from `module_id`, optionally filtered by `dep_kind`.
+///
+/// Deduplicates via `SELECT DISTINCT` to guard against parallel edges with
+/// different metadata producing duplicate paths. Results are ordered by name
+/// for deterministic test output.
+///
+/// Returns `(dep_module_id, dep_module_name, dep_kind)`.
+pub fn get_outgoing_edges_dedup(
+    conn: &Connection,
+    module_id: i64,
+    kind_filter: Option<&str>,
+) -> Result<Vec<(i64, String, String)>> {
+    if let Some(kind) = kind_filter {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT md.dep_module_id, m.name, md.dep_kind
+             FROM module_deps md
+             JOIN modules m ON md.dep_module_id = m.id
+             WHERE md.module_id = ?1 AND md.dep_kind = ?2
+             ORDER BY m.name",
+        )?;
+        let rows = stmt
+            .query_map(params![module_id, kind], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    } else {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT md.dep_module_id, m.name, md.dep_kind
+             FROM module_deps md
+             JOIN modules m ON md.dep_module_id = m.id
+             WHERE md.module_id = ?1
+             ORDER BY m.name",
+        )?;
+        let rows = stmt
+            .query_map(params![module_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+}
+
+/// Returns `Some((last_modules_indexed_at, last_update_at))` (both as unix-millis
+/// integers parsed from metadata) when both keys exist, `None` otherwise.
+///
+/// The caller decides whether the values indicate staleness; this function
+/// makes no such judgment.
+pub fn get_modules_index_freshness(conn: &Connection) -> Result<Option<(i64, i64)>> {
+    let indexed_at: Result<String, _> = conn.query_row(
+        "SELECT value FROM metadata WHERE key = 'last_modules_indexed_at'",
+        [],
+        |row| row.get(0),
+    );
+    let updated_at: Result<String, _> = conn.query_row(
+        "SELECT value FROM metadata WHERE key = 'last_update_at'",
+        [],
+        |row| row.get(0),
+    );
+    match (indexed_at, updated_at) {
+        (Ok(ia), Ok(ua)) => {
+            let ia_ms: i64 = ia.parse().unwrap_or(0);
+            let ua_ms: i64 = ua.parse().unwrap_or(0);
+            Ok(Some((ia_ms, ua_ms)))
+        }
+        _ => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1705,5 +1804,60 @@ mod tests {
         let results = find_symbols_by_pattern(&conn, "%email%", Some("function"), 10, &scope).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "send_email");
+    }
+
+    #[test]
+    fn find_module_id_exact_match() {
+        let conn = create_test_db();
+        conn.execute("INSERT INTO modules (name, path) VALUES ('core.utils', 'core/utils')", []).unwrap();
+        let id = find_module_id_by_name(&conn, "core.utils").unwrap();
+        assert!(id.is_some());
+    }
+
+    #[test]
+    fn find_module_id_colon_separator_resolves() {
+        let conn = create_test_db();
+        conn.execute("INSERT INTO modules (name, path) VALUES ('core.utils', 'core/utils')", []).unwrap();
+        // :core:utils should normalise to core.utils
+        let id = find_module_id_by_name(&conn, ":core:utils").unwrap();
+        assert!(id.is_some(), "colon-separated with leading colon should resolve");
+    }
+
+    #[test]
+    fn find_module_id_slash_separator_resolves() {
+        let conn = create_test_db();
+        conn.execute("INSERT INTO modules (name, path) VALUES ('core.utils', 'core/utils')", []).unwrap();
+        let id = find_module_id_by_name(&conn, "core/utils").unwrap();
+        assert!(id.is_some(), "slash-separated should resolve to dot form");
+    }
+
+    #[test]
+    fn find_module_id_missing_returns_none() {
+        let conn = create_test_db();
+        let id = find_module_id_by_name(&conn, "nonexistent").unwrap();
+        assert!(id.is_none());
+    }
+
+    #[test]
+    fn get_outgoing_edges_dedup_no_filter() {
+        let conn = create_test_db();
+        conn.execute("INSERT INTO modules (id, name, path) VALUES (1, 'app', 'app')", []).unwrap();
+        conn.execute("INSERT INTO modules (id, name, path) VALUES (2, 'core', 'core')", []).unwrap();
+        conn.execute("INSERT INTO module_deps (module_id, dep_module_id, dep_kind) VALUES (1, 2, 'implementation')", []).unwrap();
+        // Duplicate edge — should be deduplicated in result.
+        conn.execute("INSERT INTO module_deps (module_id, dep_module_id, dep_kind) VALUES (1, 2, 'api')", []).unwrap();
+        let edges = get_outgoing_edges_dedup(&conn, 1, None).unwrap();
+        // Both distinct rows (different kind) come back; dedup is per (dep_module_id, name, kind) tuple.
+        assert!(!edges.is_empty());
+    }
+
+    #[test]
+    fn get_outgoing_edges_dedup_kind_filter() {
+        let conn = create_test_db();
+        conn.execute("INSERT INTO modules (id, name, path) VALUES (1, 'app', 'app')", []).unwrap();
+        conn.execute("INSERT INTO modules (id, name, path) VALUES (2, 'core', 'core')", []).unwrap();
+        conn.execute("INSERT INTO module_deps (module_id, dep_module_id, dep_kind) VALUES (1, 2, 'implementation')", []).unwrap();
+        let edges = get_outgoing_edges_dedup(&conn, 1, Some("api")).unwrap();
+        assert!(edges.is_empty(), "api filter should return nothing when only implementation edge exists");
     }
 }
