@@ -1548,6 +1548,44 @@ pub fn get_outgoing_edges_dedup(
     }
 }
 
+/// Return incoming edges to `module_id` — i.e. modules that depend ON it.
+/// Used by reverse-BFS pruning in `module-route --all`.
+pub fn get_incoming_edges_dedup(
+    conn: &Connection,
+    module_id: i64,
+    kind_filter: Option<&str>,
+) -> Result<Vec<(i64, String, String)>> {
+    if let Some(kind) = kind_filter {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT md.module_id, m.name, md.dep_kind
+             FROM module_deps md
+             JOIN modules m ON md.module_id = m.id
+             WHERE md.dep_module_id = ?1 AND md.dep_kind = ?2
+             ORDER BY m.name",
+        )?;
+        let rows = stmt
+            .query_map(params![module_id, kind], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    } else {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT md.module_id, m.name, md.dep_kind
+             FROM module_deps md
+             JOIN modules m ON md.module_id = m.id
+             WHERE md.dep_module_id = ?1
+             ORDER BY m.name",
+        )?;
+        let rows = stmt
+            .query_map(params![module_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+}
+
 /// Returns `Some((last_modules_indexed_at, last_update_at))` (both as unix-millis
 /// integers parsed from metadata) when both keys exist, `None` otherwise.
 ///

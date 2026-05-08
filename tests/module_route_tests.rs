@@ -203,32 +203,30 @@ fn heavy_fanout_all_with_direct_edge() {
     // search_stats must be populated for --all mode.
     let stats = &v["search_stats"];
     assert!(stats.is_object(), "search_stats must be present for --all; got: {}", stdout);
-    assert!(stats["nodes_visited"].as_u64().unwrap_or(0) >= 1);
+    // edges_explored must include the direct edge. nodes_visited may be 0
+    // because reverse-BFS pruning lets us record the direct hit without
+    // ever pushing a child frame.
     assert!(stats["edges_explored"].as_u64().unwrap_or(0) >= 1);
 }
 
-/// REPRO 4: target unreachable in dense subgraph + tight timeout. Expect
-/// truncated_timeout reason with suggested_timeout_ms hint.
+/// REPRO 4: completely unreachable target — reverse-BFS pruning detects
+/// this instantly without consuming the timeout, so the message is
+/// "unreachable", not "truncated_timeout".
 #[test]
-fn timeout_surfaces_suggested_timeout() {
+fn unreachable_pruning_avoids_timeout() {
     let dir = TempDir::new().unwrap();
     let conn = open_fresh_db(dir.path());
 
-    // Disconnected target so DFS exhausts everything without finding paths.
     let app = insert_module(&conn, "app", "app");
-    let target = insert_module(&conn, "isolated.target", "tgt");
-    let _ = target;
-    // Build deep cycle-free fanout to keep DFS busy.
+    let _ = insert_module(&conn, "isolated.target", "tgt");
+    // Big disconnected fanout: DFS without pruning would burn timeout, but
+    // reverse-BFS sees target has no incoming edges and returns immediately.
     for i in 0..15 {
         let c = insert_module(&conn, &format!("c{:02}", i), &format!("c{}", i));
         insert_dep(&conn, app, c, "implementation");
         for j in 0..15 {
             let g = insert_module(&conn, &format!("g{:02}_{:02}", i, j), &format!("g{}_{}", i, j));
             insert_dep(&conn, c, g, "implementation");
-            for k in 0..10 {
-                let h = insert_module(&conn, &format!("h{:02}_{:02}_{:02}", i, j, k), &format!("h{}_{}_{}", i, j, k));
-                insert_dep(&conn, g, h, "implementation");
-            }
         }
     }
     drop(conn);
@@ -242,7 +240,7 @@ fn timeout_surfaces_suggested_timeout() {
             "--from", "app",
             "--to", "isolated.target",
             "--all",
-            "--timeout-ms", "1",
+            "--timeout-ms", "5000",
         ])
         .output()
         .unwrap();
@@ -250,12 +248,59 @@ fn timeout_surfaces_suggested_timeout() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     let empty_reason = v["empty_reason"].as_str().unwrap_or("");
-    assert_eq!(empty_reason, "truncated_timeout", "got: {}", stdout);
+    assert_eq!(empty_reason, "unreachable", "pruning must short-circuit; got: {}", stdout);
+}
 
-    let stats = &v["search_stats"];
-    let suggested = stats["suggested_timeout_ms"].as_u64();
-    assert!(suggested.is_some(), "suggested_timeout_ms must be present on timeout; got: {}", stdout);
-    assert!(suggested.unwrap() > 1, "suggestion must exceed current timeout; got: {}", stdout);
+/// REPRO 5: large connected DAG with many simple paths from app→target —
+/// max_paths cap is exercised, and pruning still keeps DFS bounded.
+#[test]
+fn many_paths_hits_max_paths_cap() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+
+    // Diamond layered graph: app → l0_{0..4} → l1_{0..4} → ... → target.
+    // Number of simple paths = 5^layers, easily exceeds max_paths=5.
+    let app = insert_module(&conn, "app", "app");
+    let target = insert_module(&conn, "target", "target");
+    let mut prev_layer: Vec<i64> = vec![app];
+    for layer in 0..3 {
+        let mut cur: Vec<i64> = Vec::new();
+        for i in 0..5 {
+            let n = insert_module(&conn, &format!("L{}_{:02}", layer, i), &format!("L{}_{}", layer, i));
+            cur.push(n);
+        }
+        for &p in &prev_layer {
+            for &c in &cur {
+                insert_dep(&conn, p, c, "implementation");
+            }
+        }
+        prev_layer = cur;
+    }
+    for &p in &prev_layer {
+        insert_dep(&conn, p, target, "implementation");
+    }
+    drop(conn);
+
+    let bin = env!("CARGO_BIN_EXE_ast-index");
+    let out = std::process::Command::new(bin)
+        .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
+        .args([
+            "--format", "json",
+            "module-route",
+            "--from", "app",
+            "--to", "target",
+            "--all",
+            "--max-paths", "5",
+        ])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let paths = v["paths"].as_array().unwrap();
+    assert_eq!(paths.len(), 5, "must cap at max_paths=5; got: {}", stdout);
+    assert_eq!(v["truncated"].as_bool(), Some(true));
+    assert_eq!(v["truncation_reason"].as_str(), Some("max_paths"));
 }
 
 /// 3. Cycle A→B→A and A→C→D: query A→D must not hang or panic.
