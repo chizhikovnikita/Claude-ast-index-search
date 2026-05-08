@@ -82,6 +82,182 @@ fn unreachable_returns_empty_with_reason() {
         .expect("unreachable should return Ok");
 }
 
+/// REPRO: direct edge A→B with --all should return exactly 1 path (1 hop).
+#[test]
+fn direct_edge_all_returns_one_path() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+
+    let a = insert_module(&conn, "app", "app");
+    let b = insert_module(&conn, "libx", "libx");
+    insert_dep(&conn, a, b, "implementation");
+    drop(conn);
+
+    let bin = env!("CARGO_BIN_EXE_ast-index");
+    let out = std::process::Command::new(bin)
+        .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
+        .args([
+            "--format", "json",
+            "module-route",
+            "--from", "app",
+            "--to", "libx",
+            "--all",
+        ])
+        .output()
+        .expect("binary invocation must succeed");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout must be JSON: {e}; stdout={stdout}"));
+
+    let paths = v["paths"].as_array().expect("paths must be array");
+    assert_eq!(paths.len(), 1, "direct edge --all must yield 1 path; got: {}", stdout);
+    assert_eq!(paths[0]["length"].as_u64().unwrap(), 1);
+}
+
+/// REPRO 2: real-world shape — direct edge AND indirect via intermediate, --all.
+#[test]
+fn direct_plus_indirect_all() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+
+    // Use Gradle colon → dot normalised names matching real-world DB.
+    let app = insert_module(&conn, "app", "app");
+    let target = insert_module(&conn, "sdk.clips-viewer.shared.clips-design", "target");
+    let mid = insert_module(&conn, "feature.foo", "mid");
+    insert_dep(&conn, app, target, "implementation");
+    insert_dep(&conn, app, mid, "implementation");
+    insert_dep(&conn, mid, target, "implementation");
+    drop(conn);
+
+    let bin = env!("CARGO_BIN_EXE_ast-index");
+    let out = std::process::Command::new(bin)
+        .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
+        .args([
+            "--format", "json",
+            "module-route",
+            "--from", ":app",
+            "--to", ":sdk:clips-viewer:shared:clips-design",
+            "--all",
+        ])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("must be JSON: {e}; stdout={stdout}"));
+    let paths = v["paths"].as_array().expect("paths must be array");
+    assert_eq!(paths.len(), 2, "direct + indirect --all must yield 2 paths; got: {}", stdout);
+}
+
+/// REPRO 3: heavy fanout where DFS may exhaust timeout before finding direct edge.
+/// Build :app with many children; one direct edge to target; many decoy subtrees.
+#[test]
+fn heavy_fanout_all_with_direct_edge() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+
+    let app = insert_module(&conn, "app", "app");
+    // Target name sorts late alphabetically so DFS reaches it last.
+    let target = insert_module(&conn, "zzz.target", "target");
+    insert_dep(&conn, app, target, "implementation");
+
+    // Many decoy children with their own subtrees.
+    for i in 0..30 {
+        let child = insert_module(&conn, &format!("child{:02}", i), &format!("c{}", i));
+        insert_dep(&conn, app, child, "implementation");
+        for j in 0..20 {
+            let gc = insert_module(&conn, &format!("g{:02}_{:02}", i, j), &format!("g{}_{}", i, j));
+            insert_dep(&conn, child, gc, "implementation");
+            for k in 0..5 {
+                let ggc = insert_module(&conn, &format!("h{:02}_{:02}_{:02}", i, j, k), &format!("h{}_{}_{}", i, j, k));
+                insert_dep(&conn, gc, ggc, "implementation");
+            }
+        }
+    }
+    drop(conn);
+
+    let bin = env!("CARGO_BIN_EXE_ast-index");
+    let out = std::process::Command::new(bin)
+        .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
+        .args([
+            "--format", "json",
+            "module-route",
+            "--from", "app",
+            "--to", "zzz.target",
+            "--all",
+            "--timeout-ms", "100", // tight timeout to force the bug
+        ])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    eprintln!("REPRO output: {}", stdout);
+    let paths = v["paths"].as_array().unwrap();
+    // After fix: direct-target edge is processed first, so we always find the
+    // 1-hop path even with a tight timeout.
+    assert!(!paths.is_empty(), "must record direct edge before exploring siblings; got: {}", stdout);
+    assert_eq!(paths[0]["length"].as_u64().unwrap(), 1);
+
+    // search_stats must be populated for --all mode.
+    let stats = &v["search_stats"];
+    assert!(stats.is_object(), "search_stats must be present for --all; got: {}", stdout);
+    assert!(stats["nodes_visited"].as_u64().unwrap_or(0) >= 1);
+    assert!(stats["edges_explored"].as_u64().unwrap_or(0) >= 1);
+}
+
+/// REPRO 4: target unreachable in dense subgraph + tight timeout. Expect
+/// truncated_timeout reason with suggested_timeout_ms hint.
+#[test]
+fn timeout_surfaces_suggested_timeout() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+
+    // Disconnected target so DFS exhausts everything without finding paths.
+    let app = insert_module(&conn, "app", "app");
+    let target = insert_module(&conn, "isolated.target", "tgt");
+    let _ = target;
+    // Build deep cycle-free fanout to keep DFS busy.
+    for i in 0..15 {
+        let c = insert_module(&conn, &format!("c{:02}", i), &format!("c{}", i));
+        insert_dep(&conn, app, c, "implementation");
+        for j in 0..15 {
+            let g = insert_module(&conn, &format!("g{:02}_{:02}", i, j), &format!("g{}_{}", i, j));
+            insert_dep(&conn, c, g, "implementation");
+            for k in 0..10 {
+                let h = insert_module(&conn, &format!("h{:02}_{:02}_{:02}", i, j, k), &format!("h{}_{}_{}", i, j, k));
+                insert_dep(&conn, g, h, "implementation");
+            }
+        }
+    }
+    drop(conn);
+
+    let bin = env!("CARGO_BIN_EXE_ast-index");
+    let out = std::process::Command::new(bin)
+        .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
+        .args([
+            "--format", "json",
+            "module-route",
+            "--from", "app",
+            "--to", "isolated.target",
+            "--all",
+            "--timeout-ms", "1",
+        ])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let empty_reason = v["empty_reason"].as_str().unwrap_or("");
+    assert_eq!(empty_reason, "truncated_timeout", "got: {}", stdout);
+
+    let stats = &v["search_stats"];
+    let suggested = stats["suggested_timeout_ms"].as_u64();
+    assert!(suggested.is_some(), "suggested_timeout_ms must be present on timeout; got: {}", stdout);
+    assert!(suggested.unwrap() > 1, "suggestion must exceed current timeout; got: {}", stdout);
+}
+
 /// 3. Cycle A→B→A and A→C→D: query A→D must not hang or panic.
 ///    `--all` mode with cycle: should find exactly [A→C→D].
 #[test]

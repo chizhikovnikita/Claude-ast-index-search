@@ -419,7 +419,7 @@ enum Commands {
         #[arg(long, default_value = "20")]
         max_depth: usize,
         /// Wall-clock guard for path search (milliseconds)
-        #[arg(long, default_value = "2000")]
+        #[arg(long, default_value = "5000")]
         timeout_ms: u64,
         /// Restrict traversal to a given dep kind ("api", "implementation", "all")
         #[arg(long, default_value = "all")]

@@ -605,6 +605,19 @@ struct ModuleRouteResult {
     empty_reason: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<String>,
+    /// Search progress when DFS was used. Surfaces via JSON for tooling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    search_stats: Option<SearchStats>,
+}
+
+#[derive(Debug, serde::Serialize, Clone)]
+struct SearchStats {
+    nodes_visited: usize,
+    edges_explored: usize,
+    elapsed_ms: u64,
+    max_depth_reached: usize,
+    timeout_ms: u64,
+    suggested_timeout_ms: Option<u64>,
 }
 
 fn render_json(result: &ModuleRouteResult) -> Result<()> {
@@ -622,6 +635,30 @@ fn render_text(result: &ModuleRouteResult) {
                 result.from, result.to
             ),
             "self" => format!("'{}' depends on itself (trivial path).", result.from),
+            "truncated_timeout" => {
+                let progress = result
+                    .search_stats
+                    .as_ref()
+                    .map(|s| {
+                        let suggested = s
+                            .suggested_timeout_ms
+                            .map(|ms| format!(" Try --timeout-ms {}.", ms))
+                            .unwrap_or_default();
+                        format!(
+                            " Explored {} edges across {} nodes (max depth {}) in {} ms before timeout ({} ms).{}",
+                            s.edges_explored, s.nodes_visited, s.max_depth_reached, s.elapsed_ms, s.timeout_ms, suggested
+                        )
+                    })
+                    .unwrap_or_default();
+                format!(
+                    "Search from '{}' to '{}' timed out before finding any paths.{}",
+                    result.from, result.to, progress
+                )
+            }
+            "truncated_max_paths" => format!(
+                "Hit max-paths limit before recording any complete path from '{}' to '{}'. Try --max-paths <larger> or --max-depth <smaller>.",
+                result.from, result.to
+            ),
             _ => format!("No path found (reason: {}).", reason),
         };
         println!("{}", hint.yellow());
@@ -663,7 +700,21 @@ fn render_text(result: &ModuleRouteResult) {
 
     if result.truncated {
         let reason = result.truncation_reason.as_deref().unwrap_or("limit");
-        println!("\n  {} (truncated: {})", "…".dimmed(), reason);
+        let detail = result
+            .search_stats
+            .as_ref()
+            .map(|s| {
+                let suggested = s
+                    .suggested_timeout_ms
+                    .map(|ms| format!(", try --timeout-ms {}", ms))
+                    .unwrap_or_default();
+                format!(
+                    " — explored {} edges, {} nodes, max depth {} in {} ms{}",
+                    s.edges_explored, s.nodes_visited, s.max_depth_reached, s.elapsed_ms, suggested
+                )
+            })
+            .unwrap_or_default();
+        println!("\n  {} (truncated: {}{})", "…".dimmed(), reason, detail);
     }
 
     for w in &result.warnings {
@@ -875,6 +926,16 @@ struct DfsFrame {
     edge_idx: usize,
 }
 
+/// Statistics from a DFS traversal — used to give actionable hints when
+/// the search hits a wall-clock or path-count cap.
+#[derive(Debug, Clone, Default)]
+pub struct DfsStats {
+    pub nodes_visited: usize,
+    pub edges_explored: usize,
+    pub elapsed_ms: u64,
+    pub max_depth_reached: usize,
+}
+
 /// DFS collecting all simple paths from `from_id` to `to_id`.
 fn dfs_all_paths(
     conn: &Connection,
@@ -885,10 +946,11 @@ fn dfs_all_paths(
     max_paths: usize,
     deadline: Instant,
     timeout_ms: u64,
-) -> Result<(Vec<RoutePath>, bool, Option<String>)> {
+) -> Result<(Vec<RoutePath>, bool, Option<String>, DfsStats)> {
     let mut results: Vec<RoutePath> = Vec::new();
     let mut truncated = false;
     let mut truncation_reason: Option<String> = None;
+    let mut stats = DfsStats::default();
 
     // Stack of frames; each frame owns its remaining edge list.
     let mut stack: Vec<DfsFrame> = Vec::new();
@@ -906,10 +968,15 @@ fn dfs_all_paths(
     names.insert(from_id, from_name.clone());
 
     // Push the root frame.
-    let root_edges = db::get_outgoing_edges_dedup(conn, from_id, kind_filter)?;
+    let mut root_edges = db::get_outgoing_edges_dedup(conn, from_id, kind_filter)?;
     for (id, name, _) in &root_edges {
         names.insert(*id, name.clone());
     }
+    // Reorder edges so any direct edge to `to_id` is processed first. Without
+    // this, DFS may exhaust its timeout exploring siblings (alphabetically
+    // earlier than the target) before ever recording the direct hit, and the
+    // user gets a misleading "no path" result on a graph that obviously has one.
+    root_edges.sort_by_key(|(id, _, _)| if *id == to_id { 0 } else { 1 });
     stack.push(DfsFrame {
         node_id: from_id,
         edges: root_edges,
@@ -942,6 +1009,7 @@ fn dfs_all_paths(
 
         let (child_id, child_name, edge_kind) = frame.edges[frame.edge_idx].clone();
         frame.edge_idx += 1;
+        stats.edges_explored += 1;
 
         if on_path.contains(&child_id) {
             continue; // Cycle: skip.
@@ -996,13 +1064,19 @@ fn dfs_all_paths(
         // Push child onto stack.
         on_path.insert(child_id);
         names.insert(child_id, child_name.clone());
+        stats.nodes_visited += 1;
 
-        let child_edges = db::get_outgoing_edges_dedup(conn, child_id, kind_filter)?;
+        let mut child_edges = db::get_outgoing_edges_dedup(conn, child_id, kind_filter)?;
         for (id, name, _) in &child_edges {
             names.entry(*id).or_insert_with(|| name.clone());
         }
+        child_edges.sort_by_key(|(id, _, _)| if *id == to_id { 0 } else { 1 });
 
         current_path.push((child_id, child_name, Some(edge_kind)));
+        let new_depth = stack.len() + 1;
+        if new_depth > stats.max_depth_reached {
+            stats.max_depth_reached = new_depth;
+        }
         stack.push(DfsFrame {
             node_id: child_id,
             edges: child_edges,
@@ -1019,7 +1093,8 @@ fn dfs_all_paths(
         })
     });
 
-    Ok((results, truncated, truncation_reason))
+    stats.elapsed_ms = deadline.elapsed().as_millis() as u64;
+    Ok((results, truncated, truncation_reason, stats))
 }
 
 /// Show dependency path(s) between two modules.
@@ -1073,6 +1148,7 @@ pub fn cmd_module_route(
                 truncation_reason: None,
                 empty_reason: Some("not_indexed".to_string()),
                 warnings: vec![],
+                search_stats: None,
             };
             return render_json(&result);
         }
@@ -1116,6 +1192,7 @@ pub fn cmd_module_route(
                 truncation_reason: None,
                 empty_reason: Some("self".to_string()),
                 warnings,
+                search_stats: None,
             };
             return dispatch_render(format, &result);
         }
@@ -1133,6 +1210,7 @@ pub fn cmd_module_route(
                 truncation_reason: None,
                 empty_reason: Some("missing_module_from".to_string()),
                 warnings,
+                search_stats: None,
             };
             return dispatch_render(format, &result);
         }
@@ -1146,6 +1224,7 @@ pub fn cmd_module_route(
                 truncation_reason: None,
                 empty_reason: Some("missing_module_to".to_string()),
                 warnings,
+                search_stats: None,
             };
             return dispatch_render(format, &result);
         }
@@ -1153,30 +1232,53 @@ pub fn cmd_module_route(
     };
 
     // Run BFS/DFS.
-    let (paths, truncated, truncation_reason, empty_reason) = if all {
-        let (paths, truncated, trunc_reason) =
+    let (paths, truncated, truncation_reason, empty_reason, search_stats) = if all {
+        let (paths, truncated, trunc_reason, dfs_stats) =
             dfs_all_paths(&conn, fid, tid, kind_filter, max_depth, max_paths, deadline, timeout_ms)?;
         let reason = if paths.is_empty() {
-            // Check reachability without kind filter to distinguish "kind_filter" vs "unreachable".
-            let reachable = if kind_filter.is_some() {
-                bfs_shortest(&conn, fid, tid, None, max_depth, Instant::now(), timeout_ms)?
-                    .is_some()
+            // Truncated (timeout / max_paths) wins over reachability — saying
+            // "no path" when the search was cut short is a lie.
+            if truncated {
+                Some(format!("truncated_{}", trunc_reason.as_deref().unwrap_or("limit")))
             } else {
-                false
-            };
-            if reachable {
-                Some("kind_filter".to_string())
-            } else {
-                Some("unreachable".to_string())
+                let reachable = if kind_filter.is_some() {
+                    bfs_shortest(&conn, fid, tid, None, max_depth, Instant::now(), timeout_ms)?
+                        .is_some()
+                } else {
+                    false
+                };
+                if reachable {
+                    Some("kind_filter".to_string())
+                } else {
+                    Some("unreachable".to_string())
+                }
             }
         } else {
             None
         };
-        (paths, truncated, trunc_reason, reason)
+        // Suggest a higher --timeout-ms only when truncation was actually a
+        // timeout (not a max_paths hit, which warrants different advice).
+        let suggested_timeout_ms = if truncated && trunc_reason.as_deref() == Some("timeout") {
+            // Heuristic: 2× current, rounded up to next second. Capped at 60s
+            // to keep the suggestion sane on pathological graphs.
+            let bumped = (timeout_ms.saturating_mul(2)).max(timeout_ms + 1000);
+            Some(bumped.min(60_000))
+        } else {
+            None
+        };
+        let stats = SearchStats {
+            nodes_visited: dfs_stats.nodes_visited,
+            edges_explored: dfs_stats.edges_explored,
+            elapsed_ms: dfs_stats.elapsed_ms,
+            max_depth_reached: dfs_stats.max_depth_reached,
+            timeout_ms,
+            suggested_timeout_ms,
+        };
+        (paths, truncated, trunc_reason, reason, Some(stats))
     } else {
         let path = bfs_shortest(&conn, fid, tid, kind_filter, max_depth, deadline, timeout_ms)?;
         match path {
-            Some(p) => (vec![p], false, None, None),
+            Some(p) => (vec![p], false, None, None, None),
             None => {
                 let reason = if kind_filter.is_some() {
                     // Check without filter.
@@ -1190,7 +1292,7 @@ pub fn cmd_module_route(
                 } else {
                     Some("unreachable".to_string())
                 };
-                (vec![], false, None, reason)
+                (vec![], false, None, reason, None)
             }
         }
     };
@@ -1205,6 +1307,7 @@ pub fn cmd_module_route(
         truncation_reason,
         empty_reason,
         warnings,
+        search_stats,
     };
 
     dispatch_render(format, &result)
