@@ -238,6 +238,37 @@ ast-index unused-deps <MODULE>     # Find unused dependencies (v3.2: +transitive
 ast-index api <MODULE>             # Public API of module
 ```
 
+#### module-route — dependency path between two modules
+
+Show how module A reaches module B through the dependency graph:
+
+```bash
+# Shortest path (default)
+ast-index module-route --from core.utils --to features.payments.api
+
+# All simple paths, filtered to api edges only
+ast-index module-route --from app --to core.db --all --via-kind api
+
+# JSON output — machine-readable, no ANSI
+ast-index module-route --from app --to core.db --format json
+
+# Mermaid diagram (paste into any markdown renderer)
+ast-index module-route --from app --to core.db --format mermaid
+
+# Graphviz DOT
+ast-index module-route --from app --to core.db --format dot
+
+# Gradle-style module names work too
+ast-index module-route --from :app --to :core:utils
+```
+
+Options:
+- `--all` — return all simple paths instead of the single shortest
+- `--via-kind <api|implementation|all>` — filter traversal to one edge kind (default: `all`)
+- `--max-paths <N>` — cap on returned paths when `--all` is set (default: 50)
+- `--max-depth <N>` — cap on path length in hops (default: 20)
+- `--timeout-ms <N>` — wall-clock guard in milliseconds (default: 2000)
+
 ### XML & Resource analysis
 
 ```bash
@@ -491,6 +522,9 @@ exclude:
 ```
 
 ## Changelog
+
+### Unreleased
+- **Add `module-route` command** — find transitive dependency path(s) between two modules. Supports shortest (BFS) and all-paths (iterative DFS) modes, four output formats (`text`, `json`, `mermaid`, `dot`), edge-kind filtering (`--via-kind api|implementation|all`), configurable depth and path caps, and a wall-clock timeout guard. Accepts Gradle-style module names (`:core:utils`, `core/utils`, `core.utils` all resolve to the same module)
 
 ### 3.40.4
 - **`update` now honours `.ast-index.yaml` (`include` / `exclude`)** — previously only `rebuild` loaded the project config. On a monorepo with `include: [adfox, yabs/adfox]`, `update` would crawl the entire repository (no scope), hang indefinitely on Arcadia-sized trees, and silently pull files outside the configured scope into the DB — making `search` return results from `crypta/`, `sim/`, etc. that were never in `include`. `cmd_update` now loads the config and replaces the primary walker root with the listed sub-paths; paths in the DB stay anchored to the outer root (matching what `rebuild` writes), and `exclude` patterns are applied to every walked entry. `cmd_watch` got the same treatment so file-system watchers stay scoped too. Regression test feeds a seeded DB with two `include` paths and asserts that `crypta/` / `sim/` decoys never enter the index.
