@@ -39,6 +39,7 @@ Module Commands:
   module                 Find modules
   deps                   Show module dependencies
   dependents             Show reverse dependencies
+  module-route           Show dependency path(s) between two modules
   unused-deps            Find unused dependencies in a module
   api                    Show public API of a module
   unused-symbols         Find potentially unused symbols
@@ -400,6 +401,30 @@ enum Commands {
         /// Module name
         module: String,
     },
+    /// Show transitive dependency path(s) between two modules
+    ModuleRoute {
+        /// Source module (the one whose dependencies are followed)
+        #[arg(long)]
+        from: String,
+        /// Target module to reach
+        #[arg(long)]
+        to: String,
+        /// Show all simple paths (default: shortest only)
+        #[arg(long)]
+        all: bool,
+        /// Cap on number of paths returned
+        #[arg(long, default_value = "50")]
+        max_paths: usize,
+        /// Cap on path length in hops
+        #[arg(long, default_value = "20")]
+        max_depth: usize,
+        /// Wall-clock guard for path search (milliseconds)
+        #[arg(long, default_value = "2000")]
+        timeout_ms: u64,
+        /// Restrict traversal to a given dep kind ("api", "implementation", "all")
+        #[arg(long, default_value = "all")]
+        via_kind: String,
+    },
     /// Find unused dependencies in a module
     UnusedDeps {
         /// Module name (e.g., features.payments.impl)
@@ -753,6 +778,11 @@ fn main() -> Result<()> {
         Commands::Module { pattern, limit } => commands::modules::cmd_module(&root, &pattern, limit),
         Commands::Deps { module } => commands::modules::cmd_deps(&root, &module),
         Commands::Dependents { module } => commands::modules::cmd_dependents(&root, &module),
+        Commands::ModuleRoute { from, to, all, max_paths, max_depth, timeout_ms, via_kind } => {
+            commands::modules::cmd_module_route(
+                &root, &from, &to, all, max_paths, max_depth, timeout_ms, &via_kind, format,
+            )
+        }
         Commands::UnusedDeps { module, verbose, no_transitive, no_xml, no_resources, strict } => {
             let check_transitive = !no_transitive && !strict;
             let check_xml = !no_xml && !strict;

@@ -4,10 +4,12 @@
 //! - module: Find modules by pattern
 //! - deps: Show module dependencies
 //! - dependents: Show modules that depend on a module
+//! - module-route: Show dependency path(s) between two modules
 //! - unused_deps: Find unused dependencies
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
+use std::time::Instant;
 
 use anyhow::Result;
 use colored::Colorize;
@@ -570,6 +572,660 @@ fn get_module_public_symbols(conn: &Connection, root: &Path, module_path: &str) 
     }
 
     Ok(symbols)
+}
+
+// ── module-route ─────────────────────────────────────────────────────────────
+
+/// A single edge in a dependency path.
+#[derive(Debug, serde::Serialize, Clone)]
+struct EdgeHop {
+    from: String,
+    to: String,
+    kind: String,
+}
+
+/// One complete path from source to target module.
+#[derive(Debug, serde::Serialize, Clone)]
+struct RoutePath {
+    hops: Vec<EdgeHop>,
+    length: usize,
+}
+
+/// Full result envelope returned by `cmd_module_route`.
+#[derive(Debug, serde::Serialize)]
+struct ModuleRouteResult {
+    from: String,
+    to: String,
+    paths: Vec<RoutePath>,
+    count: usize,
+    truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    truncation_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    empty_reason: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
+}
+
+fn render_json(result: &ModuleRouteResult) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(result)?);
+    Ok(())
+}
+
+fn render_text(result: &ModuleRouteResult) {
+    if let Some(reason) = &result.empty_reason {
+        let hint = match reason.as_str() {
+            "missing_module_from" => format!("Module '{}' not found in index.", result.from),
+            "missing_module_to" => format!("Module '{}' not found in index.", result.to),
+            "unreachable" => format!(
+                "No dependency path from '{}' to '{}'.",
+                result.from, result.to
+            ),
+            "self" => format!("'{}' depends on itself (trivial path).", result.from),
+            _ => format!("No path found (reason: {}).", reason),
+        };
+        println!("{}", hint.yellow());
+        for w in &result.warnings {
+            eprintln!("{}", format!("Warning: {}", w).yellow());
+        }
+        return;
+    }
+
+    let shortest = result.paths.first().map(|p| p.length).unwrap_or(0);
+    println!(
+        "{}",
+        format!(
+            "{} → {} ({} path{}, shortest = {} hop{})",
+            result.from.cyan(),
+            result.to.cyan(),
+            result.count,
+            if result.count == 1 { "" } else { "s" },
+            shortest,
+            if shortest == 1 { "" } else { "s" }
+        )
+        .bold()
+    );
+
+    for (i, path) in result.paths.iter().enumerate() {
+        println!("\n  Path {} ({} hop{}):", i + 1, path.length, if path.length == 1 { "" } else { "s" });
+        if path.hops.is_empty() {
+            println!("    {} (same module)", result.from.cyan());
+        }
+        for hop in &path.hops {
+            println!(
+                "    {} → {} [{}]",
+                hop.from.cyan(),
+                hop.to.cyan(),
+                hop.kind.dimmed()
+            );
+        }
+    }
+
+    if result.truncated {
+        let reason = result.truncation_reason.as_deref().unwrap_or("limit");
+        println!("\n  {} (truncated: {})", "…".dimmed(), reason);
+    }
+
+    for w in &result.warnings {
+        eprintln!("{}", format!("Warning: {}", w).yellow());
+    }
+}
+
+fn render_mermaid(result: &ModuleRouteResult) {
+    if result.paths.is_empty() {
+        let reason = result
+            .empty_reason
+            .as_deref()
+            .unwrap_or("no_path");
+        println!("```mermaid");
+        println!("flowchart LR");
+        println!("  %% No path: {}", reason);
+        println!("```");
+        return;
+    }
+
+    // Collect all unique node names and assign id aliases.
+    let mut node_order: Vec<String> = Vec::new();
+    let mut node_ids: HashMap<String, String> = HashMap::new();
+    for path in &result.paths {
+        for hop in &path.hops {
+            for name in [&hop.from, &hop.to] {
+                if !node_ids.contains_key(name.as_str()) {
+                    let alias = format!("n{}", node_order.len());
+                    node_ids.insert(name.clone(), alias);
+                    node_order.push(name.clone());
+                }
+            }
+        }
+    }
+
+    println!("```mermaid");
+    println!("flowchart LR");
+    for name in &node_order {
+        let alias = &node_ids[name];
+        println!("  {}[{}]", alias, name);
+    }
+
+    let mut seen_edges: HashSet<(String, String, String)> = HashSet::new();
+    for path in &result.paths {
+        for hop in &path.hops {
+            let key = (hop.from.clone(), hop.to.clone(), hop.kind.clone());
+            if seen_edges.contains(&key) {
+                continue;
+            }
+            seen_edges.insert(key);
+            let from_id = &node_ids[&hop.from];
+            let to_id = &node_ids[&hop.to];
+            // Omit edge label for "implementation" to reduce visual noise.
+            if hop.kind == "implementation" {
+                println!("  {} --> {}", from_id, to_id);
+            } else {
+                println!("  {} -->|{}| {}", from_id, hop.kind, to_id);
+            }
+        }
+    }
+    println!("```");
+}
+
+fn render_dot(result: &ModuleRouteResult) {
+    println!("digraph module_route {{");
+    println!("  rankdir=LR;");
+
+    if result.paths.is_empty() {
+        let reason = result.empty_reason.as_deref().unwrap_or("no_path");
+        println!("  // No path: {}", reason);
+        println!("}}");
+        return;
+    }
+
+    // Collect unique node names.
+    let mut node_set: HashSet<String> = HashSet::new();
+    for path in &result.paths {
+        for hop in &path.hops {
+            node_set.insert(hop.from.clone());
+            node_set.insert(hop.to.clone());
+        }
+    }
+    let mut node_list: Vec<_> = node_set.iter().cloned().collect();
+    node_list.sort();
+    for name in &node_list {
+        println!("  \"{}\";", name.replace('"', "\\\""));
+    }
+
+    let mut seen_edges: HashSet<(String, String, String)> = HashSet::new();
+    for path in &result.paths {
+        for hop in &path.hops {
+            let key = (hop.from.clone(), hop.to.clone(), hop.kind.clone());
+            if seen_edges.contains(&key) {
+                continue;
+            }
+            seen_edges.insert(key);
+            println!(
+                "  \"{}\" -> \"{}\" [label=\"{}\"];",
+                hop.from.replace('"', "\\\""),
+                hop.to.replace('"', "\\\""),
+                hop.kind.replace('"', "\\\""),
+            );
+        }
+    }
+    println!("}}");
+}
+
+/// BFS from `from_id` to `to_id` respecting `kind_filter` and `max_depth`.
+/// Stops as soon as `to_id` is first dequeued (single shortest path).
+fn bfs_shortest(
+    conn: &Connection,
+    from_id: i64,
+    to_id: i64,
+    kind_filter: Option<&str>,
+    max_depth: usize,
+    deadline: Instant,
+    timeout_ms: u64,
+) -> Result<Option<RoutePath>> {
+    // Queue entry: (node_id, current_depth)
+    let mut queue: VecDeque<(i64, usize)> = VecDeque::new();
+    // predecessor: node_id → (predecessor_id, edge_kind, node_name)
+    let mut predecessor: HashMap<i64, (i64, String, String)> = HashMap::new();
+    // name cache: id → name
+    let mut names: HashMap<i64, String> = HashMap::new();
+
+    // Seed the source name.
+    let from_name: String = conn.query_row(
+        "SELECT name FROM modules WHERE id = ?1",
+        params![from_id],
+        |row| row.get(0),
+    )?;
+    names.insert(from_id, from_name);
+
+    queue.push_back((from_id, 0));
+    let mut visited: HashSet<i64> = HashSet::new();
+    visited.insert(from_id);
+
+    while let Some((node_id, depth)) = queue.pop_front() {
+        // Wall-clock guard checked per node (not per edge).
+        if deadline.elapsed().as_millis() as u64 >= timeout_ms {
+            return Ok(None);
+        }
+
+        if node_id == to_id {
+            // Backtrack predecessor chain.
+            return Ok(Some(build_path_from_predecessors(
+                &predecessor,
+                &names,
+                from_id,
+                to_id,
+            )));
+        }
+
+        if depth >= max_depth {
+            continue;
+        }
+
+        let edges = db::get_outgoing_edges_dedup(conn, node_id, kind_filter)?;
+        for (dep_id, dep_name, edge_kind) in edges {
+            if !visited.contains(&dep_id) {
+                visited.insert(dep_id);
+                let node_name = names.get(&node_id).cloned().unwrap_or_default();
+                predecessor.insert(dep_id, (node_id, edge_kind, node_name));
+                names.insert(dep_id, dep_name);
+                queue.push_back((dep_id, depth + 1));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn build_path_from_predecessors(
+    predecessor: &HashMap<i64, (i64, String, String)>,
+    names: &HashMap<i64, String>,
+    from_id: i64,
+    to_id: i64,
+) -> RoutePath {
+    let mut chain: Vec<(i64, String, String)> = Vec::new(); // (node_id, edge_kind, from_name)
+    let mut cur = to_id;
+    while cur != from_id {
+        if let Some((prev_id, kind, from_name)) = predecessor.get(&cur) {
+            let to_name = names.get(&cur).cloned().unwrap_or_default();
+            chain.push((cur, kind.clone(), from_name.clone()));
+            let _ = to_name;
+            cur = *prev_id;
+        } else {
+            break;
+        }
+    }
+    chain.reverse();
+
+    let hops: Vec<EdgeHop> = chain
+        .into_iter()
+        .map(|(to_id_hop, kind, from_name)| EdgeHop {
+            from: from_name,
+            to: names.get(&to_id_hop).cloned().unwrap_or_default(),
+            kind,
+        })
+        .collect();
+    let length = hops.len();
+    RoutePath { hops, length }
+}
+
+/// Frame for iterative DFS.
+struct DfsFrame {
+    node_id: i64,
+    edges: Vec<(i64, String, String)>, // remaining outgoing edges to explore
+    edge_idx: usize,
+}
+
+/// DFS collecting all simple paths from `from_id` to `to_id`.
+fn dfs_all_paths(
+    conn: &Connection,
+    from_id: i64,
+    to_id: i64,
+    kind_filter: Option<&str>,
+    max_depth: usize,
+    max_paths: usize,
+    deadline: Instant,
+    timeout_ms: u64,
+) -> Result<(Vec<RoutePath>, bool, Option<String>)> {
+    let mut results: Vec<RoutePath> = Vec::new();
+    let mut truncated = false;
+    let mut truncation_reason: Option<String> = None;
+
+    // Stack of frames; each frame owns its remaining edge list.
+    let mut stack: Vec<DfsFrame> = Vec::new();
+    // current_path tracks (node_id, from_name, edge_kind_into_this_node).
+    let mut current_path: Vec<(i64, String, Option<String>)> = Vec::new();
+    let mut on_path: HashSet<i64> = HashSet::new();
+
+    // Name cache.
+    let mut names: HashMap<i64, String> = HashMap::new();
+    let from_name: String = conn.query_row(
+        "SELECT name FROM modules WHERE id = ?1",
+        params![from_id],
+        |row| row.get(0),
+    )?;
+    names.insert(from_id, from_name.clone());
+
+    // Push the root frame.
+    let root_edges = db::get_outgoing_edges_dedup(conn, from_id, kind_filter)?;
+    for (id, name, _) in &root_edges {
+        names.insert(*id, name.clone());
+    }
+    stack.push(DfsFrame {
+        node_id: from_id,
+        edges: root_edges,
+        edge_idx: 0,
+    });
+    on_path.insert(from_id);
+    current_path.push((from_id, from_name, None));
+
+    'outer: loop {
+        // Timeout check per frame operation.
+        if deadline.elapsed().as_millis() as u64 >= timeout_ms {
+            truncated = true;
+            truncation_reason = Some("timeout".to_string());
+            break;
+        }
+
+        let frame_depth = stack.len();
+        let frame = match stack.last_mut() {
+            Some(f) => f,
+            None => break,
+        };
+
+        if frame.edge_idx >= frame.edges.len() {
+            // All children of this frame explored — backtrack.
+            on_path.remove(&frame.node_id);
+            current_path.pop();
+            stack.pop();
+            continue;
+        }
+
+        let (child_id, child_name, edge_kind) = frame.edges[frame.edge_idx].clone();
+        frame.edge_idx += 1;
+
+        if on_path.contains(&child_id) {
+            continue; // Cycle: skip.
+        }
+
+        if child_id == to_id {
+            // Found a path — materialise it.
+            let mut hops: Vec<EdgeHop> = Vec::with_capacity(current_path.len());
+            for i in 0..current_path.len() {
+                let (node_id, ref node_name, ref _into_kind) = current_path[i];
+                let next_id = if i + 1 < current_path.len() {
+                    current_path[i + 1].0
+                } else {
+                    child_id
+                };
+                let next_name = if next_id == child_id {
+                    child_name.clone()
+                } else {
+                    names.get(&next_id).cloned().unwrap_or_default()
+                };
+                // The edge kind from this node to the next is stored in the NEXT frame's
+                // edge_kind field, but we track it via the edges vec. Use the edge kind
+                // from current_path's stored option for nodes that were already on path.
+                let kind = if i + 1 < current_path.len() {
+                    current_path[i + 1].2.clone().unwrap_or_else(|| edge_kind.clone())
+                } else {
+                    edge_kind.clone()
+                };
+                let _ = node_id;
+                hops.push(EdgeHop {
+                    from: node_name.clone(),
+                    to: next_name,
+                    kind,
+                });
+            }
+            let length = hops.len();
+            results.push(RoutePath { hops, length });
+
+            if results.len() >= max_paths {
+                truncated = true;
+                truncation_reason = Some("max_paths".to_string());
+                break 'outer;
+            }
+            continue; // Do not push to_id onto stack — stop here.
+        }
+
+        // Depth guard: current depth = stack.len() (number of frames already on stack = path length to frame.node_id)
+        if frame_depth >= max_depth {
+            continue;
+        }
+
+        // Push child onto stack.
+        on_path.insert(child_id);
+        names.insert(child_id, child_name.clone());
+
+        let child_edges = db::get_outgoing_edges_dedup(conn, child_id, kind_filter)?;
+        for (id, name, _) in &child_edges {
+            names.entry(*id).or_insert_with(|| name.clone());
+        }
+
+        current_path.push((child_id, child_name, Some(edge_kind)));
+        stack.push(DfsFrame {
+            node_id: child_id,
+            edges: child_edges,
+            edge_idx: 0,
+        });
+    }
+
+    // Sort: shortest first, then lexicographic by hop names for determinism.
+    results.sort_by(|a, b| {
+        a.length.cmp(&b.length).then_with(|| {
+            let a_key: Vec<_> = a.hops.iter().map(|h| h.to.as_str()).collect();
+            let b_key: Vec<_> = b.hops.iter().map(|h| h.to.as_str()).collect();
+            a_key.cmp(&b_key)
+        })
+    });
+
+    Ok((results, truncated, truncation_reason))
+}
+
+/// Show dependency path(s) between two modules.
+pub fn cmd_module_route(
+    root: &Path,
+    from: &str,
+    to: &str,
+    all: bool,
+    max_paths: usize,
+    max_depth: usize,
+    timeout_ms: u64,
+    via_kind: &str,
+    format: &str,
+) -> Result<()> {
+    // Validate format early so JSON mode never emits ANSI.
+    match format {
+        "text" | "json" | "mermaid" | "dot" => {}
+        _ => {
+            println!("{}", format!("Invalid --format '{}'. Use: text, json, mermaid, dot.", format).red());
+            return Ok(());
+        }
+    }
+
+    // Validate via_kind.
+    match via_kind {
+        "api" | "implementation" | "all" => {}
+        _ => {
+            println!("{}", format!("Invalid --via-kind '{}'. Use: api, implementation, all.", via_kind).red());
+            return Ok(());
+        }
+    }
+
+    if !db::db_exists(root) {
+        println!("{}", "Index not found. Run 'ast-index rebuild' first.".red());
+        return Ok(());
+    }
+
+    let conn = db::open_db(root)?;
+
+    // Check module_deps populated.
+    let dep_count: i64 = conn.query_row("SELECT COUNT(*) FROM module_deps", [], |row| row.get(0))?;
+    if dep_count == 0 {
+        let msg = "Module dependencies not indexed. Run 'ast-index rebuild'.";
+        if format == "json" {
+            let result = ModuleRouteResult {
+                from: from.to_string(),
+                to: to.to_string(),
+                paths: vec![],
+                count: 0,
+                truncated: false,
+                truncation_reason: None,
+                empty_reason: Some("not_indexed".to_string()),
+                warnings: vec![],
+            };
+            return render_json(&result);
+        }
+        println!("{}", msg.yellow());
+        return Ok(());
+    }
+
+    // Multi-root warning.
+    let extra_roots = db::get_extra_roots(&conn)?;
+    if !extra_roots.is_empty() {
+        eprintln!(
+            "{}",
+            "Multi-root project detected; module-route v1 only walks the primary root graph.".yellow()
+        );
+    }
+
+    // Staleness warning.
+    let mut warnings: Vec<String> = Vec::new();
+    if let Ok(Some((indexed_at, updated_at))) = db::get_modules_index_freshness(&conn) {
+        if updated_at > indexed_at {
+            warnings.push("index_may_be_stale".to_string());
+        }
+    }
+
+    // Resolve module ids.
+    let from_id = db::find_module_id_by_name(&conn, from)?;
+    let to_id = db::find_module_id_by_name(&conn, to)?;
+
+    let kind_filter: Option<&str> = if via_kind == "all" { None } else { Some(via_kind) };
+    let deadline = Instant::now();
+
+    // Self-query.
+    if let (Some(fid), Some(tid)) = (from_id, to_id) {
+        if fid == tid {
+            let result = ModuleRouteResult {
+                from: from.to_string(),
+                to: to.to_string(),
+                paths: vec![RoutePath { hops: vec![], length: 0 }],
+                count: 1,
+                truncated: false,
+                truncation_reason: None,
+                empty_reason: Some("self".to_string()),
+                warnings,
+            };
+            return dispatch_render(format, &result);
+        }
+    }
+
+    // Missing module handling.
+    let (fid, tid) = match (from_id, to_id) {
+        (None, _) => {
+            let result = ModuleRouteResult {
+                from: from.to_string(),
+                to: to.to_string(),
+                paths: vec![],
+                count: 0,
+                truncated: false,
+                truncation_reason: None,
+                empty_reason: Some("missing_module_from".to_string()),
+                warnings,
+            };
+            return dispatch_render(format, &result);
+        }
+        (_, None) => {
+            let result = ModuleRouteResult {
+                from: from.to_string(),
+                to: to.to_string(),
+                paths: vec![],
+                count: 0,
+                truncated: false,
+                truncation_reason: None,
+                empty_reason: Some("missing_module_to".to_string()),
+                warnings,
+            };
+            return dispatch_render(format, &result);
+        }
+        (Some(f), Some(t)) => (f, t),
+    };
+
+    // Run BFS/DFS.
+    let (paths, truncated, truncation_reason, empty_reason) = if all {
+        let (paths, truncated, trunc_reason) =
+            dfs_all_paths(&conn, fid, tid, kind_filter, max_depth, max_paths, deadline, timeout_ms)?;
+        let reason = if paths.is_empty() {
+            // Check reachability without kind filter to distinguish "kind_filter" vs "unreachable".
+            let reachable = if kind_filter.is_some() {
+                bfs_shortest(&conn, fid, tid, None, max_depth, Instant::now(), timeout_ms)?
+                    .is_some()
+            } else {
+                false
+            };
+            if reachable {
+                Some("kind_filter".to_string())
+            } else {
+                Some("unreachable".to_string())
+            }
+        } else {
+            None
+        };
+        (paths, truncated, trunc_reason, reason)
+    } else {
+        let path = bfs_shortest(&conn, fid, tid, kind_filter, max_depth, deadline, timeout_ms)?;
+        match path {
+            Some(p) => (vec![p], false, None, None),
+            None => {
+                let reason = if kind_filter.is_some() {
+                    // Check without filter.
+                    let reachable = bfs_shortest(&conn, fid, tid, None, max_depth, Instant::now(), timeout_ms)?
+                        .is_some();
+                    if reachable {
+                        Some("kind_filter".to_string())
+                    } else {
+                        Some("unreachable".to_string())
+                    }
+                } else {
+                    Some("unreachable".to_string())
+                };
+                (vec![], false, None, reason)
+            }
+        }
+    };
+
+    let count = paths.len();
+    let result = ModuleRouteResult {
+        from: from.to_string(),
+        to: to.to_string(),
+        paths,
+        count,
+        truncated,
+        truncation_reason,
+        empty_reason,
+        warnings,
+    };
+
+    dispatch_render(format, &result)
+}
+
+fn dispatch_render(format: &str, result: &ModuleRouteResult) -> Result<()> {
+    match format {
+        "json" => render_json(result),
+        "mermaid" => {
+            render_mermaid(result);
+            Ok(())
+        }
+        "dot" => {
+            render_dot(result);
+            Ok(())
+        }
+        _ => {
+            render_text(result);
+            Ok(())
+        }
+    }
 }
 
 /// Check if any symbols from a dependency are used in the target module (index-based)
