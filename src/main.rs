@@ -102,7 +102,7 @@ struct Cli {
     #[command(subcommand)]
     command: Commands,
 
-    /// Output format: text or json
+    /// Output format: text, json (all commands); mermaid, dot (module-route only)
     #[arg(long, global = true, default_value = "text")]
     format: String,
 
