@@ -103,7 +103,7 @@ fn detect_project_type(conn: &rusqlite::Connection) -> String {
                     WHEN path LIKE '%.swift' THEN 'swift'
                     WHEN path LIKE '%.m' OR path LIKE '%.mm' THEN 'objc'
                     WHEN path LIKE '%.dart' THEN 'dart'
-                    WHEN path LIKE '%.ts' OR path LIKE '%.tsx' THEN 'ts'
+                    WHEN path LIKE '%.ts' OR path LIKE '%.tsx' OR path LIKE '%.mts' THEN 'ts'
                     WHEN path LIKE '%.js' OR path LIKE '%.jsx' THEN 'js'
                     WHEN path LIKE '%.py' THEN 'py'
                     WHEN path LIKE '%.go' THEN 'go'

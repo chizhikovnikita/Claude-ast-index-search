@@ -1,7 +1,7 @@
 # TypeScript/JavaScript Commands Reference
 
 ast-index supports parsing and indexing TypeScript and JavaScript files:
-- `.ts`, `.tsx` - TypeScript and TSX (React)
+- `.ts`, `.tsx`, `.mts` - TypeScript and TSX (React and ES modules)
 - `.js`, `.jsx` - JavaScript and JSX (React)
 - `.mjs`, `.cjs` - ES modules and CommonJS
 - `.vue` - Vue Single File Components

@@ -108,7 +108,7 @@ pub fn cmd_outline(root: &Path, file: &str) -> Result<()> {
     } else if ext == "java" {
         // Java — delegate to tree-sitter
         found = outline_via_treesitter(&content, crate::parsers::FileType::Java, &[SymbolKind::Import, SymbolKind::Annotation])?;
-    } else if ext == "ts" || ext == "tsx" || ext == "js" || ext == "jsx" {
+    } else if ext == "ts" || ext == "tsx" || ext == "mts" || ext == "js" || ext == "jsx" {
         // TypeScript/JavaScript — delegate to tree-sitter
         found = outline_via_treesitter(&content, crate::parsers::FileType::TypeScript, &[SymbolKind::Import])?;
     } else if ext == "vue" {
