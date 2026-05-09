@@ -1505,6 +1505,49 @@ pub fn find_module_id_by_name(conn: &Connection, input: &str) -> Result<Option<i
     Ok(None)
 }
 
+/// Return the name of a module by its id, or `None` when the id is absent.
+pub fn get_module_name(conn: &Connection, id: i64) -> Result<Option<String>> {
+    let result: Result<String, _> = conn.query_row(
+        "SELECT name FROM modules WHERE id = ?1",
+        params![id],
+        |row| row.get(0),
+    );
+    match result {
+        Ok(name) => Ok(Some(name)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Return the total number of rows in `module_deps`.
+pub fn count_module_deps(conn: &Connection) -> Result<i64> {
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM module_deps", [], |row| row.get(0))?;
+    Ok(count)
+}
+
+/// Return `true` when a self-edge `id → id` exists in `module_deps`,
+/// optionally filtered by `dep_kind`.
+pub fn has_module_self_edge(conn: &Connection, id: i64, kind_filter: Option<&str>) -> Result<bool> {
+    let result: Result<i64, _> = if let Some(kind) = kind_filter {
+        conn.query_row(
+            "SELECT 1 FROM module_deps WHERE module_id = ?1 AND dep_module_id = ?1 AND dep_kind = ?2 LIMIT 1",
+            params![id, kind],
+            |row| row.get(0),
+        )
+    } else {
+        conn.query_row(
+            "SELECT 1 FROM module_deps WHERE module_id = ?1 AND dep_module_id = ?1 LIMIT 1",
+            params![id],
+            |row| row.get(0),
+        )
+    };
+    match result {
+        Ok(_) => Ok(true),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Return outgoing edges from `module_id`, optionally filtered by `dep_kind`.
 ///
 /// Deduplicates via `SELECT DISTINCT` to guard against parallel edges with
@@ -1518,7 +1561,7 @@ pub fn get_outgoing_edges_dedup(
     kind_filter: Option<&str>,
 ) -> Result<Vec<(i64, String, String)>> {
     if let Some(kind) = kind_filter {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT DISTINCT md.dep_module_id, m.name, md.dep_kind
              FROM module_deps md
              JOIN modules m ON md.dep_module_id = m.id
@@ -1532,7 +1575,7 @@ pub fn get_outgoing_edges_dedup(
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     } else {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT DISTINCT md.dep_module_id, m.name, md.dep_kind
              FROM module_deps md
              JOIN modules m ON md.dep_module_id = m.id
@@ -1556,7 +1599,7 @@ pub fn get_incoming_edges_dedup(
     kind_filter: Option<&str>,
 ) -> Result<Vec<(i64, String, String)>> {
     if let Some(kind) = kind_filter {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT DISTINCT md.module_id, m.name, md.dep_kind
              FROM module_deps md
              JOIN modules m ON md.module_id = m.id
@@ -1570,7 +1613,7 @@ pub fn get_incoming_edges_dedup(
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     } else {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT DISTINCT md.module_id, m.name, md.dep_kind
              FROM module_deps md
              JOIN modules m ON md.module_id = m.id
@@ -1604,8 +1647,20 @@ pub fn get_modules_index_freshness(conn: &Connection) -> Result<Option<(i64, i64
     );
     match (indexed_at, updated_at) {
         (Ok(ia), Ok(ua)) => {
-            let ia_ms: i64 = ia.parse().unwrap_or(0);
-            let ua_ms: i64 = ua.parse().unwrap_or(0);
+            let ia_ms = match ia.parse::<i64>() {
+                Ok(v) => v,
+                Err(_) => {
+                    eprintln!("Warning: malformed 'last_modules_indexed_at' in metadata");
+                    return Ok(None);
+                }
+            };
+            let ua_ms = match ua.parse::<i64>() {
+                Ok(v) => v,
+                Err(_) => {
+                    eprintln!("Warning: malformed 'last_update_at' in metadata");
+                    return Ok(None);
+                }
+            };
             Ok(Some((ia_ms, ua_ms)))
         }
         _ => Ok(None),
