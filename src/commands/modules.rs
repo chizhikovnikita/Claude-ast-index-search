@@ -66,9 +66,7 @@ pub fn cmd_deps(root: &Path, module: &str) -> Result<()> {
     let conn = db::open_db(root)?;
 
     // Check if module deps are indexed
-    let dep_count: i64 = conn.query_row("SELECT COUNT(*) FROM module_deps", [], |row| row.get(0))?;
-
-    if dep_count == 0 {
+    if db::count_module_deps(&conn)? == 0 {
         println!(
             "{}",
             "Module dependencies not indexed. Run 'ast-index rebuild' to index them.".yellow()
@@ -129,9 +127,7 @@ pub fn cmd_dependents(root: &Path, module: &str) -> Result<()> {
     let conn = db::open_db(root)?;
 
     // Check if module deps are indexed
-    let dep_count: i64 = conn.query_row("SELECT COUNT(*) FROM module_deps", [], |row| row.get(0))?;
-
-    if dep_count == 0 {
+    if db::count_module_deps(&conn)? == 0 {
         println!(
             "{}",
             "Module dependencies not indexed. Run 'ast-index rebuild' to index them.".yellow()
@@ -196,8 +192,7 @@ pub fn cmd_unused_deps(
     let conn = db::open_db(root)?;
 
     // Check if module deps are indexed
-    let dep_count: i64 = conn.query_row("SELECT COUNT(*) FROM module_deps", [], |row| row.get(0))?;
-    if dep_count == 0 {
+    if db::count_module_deps(&conn)? == 0 {
         println!("{}", "Module dependencies not indexed. Run 'ast-index rebuild' first.".yellow());
         return Ok(());
     }
@@ -722,6 +717,37 @@ fn render_text(result: &ModuleRouteResult) {
     }
 }
 
+/// Escape a string for use as a Mermaid node label inside `[…]`.
+///
+/// The characters `[`, `]`, `(`, `)`, `{`, `}`, `|`, `"`, and newlines have
+/// special meaning in Mermaid flowchart syntax and must be replaced or removed.
+fn mermaid_escape(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '[' => '⟦',
+            ']' => '⟧',
+            '(' => '❨',
+            ')' => '❩',
+            '{' => '❴',
+            '}' => '❵',
+            '|' => '∣',
+            '"' => '\'',
+            '\n' | '\r' => ' ',
+            other => other,
+        })
+        .collect()
+}
+
+/// Escape a string for use inside a DOT double-quoted string.
+///
+/// DOT requires `"` → `\"` and `\n` → `\\n` inside quoted identifiers.
+fn dot_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
 fn render_mermaid(result: &ModuleRouteResult) {
     if result.paths.is_empty() {
         let reason = result
@@ -754,7 +780,10 @@ fn render_mermaid(result: &ModuleRouteResult) {
     println!("flowchart LR");
     for name in &node_order {
         let alias = &node_ids[name];
-        println!("  {}[{}]", alias, name);
+        // Mermaid label text inside `[]` must not contain `[](){}|"\n`.
+        // Replace those chars with safe Unicode look-alikes / escape sequences.
+        let safe = mermaid_escape(name);
+        println!("  {}[{}]", alias, safe);
     }
 
     let mut seen_edges: HashSet<(String, String, String)> = HashSet::new();
@@ -771,7 +800,8 @@ fn render_mermaid(result: &ModuleRouteResult) {
             if hop.kind == "implementation" {
                 println!("  {} --> {}", from_id, to_id);
             } else {
-                println!("  {} -->|{}| {}", from_id, hop.kind, to_id);
+                let safe_kind = mermaid_escape(&hop.kind);
+                println!("  {} -->|{}| {}", from_id, safe_kind, to_id);
             }
         }
     }
@@ -800,7 +830,7 @@ fn render_dot(result: &ModuleRouteResult) {
     let mut node_list: Vec<_> = node_set.iter().cloned().collect();
     node_list.sort();
     for name in &node_list {
-        println!("  \"{}\";", name.replace('"', "\\\""));
+        println!("  \"{}\";", dot_escape(name));
     }
 
     let mut seen_edges: HashSet<(String, String, String)> = HashSet::new();
@@ -813,9 +843,9 @@ fn render_dot(result: &ModuleRouteResult) {
             seen_edges.insert(key);
             println!(
                 "  \"{}\" -> \"{}\" [label=\"{}\"];",
-                hop.from.replace('"', "\\\""),
-                hop.to.replace('"', "\\\""),
-                hop.kind.replace('"', "\\\""),
+                dot_escape(&hop.from),
+                dot_escape(&hop.to),
+                dot_escape(&hop.kind),
             );
         }
     }
@@ -841,11 +871,8 @@ fn bfs_shortest(
     let mut names: HashMap<i64, String> = HashMap::new();
 
     // Seed the source name.
-    let from_name: String = conn.query_row(
-        "SELECT name FROM modules WHERE id = ?1",
-        params![from_id],
-        |row| row.get(0),
-    )?;
+    let from_name: String = db::get_module_name(conn, from_id)?
+        .unwrap_or_default();
     names.insert(from_id, from_name);
 
     queue.push_back((from_id, 0));
@@ -897,9 +924,7 @@ fn build_path_from_predecessors(
     let mut cur = to_id;
     while cur != from_id {
         if let Some((prev_id, kind, from_name)) = predecessor.get(&cur) {
-            let to_name = names.get(&cur).cloned().unwrap_or_default();
             chain.push((cur, kind.clone(), from_name.clone()));
-            let _ = to_name;
             cur = *prev_id;
         } else {
             break;
@@ -941,6 +966,10 @@ pub struct DfsStats {
 /// `max_depth`. Nodes that cannot reach `to_id` within `max_depth` are
 /// absent from the map. Used by `dfs_all_paths` to prune subtrees that
 /// cannot lead to the target.
+///
+/// Returns `(distance_map, truncated_by_timeout)`. When the second element is
+/// `true` the map is incomplete — the BFS was cut short by the wall-clock
+/// deadline, so absence from the map does NOT mean "unreachable".
 fn compute_reverse_distances(
     conn: &Connection,
     to_id: i64,
@@ -948,14 +977,16 @@ fn compute_reverse_distances(
     max_depth: usize,
     deadline: Instant,
     timeout_ms: u64,
-) -> Result<HashMap<i64, usize>> {
+) -> Result<(HashMap<i64, usize>, bool)> {
     let mut dist: HashMap<i64, usize> = HashMap::new();
     let mut queue: VecDeque<(i64, usize)> = VecDeque::new();
+    let mut timed_out = false;
     dist.insert(to_id, 0);
     queue.push_back((to_id, 0));
 
     while let Some((node, d)) = queue.pop_front() {
         if deadline.elapsed().as_millis() as u64 >= timeout_ms {
+            timed_out = true;
             break;
         }
         if d >= max_depth {
@@ -969,7 +1000,7 @@ fn compute_reverse_distances(
             }
         }
     }
-    Ok(dist)
+    Ok((dist, timed_out))
 }
 
 /// DFS collecting all simple paths from `from_id` to `to_id`.
@@ -997,7 +1028,19 @@ fn dfs_all_paths(
 
     // Reverse-BFS pruning map: node → min hops to to_id. Nodes that can't
     // reach to_id within max_depth are absent.
-    let dist_to = compute_reverse_distances(conn, to_id, kind_filter, max_depth, deadline, timeout_ms)?;
+    let (dist_to, prune_timed_out) =
+        compute_reverse_distances(conn, to_id, kind_filter, max_depth, deadline, timeout_ms)?;
+
+    // When the reverse BFS was cut short we cannot trust absence from dist_to:
+    // some reachable nodes may simply not have been visited yet.
+    // Signal immediately rather than running DFS that would produce wrong "unreachable".
+    if prune_timed_out {
+        truncated = true;
+        truncation_reason = Some("prune_timeout".to_string());
+        stats.elapsed_ms = deadline.elapsed().as_millis() as u64;
+        return Ok((results, truncated, truncation_reason, stats));
+    }
+
     // If from_id can't reach to_id at all, return empty fast.
     if !dist_to.contains_key(&from_id) {
         stats.elapsed_ms = deadline.elapsed().as_millis() as u64;
@@ -1012,11 +1055,8 @@ fn dfs_all_paths(
 
     // Name cache.
     let mut names: HashMap<i64, String> = HashMap::new();
-    let from_name: String = conn.query_row(
-        "SELECT name FROM modules WHERE id = ?1",
-        params![from_id],
-        |row| row.get(0),
-    )?;
+    let from_name: String = db::get_module_name(conn, from_id)?
+        .unwrap_or_default();
     names.insert(from_id, from_name.clone());
 
     // Push the root frame.
@@ -1082,28 +1122,30 @@ fn dfs_all_paths(
 
         if child_id == to_id {
             // Found a path — materialise it.
+            //
+            // Layout of current_path:
+            //   index 0  → (root_id,   root_name,   None)           ← no incoming edge
+            //   index k  → (node_k_id, node_k_name, Some(kind_k-1→k)) ← kind of edge (k-1)→k
+            //
+            // So the outgoing edge kind for hop i→(i+1) is stored at
+            // current_path[i+1].2 for intermediate hops, and `edge_kind` for
+            // the final hop to `child_id` (= to_id).
             let mut hops: Vec<EdgeHop> = Vec::with_capacity(current_path.len());
             for i in 0..current_path.len() {
-                let (node_id, ref node_name, ref _into_kind) = current_path[i];
-                let next_id = if i + 1 < current_path.len() {
-                    current_path[i + 1].0
+                let (_node_id, ref node_name, _) = current_path[i];
+                let (next_name, kind) = if i + 1 < current_path.len() {
+                    // Intermediate hop: next node is already on the path.
+                    let next_id = current_path[i + 1].0;
+                    let next_n = names.get(&next_id).cloned().unwrap_or_default();
+                    // current_path[i+1].2 is the kind of edge i → i+1 (set when
+                    // we pushed node i+1 onto the stack).
+                    let k = current_path[i + 1].2.clone().unwrap_or_default();
+                    (next_n, k)
                 } else {
-                    child_id
+                    // Last hop: destination is child_id (= to_id), found in
+                    // this iteration; edge_kind is the outgoing kind from node i.
+                    (child_name.clone(), edge_kind.clone())
                 };
-                let next_name = if next_id == child_id {
-                    child_name.clone()
-                } else {
-                    names.get(&next_id).cloned().unwrap_or_default()
-                };
-                // The edge kind from this node to the next is stored in the NEXT frame's
-                // edge_kind field, but we track it via the edges vec. Use the edge kind
-                // from current_path's stored option for nodes that were already on path.
-                let kind = if i + 1 < current_path.len() {
-                    current_path[i + 1].2.clone().unwrap_or_else(|| edge_kind.clone())
-                } else {
-                    edge_kind.clone()
-                };
-                let _ = node_id;
                 hops.push(EdgeHop {
                     from: node_name.clone(),
                     to: next_name,
@@ -1178,7 +1220,9 @@ pub fn cmd_module_route(
     match format {
         "text" | "json" | "mermaid" | "dot" => {}
         _ => {
-            println!("{}", format!("Invalid --format '{}'. Use: text, json, mermaid, dot.", format).red());
+            // Unknown format: we cannot emit JSON because we don't know the
+            // caller's intent, so emit a plain-text error to stderr.
+            eprintln!("{}", format!("Invalid --format '{}'. Use: text, json, mermaid, dot.", format).red());
             return Ok(());
         }
     }
@@ -1187,21 +1231,50 @@ pub fn cmd_module_route(
     match via_kind {
         "api" | "implementation" | "all" => {}
         _ => {
-            println!("{}", format!("Invalid --via-kind '{}'. Use: api, implementation, all.", via_kind).red());
+            let msg = format!("Invalid --via-kind '{}'. Use: api, implementation, all.", via_kind);
+            if format == "json" {
+                let result = ModuleRouteResult {
+                    from: from.to_string(),
+                    to: to.to_string(),
+                    paths: vec![],
+                    count: 0,
+                    truncated: false,
+                    truncation_reason: None,
+                    empty_reason: Some("invalid_args".to_string()),
+                    warnings: vec![msg],
+                    search_stats: None,
+                };
+                return render_json(&result);
+            }
+            eprintln!("{}", msg.red());
             return Ok(());
         }
     }
 
     if !db::db_exists(root) {
-        println!("{}", "Index not found. Run 'ast-index rebuild' first.".red());
+        let msg = "Index not found. Run 'ast-index rebuild' first.";
+        if format == "json" {
+            let result = ModuleRouteResult {
+                from: from.to_string(),
+                to: to.to_string(),
+                paths: vec![],
+                count: 0,
+                truncated: false,
+                truncation_reason: None,
+                empty_reason: Some("index_missing".to_string()),
+                warnings: vec![],
+                search_stats: None,
+            };
+            return render_json(&result);
+        }
+        eprintln!("{}", msg.red());
         return Ok(());
     }
 
     let conn = db::open_db(root)?;
 
     // Check module_deps populated.
-    let dep_count: i64 = conn.query_row("SELECT COUNT(*) FROM module_deps", [], |row| row.get(0))?;
-    if dep_count == 0 {
+    if db::count_module_deps(&conn)? == 0 {
         let msg = "Module dependencies not indexed. Run 'ast-index rebuild'.";
         if format == "json" {
             let result = ModuleRouteResult {
@@ -1217,7 +1290,7 @@ pub fn cmd_module_route(
             };
             return render_json(&result);
         }
-        println!("{}", msg.yellow());
+        eprintln!("{}", msg.yellow());
         return Ok(());
     }
 
@@ -1245,14 +1318,38 @@ pub fn cmd_module_route(
     let kind_filter: Option<&str> = if via_kind == "all" { None } else { Some(via_kind) };
     let deadline = Instant::now();
 
-    // Self-query.
-    if let (Some(fid), Some(tid)) = (from_id, to_id) {
-        if fid == tid {
+    // Self-query: when from == to, check whether a real self-edge exists in
+    // the DB. If it does, traverse it as a proper 1-hop cycle path. Otherwise
+    // return empty with empty_reason="self" so callers can distinguish.
+    if let (Some(fid), Some(_tid)) = (from_id, to_id) {
+        if fid == _tid {
+            if db::has_module_self_edge(&conn, fid, kind_filter)? {
+                // Real self-loop: represent it as a single hop from→from.
+                let name = db::get_module_name(&conn, fid)?.unwrap_or_else(|| from.to_string());
+                let hop = EdgeHop {
+                    from: name.clone(),
+                    to: name,
+                    kind: kind_filter.unwrap_or("implementation").to_string(),
+                };
+                let result = ModuleRouteResult {
+                    from: from.to_string(),
+                    to: to.to_string(),
+                    paths: vec![RoutePath { hops: vec![hop], length: 1 }],
+                    count: 1,
+                    truncated: false,
+                    truncation_reason: None,
+                    empty_reason: None,
+                    warnings,
+                    search_stats: None,
+                };
+                return dispatch_render(format, &result);
+            }
+            // No self-edge: trivial "same module" answer.
             let result = ModuleRouteResult {
                 from: from.to_string(),
                 to: to.to_string(),
-                paths: vec![RoutePath { hops: vec![], length: 0 }],
-                count: 1,
+                paths: vec![],
+                count: 0,
                 truncated: false,
                 truncation_reason: None,
                 empty_reason: Some("self".to_string()),
@@ -1301,13 +1398,18 @@ pub fn cmd_module_route(
         let (paths, truncated, trunc_reason, dfs_stats) =
             dfs_all_paths(&conn, fid, tid, kind_filter, max_depth, max_paths, deadline, timeout_ms)?;
         let reason = if paths.is_empty() {
-            // Truncated (timeout / max_paths) wins over reachability — saying
-            // "no path" when the search was cut short is a lie.
+            // Truncated (timeout / prune_timeout / max_paths) wins over
+            // reachability — saying "no path" when the search was cut short
+            // is a lie.
             if truncated {
-                Some(format!("truncated_{}", trunc_reason.as_deref().unwrap_or("limit")))
+                // prune_timeout gets its own value so callers can distinguish
+                // "we ran DFS but timed out" from "the pruning phase itself
+                // was too slow to finish".
+                let tag = trunc_reason.as_deref().unwrap_or("limit");
+                Some(format!("truncated_{}", tag))
             } else {
                 let reachable = if kind_filter.is_some() {
-                    bfs_shortest(&conn, fid, tid, None, max_depth, Instant::now(), timeout_ms)?
+                    bfs_shortest(&conn, fid, tid, None, max_depth, deadline, timeout_ms)?
                         .is_some()
                 } else {
                     false
@@ -1321,9 +1423,10 @@ pub fn cmd_module_route(
         } else {
             None
         };
-        // Suggest a higher --timeout-ms only when truncation was actually a
-        // timeout (not a max_paths hit, which warrants different advice).
-        let suggested_timeout_ms = if truncated && trunc_reason.as_deref() == Some("timeout") {
+        // Suggest a higher --timeout-ms for both DFS timeout and prune timeout.
+        let suggested_timeout_ms = if truncated
+            && matches!(trunc_reason.as_deref(), Some("timeout") | Some("prune_timeout"))
+        {
             // Heuristic: 2× current, rounded up to next second. Capped at 60s
             // to keep the suggestion sane on pathological graphs.
             let bumped = (timeout_ms.saturating_mul(2)).max(timeout_ms + 1000);
@@ -1346,8 +1449,9 @@ pub fn cmd_module_route(
             Some(p) => (vec![p], false, None, None, None),
             None => {
                 let reason = if kind_filter.is_some() {
-                    // Check without filter.
-                    let reachable = bfs_shortest(&conn, fid, tid, None, max_depth, Instant::now(), timeout_ms)?
+                    // Check without filter; reuse the original deadline so the
+                    // total work stays within the user-specified budget.
+                    let reachable = bfs_shortest(&conn, fid, tid, None, max_depth, deadline, timeout_ms)?
                         .is_some();
                     if reachable {
                         Some("kind_filter".to_string())
