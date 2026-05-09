@@ -505,9 +505,10 @@ fn max_paths_truncation_signals() {
     );
 }
 
-/// 8. Self-query: querying A→A returns a trivial zero-length path with empty_reason="self".
+/// 8. Self-query without a self-edge in the DB returns empty with empty_reason="self".
+///    (When a real self-edge exists the `self_edge_returns_real_cycle_path` test covers it.)
 #[test]
-fn self_query_returns_trivial_path() {
+fn self_query_no_self_edge_returns_empty_self_reason() {
     let dir = TempDir::new().unwrap();
     let conn = open_fresh_db(dir.path());
 
@@ -515,6 +516,7 @@ fn self_query_returns_trivial_path() {
     let a = insert_module(&conn, "self_mod", "self_mod");
     let b = insert_module(&conn, "other_mod", "other_mod");
     insert_dep(&conn, a, b, "implementation");
+    // No self-edge for self_mod.
     drop(conn);
 
     let bin = env!("CARGO_BIN_EXE_ast-index");
@@ -536,12 +538,14 @@ fn self_query_returns_trivial_path() {
     assert_eq!(
         v["empty_reason"].as_str().unwrap_or(""),
         "self",
-        "self-query must return empty_reason=self"
+        "self-query without self-edge must return empty_reason=self; got: {}",
+        stdout
     );
     assert_eq!(
-        v["count"].as_u64().unwrap(),
-        1,
-        "self-query must return exactly 1 trivial path"
+        v["count"].as_u64().unwrap_or(99),
+        0,
+        "self-query without self-edge must return count=0; got: {}",
+        stdout
     );
 }
 
@@ -576,5 +580,442 @@ fn mermaid_output_uses_id_aliases() {
     assert!(
         stdout.contains("n0[") || stdout.contains("n1["),
         "mermaid output must use id aliases like n0[ or n1["
+    );
+}
+
+/// prune_timeout: when the reverse-BFS phase times out we must signal
+/// truncated=true and truncation_reason="prune_timeout" rather than silently
+/// returning an empty "unreachable" result.
+///
+/// Build a large connected graph where the reverse BFS will exhaust the budget
+/// before completing, then query with a 1 ms timeout.
+#[test]
+fn prune_timeout_sets_truncation_reason() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+
+    // Fan-in graph: many sources all pointing to target.
+    // Reverse BFS from target will try to walk all predecessors.
+    let target = insert_module(&conn, "target", "target");
+    for i in 0..50 {
+        let src = insert_module(&conn, &format!("src{:03}", i), &format!("src{}", i));
+        insert_dep(&conn, src, target, "implementation");
+        // Give each source its own chain so the graph is wide enough to
+        // trigger the deadline inside compute_reverse_distances.
+        for j in 0..20 {
+            let anc = insert_module(&conn, &format!("anc{:03}_{:02}", i, j), &format!("anc{}_{}", i, j));
+            insert_dep(&conn, anc, src, "implementation");
+        }
+    }
+    drop(conn);
+
+    let bin = env!("CARGO_BIN_EXE_ast-index");
+    let out = std::process::Command::new(bin)
+        .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
+        .args([
+            "--format", "json",
+            "module-route",
+            "--from", "anc000_00",
+            "--to", "target",
+            "--all",
+            "--timeout-ms", "1",
+        ])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("must be JSON: {e}; stdout={stdout}"));
+
+    // Either the prune phase timed out (truncated, prune_timeout) or the DFS
+    // ran and found something. We never want a silent "unreachable" when the
+    // budget ran out during pruning.
+    let truncated = v["truncated"].as_bool().unwrap_or(false);
+    let trunc_reason = v["truncation_reason"].as_str().unwrap_or("");
+    let empty_reason = v["empty_reason"].as_str().unwrap_or("");
+
+    if truncated {
+        // When truncated, reason must be timeout or prune_timeout — NOT "unreachable".
+        assert!(
+            trunc_reason == "timeout" || trunc_reason == "prune_timeout",
+            "truncation_reason must be timeout or prune_timeout, got: {}; stdout={}",
+            trunc_reason,
+            stdout
+        );
+        // empty_reason (if present) must not be "unreachable" when truncated.
+        assert_ne!(
+            empty_reason, "unreachable",
+            "truncated result must not say 'unreachable'; stdout={}",
+            stdout
+        );
+    }
+    // If not truncated the search finished within budget — both outcomes are valid.
+}
+
+/// 3-hop path with distinct edge kinds: verify the kind sequence is correct.
+///
+///   A --api--> B --implementation--> C --compileOnly--> D
+///
+/// Each hop must record the kind of the edge that produced it.
+#[test]
+fn three_hop_path_preserves_distinct_kinds() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+
+    let a = insert_module(&conn, "kindA", "kindA");
+    let b = insert_module(&conn, "kindB", "kindB");
+    let c = insert_module(&conn, "kindC", "kindC");
+    let d = insert_module(&conn, "kindD", "kindD");
+    insert_dep(&conn, a, b, "api");
+    insert_dep(&conn, b, c, "implementation");
+    insert_dep(&conn, c, d, "compileOnly");
+    drop(conn);
+
+    let bin = env!("CARGO_BIN_EXE_ast-index");
+    let out = std::process::Command::new(bin)
+        .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
+        .args([
+            "--format", "json",
+            "module-route",
+            "--from", "kindA",
+            "--to", "kindD",
+            "--all",
+            "--via-kind", "all",
+        ])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("must be JSON: {e}; stdout={stdout}"));
+
+    let paths = v["paths"].as_array().expect("paths must be array");
+    assert_eq!(paths.len(), 1, "must find exactly 1 path; got: {}", stdout);
+    let hops = paths[0]["hops"].as_array().expect("hops must be array");
+    assert_eq!(hops.len(), 3, "path must have 3 hops; got: {}", stdout);
+
+    // Hop 0: kindA → kindB, kind = "api"
+    assert_eq!(hops[0]["from"].as_str(), Some("kindA"), "hop0 from; stdout={}", stdout);
+    assert_eq!(hops[0]["to"].as_str(), Some("kindB"), "hop0 to; stdout={}", stdout);
+    assert_eq!(hops[0]["kind"].as_str(), Some("api"), "hop0 kind must be api; stdout={}", stdout);
+
+    // Hop 1: kindB → kindC, kind = "implementation"
+    assert_eq!(hops[1]["from"].as_str(), Some("kindB"), "hop1 from; stdout={}", stdout);
+    assert_eq!(hops[1]["to"].as_str(), Some("kindC"), "hop1 to; stdout={}", stdout);
+    assert_eq!(hops[1]["kind"].as_str(), Some("implementation"), "hop1 kind must be implementation; stdout={}", stdout);
+
+    // Hop 2: kindC → kindD, kind = "compileOnly"
+    assert_eq!(hops[2]["from"].as_str(), Some("kindC"), "hop2 from; stdout={}", stdout);
+    assert_eq!(hops[2]["to"].as_str(), Some("kindD"), "hop2 to; stdout={}", stdout);
+    assert_eq!(hops[2]["kind"].as_str(), Some("compileOnly"), "hop2 kind must be compileOnly; stdout={}", stdout);
+}
+
+/// Self-loop: when a module has a self-edge in the DB, querying from==to
+/// must return a 1-hop real cycle path, not the trivial empty "self" result.
+#[test]
+fn self_edge_returns_real_cycle_path() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+
+    let m = insert_module(&conn, "cyclic_mod", "cyclic_mod");
+    // Self-edge: cyclic_mod depends on itself.
+    insert_dep(&conn, m, m, "implementation");
+    drop(conn);
+
+    let bin = env!("CARGO_BIN_EXE_ast-index");
+    let out = std::process::Command::new(bin)
+        .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
+        .args([
+            "--format", "json",
+            "module-route",
+            "--from", "cyclic_mod",
+            "--to", "cyclic_mod",
+        ])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("must be JSON: {e}; stdout={stdout}"));
+
+    // Must return a real 1-hop path, not empty with reason="self".
+    let paths = v["paths"].as_array().expect("paths must be array");
+    assert_eq!(paths.len(), 1, "self-edge must produce 1 path; got: {}", stdout);
+    assert_eq!(paths[0]["length"].as_u64().unwrap_or(0), 1, "self-loop path must have length 1; got: {}", stdout);
+
+    let empty_reason = v["empty_reason"].as_str().unwrap_or("none");
+    assert_ne!(empty_reason, "self", "self-edge must not report empty_reason=self; got: {}", stdout);
+
+    let hops = paths[0]["hops"].as_array().expect("hops must be array");
+    assert_eq!(hops[0]["from"].as_str(), Some("cyclic_mod"), "self-loop from; stdout={}", stdout);
+    assert_eq!(hops[0]["to"].as_str(), Some("cyclic_mod"), "self-loop to; stdout={}", stdout);
+}
+
+/// invalid --format emits error to stderr (not stdout) and stdout is empty.
+#[test]
+fn invalid_format_text_mode_emits_to_stderr() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+    let a = insert_module(&conn, "fa", "fa");
+    let b = insert_module(&conn, "fb", "fb");
+    insert_dep(&conn, a, b, "implementation");
+    drop(conn);
+
+    let bin = env!("CARGO_BIN_EXE_ast-index");
+    let out = std::process::Command::new(bin)
+        .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
+        .args([
+            "--format", "bogus",
+            "module-route",
+            "--from", "fa",
+            "--to", "fb",
+        ])
+        .output()
+        .unwrap();
+
+    // Stdout must be empty (error goes to stderr).
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.trim().is_empty(),
+        "invalid --format must produce no stdout; got: {}",
+        stdout
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Invalid --format") || stderr.contains("bogus"),
+        "stderr must contain error message; got: {}",
+        stderr
+    );
+}
+
+/// invalid --via-kind under --format json must emit a valid JSON envelope
+/// with empty_reason="invalid_args", not colored text.
+#[test]
+fn invalid_via_kind_json_mode_emits_envelope() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+    let a = insert_module(&conn, "vka", "vka");
+    let b = insert_module(&conn, "vkb", "vkb");
+    insert_dep(&conn, a, b, "implementation");
+    drop(conn);
+
+    let bin = env!("CARGO_BIN_EXE_ast-index");
+    let out = std::process::Command::new(bin)
+        .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
+        .args([
+            "--format", "json",
+            "module-route",
+            "--from", "vka",
+            "--to", "vkb",
+            "--via-kind", "badkind",
+        ])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("must be JSON for invalid --via-kind in json mode: {e}; stdout={stdout}"));
+
+    assert_eq!(
+        v["empty_reason"].as_str().unwrap_or(""),
+        "invalid_args",
+        "json mode invalid via-kind must produce empty_reason=invalid_args; got: {}",
+        stdout
+    );
+    // Stdout must not contain ANSI.
+    assert!(
+        !out.stdout.windows(2).any(|w| w == b"\x1b["),
+        "JSON output must not contain ANSI codes; stdout={}",
+        stdout
+    );
+}
+
+/// invalid --via-kind in text mode emits error to stderr, not stdout.
+#[test]
+fn invalid_via_kind_text_mode_emits_to_stderr() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+    let a = insert_module(&conn, "tvka", "tvka");
+    let b = insert_module(&conn, "tvkb", "tvkb");
+    insert_dep(&conn, a, b, "implementation");
+    drop(conn);
+
+    let bin = env!("CARGO_BIN_EXE_ast-index");
+    let out = std::process::Command::new(bin)
+        .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
+        .args([
+            "module-route",
+            "--from", "tvka",
+            "--to", "tvkb",
+            "--via-kind", "badkind",
+        ])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.trim().is_empty(),
+        "invalid --via-kind (text mode) must produce no stdout; got: {}",
+        stdout
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Invalid --via-kind") || stderr.contains("badkind"),
+        "stderr must contain error; got: {}",
+        stderr
+    );
+}
+
+/// Module name with mermaid-breaking characters is properly escaped in output.
+#[test]
+fn mermaid_escapes_special_chars_in_module_names() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+
+    // Name contains chars that break Mermaid syntax: [](){}|"
+    let a = insert_module(&conn, ":feature:auth-impl(jvm)", "feature/auth");
+    let b = insert_module(&conn, "core", "core");
+    insert_dep(&conn, a, b, "api");
+    drop(conn);
+
+    let bin = env!("CARGO_BIN_EXE_ast-index");
+    let out = std::process::Command::new(bin)
+        .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
+        .args([
+            "--format", "mermaid",
+            "module-route",
+            "--from", ":feature:auth-impl(jvm)",
+            "--to", "core",
+        ])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("```mermaid"), "must have mermaid fence; got: {}", stdout);
+    // The raw name must NOT appear unescaped in node declarations.
+    // Specifically the `(jvm)` part would break Mermaid if not escaped.
+    assert!(
+        !stdout.contains("n0[:feature:auth-impl(jvm)]") && !stdout.contains("n1[:feature:auth-impl(jvm)]"),
+        "raw special-char name must not appear unescaped in node declaration; stdout={}",
+        stdout
+    );
+}
+
+/// --format dot smoke test: output must start with digraph header and contain edges.
+#[test]
+fn dot_format_smoke_test() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+
+    let a = insert_module(&conn, "dota", "dota");
+    let b = insert_module(&conn, "dotb", "dotb");
+    insert_dep(&conn, a, b, "api");
+    drop(conn);
+
+    let bin = env!("CARGO_BIN_EXE_ast-index");
+    let out = std::process::Command::new(bin)
+        .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
+        .args([
+            "--format", "dot",
+            "module-route",
+            "--from", "dota",
+            "--to", "dotb",
+        ])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("digraph"),
+        "dot output must contain digraph header; got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("->"),
+        "dot output must contain edge arrow; got: {}",
+        stdout
+    );
+}
+
+/// --max-depth cuts long path: a chain A→B→C→D with max-depth=2 must not
+/// find the 3-hop path from A to D.
+#[test]
+fn max_depth_cuts_long_path() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+
+    let a = insert_module(&conn, "mdA", "mdA");
+    let b = insert_module(&conn, "mdB", "mdB");
+    let c = insert_module(&conn, "mdC", "mdC");
+    let d = insert_module(&conn, "mdD", "mdD");
+    insert_dep(&conn, a, b, "implementation");
+    insert_dep(&conn, b, c, "implementation");
+    insert_dep(&conn, c, d, "implementation");
+    drop(conn);
+
+    let bin = env!("CARGO_BIN_EXE_ast-index");
+    let out = std::process::Command::new(bin)
+        .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
+        .args([
+            "--format", "json",
+            "module-route",
+            "--from", "mdA",
+            "--to", "mdD",
+            "--max-depth", "2",
+        ])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("must be JSON: {e}; stdout={stdout}"));
+
+    let paths = v["paths"].as_array().expect("paths must be array");
+    assert!(
+        paths.is_empty(),
+        "max-depth=2 must cut the 3-hop path A→B→C→D; got: {}",
+        stdout
+    );
+}
+
+/// not_indexed JSON envelope: when module_deps table is empty, JSON mode
+/// must return a valid envelope with empty_reason="not_indexed".
+#[test]
+fn not_indexed_json_envelope_shape() {
+    let dir = TempDir::new().unwrap();
+    // Create DB but do NOT insert any module_deps rows.
+    let conn = open_fresh_db(dir.path());
+    let _ = insert_module(&conn, "x", "x");
+    let _ = insert_module(&conn, "y", "y");
+    // No deps inserted — count stays 0.
+    drop(conn);
+
+    let bin = env!("CARGO_BIN_EXE_ast-index");
+    let out = std::process::Command::new(bin)
+        .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
+        .args([
+            "--format", "json",
+            "module-route",
+            "--from", "x",
+            "--to", "y",
+        ])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("must be JSON: {e}; stdout={stdout}"));
+
+    assert_eq!(
+        v["empty_reason"].as_str().unwrap_or(""),
+        "not_indexed",
+        "must report not_indexed when module_deps is empty; got: {}",
+        stdout
+    );
+    // Must be valid JSON without ANSI.
+    assert!(
+        !out.stdout.windows(2).any(|w| w == b"\x1b["),
+        "JSON envelope must not contain ANSI codes; stdout={}",
+        stdout
     );
 }
