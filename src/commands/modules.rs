@@ -852,6 +852,15 @@ fn render_dot(result: &ModuleRouteResult) {
     println!("}}");
 }
 
+/// Outcome of a `bfs_shortest` run. Distinguishes "no path exists" from
+/// "we timed out before deciding" — the caller must NOT report `unreachable`
+/// when the budget was exhausted.
+enum BfsOutcome {
+    Found(RoutePath),
+    NotFound,
+    TimedOut,
+}
+
 /// BFS from `from_id` to `to_id` respecting `kind_filter` and `max_depth`.
 /// Stops as soon as `to_id` is first dequeued (single shortest path).
 fn bfs_shortest(
@@ -862,7 +871,7 @@ fn bfs_shortest(
     max_depth: usize,
     deadline: Instant,
     timeout_ms: u64,
-) -> Result<Option<RoutePath>> {
+) -> Result<BfsOutcome> {
     // Queue entry: (node_id, current_depth)
     let mut queue: VecDeque<(i64, usize)> = VecDeque::new();
     // predecessor: node_id → (predecessor_id, edge_kind, node_name)
@@ -882,12 +891,12 @@ fn bfs_shortest(
     while let Some((node_id, depth)) = queue.pop_front() {
         // Wall-clock guard checked per node (not per edge).
         if deadline.elapsed().as_millis() as u64 >= timeout_ms {
-            return Ok(None);
+            return Ok(BfsOutcome::TimedOut);
         }
 
         if node_id == to_id {
             // Backtrack predecessor chain.
-            return Ok(Some(build_path_from_predecessors(
+            return Ok(BfsOutcome::Found(build_path_from_predecessors(
                 &predecessor,
                 &names,
                 from_id,
@@ -911,7 +920,7 @@ fn bfs_shortest(
         }
     }
 
-    Ok(None)
+    Ok(BfsOutcome::NotFound)
 }
 
 fn build_path_from_predecessors(
@@ -1025,6 +1034,13 @@ fn dfs_all_paths(
     let mut truncated = false;
     let mut truncation_reason: Option<String> = None;
     let mut stats = DfsStats::default();
+
+    // max_paths == 0 means "do not collect any path" — return truncated
+    // immediately so we don't materialise one path before checking the cap.
+    if max_paths == 0 {
+        stats.elapsed_ms = deadline.elapsed().as_millis() as u64;
+        return Ok((results, true, Some("max_paths".to_string()), stats));
+    }
 
     // Reverse-BFS pruning map: node → min hops to to_id. Nodes that can't
     // reach to_id within max_depth are absent.
@@ -1323,13 +1339,14 @@ pub fn cmd_module_route(
     // return empty with empty_reason="self" so callers can distinguish.
     if let (Some(fid), Some(_tid)) = (from_id, to_id) {
         if fid == _tid {
-            if db::has_module_self_edge(&conn, fid, kind_filter)? {
-                // Real self-loop: represent it as a single hop from→from.
+            if let Some(real_kind) = db::get_module_self_edge_kind(&conn, fid, kind_filter)? {
+                // Real self-loop: surface the actual dep_kind from the DB,
+                // not a hardcoded default.
                 let name = db::get_module_name(&conn, fid)?.unwrap_or_else(|| from.to_string());
                 let hop = EdgeHop {
                     from: name.clone(),
                     to: name,
-                    kind: kind_filter.unwrap_or("implementation").to_string(),
+                    kind: real_kind,
                 };
                 let result = ModuleRouteResult {
                     from: from.to_string(),
@@ -1409,8 +1426,10 @@ pub fn cmd_module_route(
                 Some(format!("truncated_{}", tag))
             } else {
                 let reachable = if kind_filter.is_some() {
-                    bfs_shortest(&conn, fid, tid, None, max_depth, deadline, timeout_ms)?
-                        .is_some()
+                    matches!(
+                        bfs_shortest(&conn, fid, tid, None, max_depth, deadline, timeout_ms)?,
+                        BfsOutcome::Found(_)
+                    )
                 } else {
                     false
                 };
@@ -1444,19 +1463,49 @@ pub fn cmd_module_route(
         };
         (paths, truncated, trunc_reason, reason, Some(stats))
     } else {
-        let path = bfs_shortest(&conn, fid, tid, kind_filter, max_depth, deadline, timeout_ms)?;
-        match path {
-            Some(p) => (vec![p], false, None, None, None),
-            None => {
+        let outcome = bfs_shortest(&conn, fid, tid, kind_filter, max_depth, deadline, timeout_ms)?;
+        match outcome {
+            BfsOutcome::Found(p) => (vec![p], false, None, None, None),
+            BfsOutcome::TimedOut => {
+                // Shortest-mode timeout must NOT collapse to "unreachable" —
+                // we don't know whether a path exists. Report as truncated,
+                // mirroring the --all behaviour, so callers can retry with a
+                // larger --timeout-ms.
+                let suggested_timeout_ms = {
+                    let bumped = (timeout_ms.saturating_mul(2)).max(timeout_ms + 1000);
+                    Some(bumped.min(60_000))
+                };
+                let stats = SearchStats {
+                    nodes_visited: 0,
+                    edges_explored: 0,
+                    elapsed_ms: deadline.elapsed().as_millis() as u64,
+                    max_depth_reached: 0,
+                    timeout_ms,
+                    suggested_timeout_ms,
+                };
+                (
+                    vec![],
+                    true,
+                    Some("timeout".to_string()),
+                    Some("truncated_timeout".to_string()),
+                    Some(stats),
+                )
+            }
+            BfsOutcome::NotFound => {
                 let reason = if kind_filter.is_some() {
                     // Check without filter; reuse the original deadline so the
                     // total work stays within the user-specified budget.
-                    let reachable = bfs_shortest(&conn, fid, tid, None, max_depth, deadline, timeout_ms)?
-                        .is_some();
-                    if reachable {
-                        Some("kind_filter".to_string())
-                    } else {
-                        Some("unreachable".to_string())
+                    let outcome_unfiltered =
+                        bfs_shortest(&conn, fid, tid, None, max_depth, deadline, timeout_ms)?;
+                    match outcome_unfiltered {
+                        BfsOutcome::Found(_) => Some("kind_filter".to_string()),
+                        // Treat a follow-up timeout as unreachable here: the
+                        // primary attempt already returned NotFound, so the
+                        // caller knows the kind-filtered path is absent; the
+                        // unfiltered probe is best-effort.
+                        BfsOutcome::NotFound | BfsOutcome::TimedOut => {
+                            Some("unreachable".to_string())
+                        }
                     }
                 } else {
                     Some("unreachable".to_string())

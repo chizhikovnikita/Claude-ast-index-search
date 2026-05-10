@@ -1525,25 +1525,32 @@ pub fn count_module_deps(conn: &Connection) -> Result<i64> {
     Ok(count)
 }
 
-/// Return `true` when a self-edge `id → id` exists in `module_deps`,
-/// optionally filtered by `dep_kind`.
-pub fn has_module_self_edge(conn: &Connection, id: i64, kind_filter: Option<&str>) -> Result<bool> {
-    let result: Result<i64, _> = if let Some(kind) = kind_filter {
+/// Return the `dep_kind` of a self-edge `id → id` in `module_deps`, if one
+/// exists. Optionally filtered by `dep_kind`.
+///
+/// Used by `module-route` to surface the real edge kind on a self-loop
+/// instead of guessing a default like "implementation".
+pub fn get_module_self_edge_kind(
+    conn: &Connection,
+    id: i64,
+    kind_filter: Option<&str>,
+) -> Result<Option<String>> {
+    let result: Result<String, _> = if let Some(kind) = kind_filter {
         conn.query_row(
-            "SELECT 1 FROM module_deps WHERE module_id = ?1 AND dep_module_id = ?1 AND dep_kind = ?2 LIMIT 1",
+            "SELECT dep_kind FROM module_deps WHERE module_id = ?1 AND dep_module_id = ?1 AND dep_kind = ?2 LIMIT 1",
             params![id, kind],
             |row| row.get(0),
         )
     } else {
         conn.query_row(
-            "SELECT 1 FROM module_deps WHERE module_id = ?1 AND dep_module_id = ?1 LIMIT 1",
+            "SELECT dep_kind FROM module_deps WHERE module_id = ?1 AND dep_module_id = ?1 ORDER BY dep_kind LIMIT 1",
             params![id],
             |row| row.get(0),
         )
     };
     match result {
-        Ok(_) => Ok(true),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+        Ok(kind) => Ok(Some(kind)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => Err(e.into()),
     }
 }
