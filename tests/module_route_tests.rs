@@ -1019,3 +1019,151 @@ fn not_indexed_json_envelope_shape() {
         stdout
     );
 }
+
+/// REPRO P1: shortest-mode (`--all` absent) timeout must NOT collapse to
+/// "unreachable" — a direct edge with `--timeout-ms 0` must produce a
+/// truncated envelope, not a misleading empty result.
+#[test]
+fn shortest_mode_timeout_signals_truncated_not_unreachable() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+
+    let a = insert_module(&conn, "a", "a");
+    let b = insert_module(&conn, "b", "b");
+    insert_dep(&conn, a, b, "implementation");
+    drop(conn);
+
+    let bin = env!("CARGO_BIN_EXE_ast-index");
+    let out = std::process::Command::new(bin)
+        .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
+        .args([
+            "--format", "json",
+            "module-route",
+            "--from", "a",
+            "--to", "b",
+            "--timeout-ms", "0",
+        ])
+        .output()
+        .expect("binary invocation must succeed");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("must be JSON: {e}; stdout={stdout}"));
+
+    assert_eq!(
+        v["truncated"].as_bool().unwrap_or(false),
+        true,
+        "timeout=0 must produce truncated=true; got: {}",
+        stdout
+    );
+    assert_eq!(
+        v["truncation_reason"].as_str().unwrap_or(""),
+        "timeout",
+        "truncation_reason must be 'timeout' on shortest-mode timeout; got: {}",
+        stdout
+    );
+    assert_eq!(
+        v["empty_reason"].as_str().unwrap_or(""),
+        "truncated_timeout",
+        "empty_reason must mirror --all behaviour; got: {}",
+        stdout
+    );
+    assert_ne!(
+        v["empty_reason"].as_str().unwrap_or(""),
+        "unreachable",
+        "shortest-mode timeout must NOT report unreachable; got: {}",
+        stdout
+    );
+}
+
+/// REPRO P2: self-edge with --via-kind=all must surface the real `dep_kind`
+/// from the DB, not the hardcoded "implementation" default.
+#[test]
+fn self_edge_surfaces_real_kind_under_via_kind_all() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+
+    let m = insert_module(&conn, "api_self_mod", "api_self_mod");
+    insert_dep(&conn, m, m, "api");
+    drop(conn);
+
+    let bin = env!("CARGO_BIN_EXE_ast-index");
+    let out = std::process::Command::new(bin)
+        .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
+        .args([
+            "--format", "json",
+            "module-route",
+            "--from", "api_self_mod",
+            "--to", "api_self_mod",
+            "--via-kind", "all",
+        ])
+        .output()
+        .expect("binary invocation must succeed");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("must be JSON: {e}; stdout={stdout}"));
+
+    let paths = v["paths"].as_array().expect("paths must be array");
+    assert_eq!(paths.len(), 1, "self-edge must yield 1 path; got: {}", stdout);
+    let kind = paths[0]["hops"][0]["kind"].as_str().unwrap_or("");
+    assert_eq!(
+        kind, "api",
+        "self-edge kind must reflect the real DB row, not 'implementation'; got: {}",
+        stdout
+    );
+}
+
+/// REPRO P3: --max-paths 0 must NOT return a path; it must produce a
+/// truncated envelope with truncation_reason="max_paths" and count=0.
+#[test]
+fn max_paths_zero_returns_no_paths() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+
+    let a = insert_module(&conn, "a", "a");
+    let b = insert_module(&conn, "b", "b");
+    insert_dep(&conn, a, b, "implementation");
+    drop(conn);
+
+    let bin = env!("CARGO_BIN_EXE_ast-index");
+    let out = std::process::Command::new(bin)
+        .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
+        .args([
+            "--format", "json",
+            "module-route",
+            "--from", "a",
+            "--to", "b",
+            "--all",
+            "--max-paths", "0",
+        ])
+        .output()
+        .expect("binary invocation must succeed");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("must be JSON: {e}; stdout={stdout}"));
+
+    let paths = v["paths"].as_array().expect("paths must be array");
+    assert_eq!(
+        paths.len(), 0,
+        "--max-paths 0 must yield zero paths; got: {}",
+        stdout
+    );
+    assert_eq!(
+        v["count"].as_u64().unwrap_or(99), 0,
+        "--max-paths 0 must report count=0; got: {}",
+        stdout
+    );
+    assert_eq!(
+        v["truncated"].as_bool().unwrap_or(false), true,
+        "--max-paths 0 must report truncated=true; got: {}",
+        stdout
+    );
+    assert_eq!(
+        v["truncation_reason"].as_str().unwrap_or(""),
+        "max_paths",
+        "--max-paths 0 must report truncation_reason=max_paths; got: {}",
+        stdout
+    );
+}
