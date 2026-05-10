@@ -129,7 +129,22 @@ Restart Claude Code to activate. Update: `brew upgrade ast-index && claude plugi
 
 See [`examples/.claude/rules/ast-index.md`](examples/.claude/rules/ast-index.md) for a template rules file that teaches the agent to prefer ast-index over grep, outline before reading large files, and pass the same instructions to subagents. Adapt before dropping into your project's `.claude/rules/`.
 
-### MCP server (Cursor, Codex, Cline, Continue, OpenCode, Windsurf, …)
+### Codex
+
+```bash
+cd /path/to/project
+ast-index rebuild
+ast-index install-codex-mcp
+```
+
+`install-codex-mcp` registers `ast-index-mcp` with Codex via
+`codex mcp add`, sets `AST_INDEX_ROOT` to the current project, and sets
+`AST_INDEX_BIN` to the current `ast-index` binary. It expects
+`ast-index-mcp` next to `ast-index` or on `PATH`. Use
+`ast-index install-codex-mcp --dry-run` to print the command and
+`~/.codex/config.toml` fallback without changing Codex config.
+
+### MCP server (Cursor, Cline, Continue, OpenCode, Windsurf, …)
 
 An MCP server that exposes ast-index tools to any MCP-compatible agent. Each
 tool call spawns `ast-index <subcommand>`, parses the output, and returns a
