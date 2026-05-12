@@ -151,19 +151,29 @@ Reload Cursor window.
 
 ### Codex (OpenAI CLI)
 
-Add to `~/.codex/config.json`:
+From the project you want Codex to search:
 
-```json
-{
-  "mcp": {
-    "servers": {
-      "ast-index": {
-        "command": "ast-index-mcp",
-        "env": { "AST_INDEX_ROOT": "/absolute/path/to/your/project" }
-      }
-    }
-  }
-}
+```bash
+cd /absolute/path/to/your/project
+ast-index rebuild
+ast-index install-codex-mcp
+```
+
+The installer runs `codex mcp add`, sets `AST_INDEX_ROOT` to the current
+project, and sets `AST_INDEX_BIN` to the current `ast-index` executable.
+It expects `ast-index-mcp` next to `ast-index` or on `PATH`. Preview
+without changing Codex config:
+
+```bash
+ast-index install-codex-mcp --dry-run
+```
+
+Manual fallback for `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.ast-index]
+command = "ast-index-mcp"
+env = { AST_INDEX_ROOT = "/absolute/path/to/your/project", AST_INDEX_BIN = "ast-index" }
 ```
 
 ### Cline (VS Code extension)
