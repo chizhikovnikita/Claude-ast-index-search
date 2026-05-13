@@ -1,0 +1,16 @@
+{
+  "name": "ast-index-plugins",
+  "owner": {
+    "name": "defendend"
+  },
+  "metadata": {
+    "description": "ast-index plugin marketplace for Cursor."
+  },
+  "plugins": [
+    {
+      "name": "ast-index",
+      "source": "plugin",
+      "description": "Fast structural code search for multi-language projects using the ast-index CLI."
+    }
+  ]
+}

@@ -144,7 +144,41 @@ ast-index install-codex-mcp
 `ast-index install-codex-mcp --dry-run` to print the command and
 `~/.codex/config.toml` fallback without changing Codex config.
 
-### MCP server (Cursor, Cline, Continue, OpenCode, Windsurf, …)
+### Codex Plugin
+
+This repository includes a Codex plugin manifest at
+[`plugin/.codex-plugin/plugin.json`](plugin/.codex-plugin/plugin.json) and a
+repo marketplace at [`.agents/plugins/marketplace.json`](.agents/plugins/marketplace.json).
+
+For local development, restart Codex in this repo and install `ast-index` from
+the repo marketplace. For a remote marketplace, add the repository:
+
+```bash
+codex plugin marketplace add defendend/Claude-ast-index-search
+```
+
+The Codex package exposes the `ast-index` skill. Command-style project setup is
+kept out of the Codex manifest because Codex plugins use skills, MCP config,
+apps, and hooks as first-class components.
+
+### Cursor Plugin
+
+This repository includes a Cursor plugin manifest at
+[`plugin/.cursor-plugin/plugin.json`](plugin/.cursor-plugin/plugin.json) and a
+multi-plugin marketplace at [`.cursor-plugin/marketplace.json`](.cursor-plugin/marketplace.json).
+
+For local Cursor testing:
+
+```bash
+mkdir -p ~/.cursor/plugins/local
+ln -s /absolute/path/to/Claude-ast-index-search/plugin ~/.cursor/plugins/local/ast-index
+```
+
+Reload Cursor after creating the symlink. The Cursor package exposes the shared
+`ast-index` skill, a project rule in `plugin/rules/`, and a Cursor-specific
+`initialize-ast-index` command that writes `.cursor/rules/ast-index.mdc`.
+
+### MCP server (Cursor, Codex, Cline, Continue, OpenCode, Windsurf, …)
 
 An MCP server that exposes ast-index tools to any MCP-compatible agent. Each
 tool call spawns `ast-index <subcommand>`, parses the output, and returns a
@@ -192,9 +226,9 @@ Setup instructions per agent: [`docs/mcp-setup.md`](docs/mcp-setup.md).
 gemini skills install https://github.com/defendend/Claude-ast-index-search.git --path plugin/skills/ast-index
 ```
 
-### Cursor / Windsurf / Yandex Code Assistant
+### Generic Rule-Based Agents
 
-Add to `.cursor/rules` or project rules:
+Add to `.cursor/rules` or project-specific agent rules:
 
 ```markdown
 Use `ast-index` CLI for fast code search. Run `ast-index rebuild` before first use.

@@ -1,0 +1,38 @@
+---
+description: Use ast-index for fast structural code search before broad text search.
+alwaysApply: true
+---
+
+# ast-index Search Rules
+
+Use `ast-index` first for codebase navigation tasks: finding files, symbols,
+classes, usages, implementations, callers, outlines, module dependencies, and
+project maps.
+
+Before the first query in a project, run `ast-index stats`. If there is no
+usable index yet, run `ast-index rebuild` from the project root. For large
+repositories, prefer a scoped rebuild with `--include` or work from the
+smallest relevant project root.
+
+Do not run grep or broad text search after `ast-index` returns sufficient
+structural results. Fall back to text search only for regex searches, string
+literals, comments, or when `ast-index` returns no useful result.
+
+Useful commands:
+
+```bash
+ast-index search "Query"
+ast-index file "FileName"
+ast-index symbol "SymbolName"
+ast-index class "ClassName"
+ast-index usages "SymbolName"
+ast-index implementations "InterfaceOrBaseClass"
+ast-index refs "SymbolName"
+ast-index outline "path/to/File.kt"
+ast-index map --limit 20
+ast-index conventions
+```
+
+For monorepos with a trusted parent index, use `ast-index --walk-up ...` or
+`AST_INDEX_WALK_UP=1`. Otherwise stay scoped to the nearest project root to
+avoid mixing unrelated results.

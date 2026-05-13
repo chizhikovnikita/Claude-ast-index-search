@@ -1,0 +1,20 @@
+{
+  "name": "ast-index-plugins",
+  "interface": {
+    "displayName": "ast-index Plugins"
+  },
+  "plugins": [
+    {
+      "name": "ast-index",
+      "source": {
+        "source": "local",
+        "path": "./plugin"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

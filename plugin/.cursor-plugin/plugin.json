@@ -1,0 +1,30 @@
+{
+  "name": "ast-index",
+  "displayName": "ast-index",
+  "version": "3.40.4",
+  "description": "Fast structural code search for multi-language projects using the ast-index CLI.",
+  "author": {
+    "name": "defendend"
+  },
+  "homepage": "https://github.com/defendend/Claude-ast-index-search",
+  "repository": "https://github.com/defendend/Claude-ast-index-search",
+  "license": "MIT",
+  "keywords": [
+    "code-search",
+    "symbols",
+    "usages",
+    "tree-sitter",
+    "sqlite",
+    "agents"
+  ],
+  "category": "developer-tools",
+  "tags": [
+    "code-search",
+    "agents",
+    "navigation",
+    "refactoring"
+  ],
+  "commands": "./commands-cursor/*.md",
+  "skills": "./skills/",
+  "rules": "./rules/*.mdc"
+}
