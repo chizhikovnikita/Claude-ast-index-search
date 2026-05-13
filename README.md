@@ -1,4 +1,4 @@
-# ast-index v3.40.4
+# ast-index v3.41.0
 
 Fast code search CLI for 34 programming languages. Native Rust implementation.
 
@@ -572,7 +572,8 @@ exclude:
 
 ## Changelog
 
-### Unreleased
+### 3.41.0
+- **Codex and Cursor plugin packaging** — added first-class Codex and Cursor manifests, repo-local marketplaces, a Cursor-specific project rule/initializer command, and a validation script so agent packaging stays in sync with release version bumps. The existing Claude plugin payload remains unchanged.
 - **Add `module-route` command** — find transitive dependency path(s) between two modules. Supports shortest (BFS) and all-paths (iterative DFS) modes, four output formats (`text`, `json`, `mermaid`, `dot`), edge-kind filtering (`--via-kind api|implementation|all`), configurable depth and path caps, and a wall-clock timeout guard. Accepts Gradle-style module names (`:core:utils`, `core/utils`, `core.utils` all resolve to the same module)
 - **Fix `module-route --all` returning "no path" on large graphs when a direct edge exists** — DFS iterated each frame's edges in alphabetical order, so on a `:app` with many siblings it could blow the 2000ms timeout exploring decoy subtrees before reaching an alphabetically late target. Now each frame's edges are reordered so any edge pointing directly at `to` is processed first; the 1-hop direct path is recorded before any deep recursion. When the search still ends empty due to timeout or `max_paths`, the rendered message says so (`truncated_timeout` / `truncated_max_paths`) instead of the misleading "No dependency path"
 - **Surface `module-route --all` search progress and a suggested `--timeout-ms`** — DFS now tracks `nodes_visited`, `edges_explored`, `max_depth_reached`, and `elapsed_ms`; the `truncated` text/JSON output includes these and a doubled-and-clamped `suggested_timeout_ms` so the user can tell whether the search ran out of time vs. exhausted the graph and knows the next value to try. Default `--timeout-ms` raised from 2000 to 5000 to give real Android-monorepo graphs more headroom out of the box
