@@ -473,7 +473,7 @@ impl FileType {
             "rb" => Some(FileType::Ruby),
             "cs" => Some(FileType::CSharp),
             "dart" => Some(FileType::Dart),
-            "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" => Some(FileType::TypeScript),
+            "ts" | "tsx" | "mts" | "js" | "jsx" | "mjs" | "cjs" => Some(FileType::TypeScript),
             "vue" => Some(FileType::Vue),
             "svelte" => Some(FileType::Svelte),
             "scala" | "sc" => Some(FileType::Scala),
@@ -967,6 +967,7 @@ mod tests {
         assert!(is_supported_extension("swift"));
         assert!(is_supported_extension("ts"));
         assert!(is_supported_extension("tsx"));
+        assert!(is_supported_extension("mts"));
         assert!(is_supported_extension("py"));
         assert!(is_supported_extension("go"));
         assert!(is_supported_extension("rs"));
@@ -1203,6 +1204,7 @@ mod tests {
         assert_eq!(FileType::from_extension("dart"), Some(FileType::Dart));
         assert_eq!(FileType::from_extension("ts"), Some(FileType::TypeScript));
         assert_eq!(FileType::from_extension("tsx"), Some(FileType::TypeScript));
+        assert_eq!(FileType::from_extension("mts"), Some(FileType::TypeScript));
         assert_eq!(FileType::from_extension("vue"), Some(FileType::Vue));
         assert_eq!(FileType::from_extension("svelte"), Some(FileType::Svelte));
         assert_eq!(FileType::from_extension("php"), Some(FileType::Php));

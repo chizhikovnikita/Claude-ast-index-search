@@ -257,7 +257,7 @@ ast-index --format json refs "UserRepository"
 |----------|-----------|------------|
 | Android | Kotlin, Java | `.kt`, `.java` |
 | iOS | Swift, Objective-C | `.swift`, `.m`, `.h` |
-| Web | TypeScript, JavaScript | `.ts`, `.tsx`, `.js`, `.jsx`, `.vue`, `.svelte` |
+| Web | TypeScript, JavaScript | `.ts`, `.tsx`, `.mts`, `.js`, `.jsx`, `.vue`, `.svelte` |
 | Systems | Rust, C/C++ | `.rs`, `.cpp`, `.cc`, `.c`, `.h`, `.hpp` |
 | Backend | C#, Python, Go, Scala, PHP | `.cs`, `.py`, `.go`, `.scala`, `.php` |
 | Scripting | Ruby, Perl | `.rb`, `.pm`, `.pl` |

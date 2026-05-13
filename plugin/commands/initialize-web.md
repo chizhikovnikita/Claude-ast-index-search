@@ -146,7 +146,7 @@ After completion, inform user:
 ## Supported File Types
 
 This initialization supports:
-- `.ts`, `.tsx` - TypeScript (including React TSX)
+- `.ts`, `.tsx`, `.mts` - TypeScript (including React TSX and ES modules)
 - `.js`, `.jsx` - JavaScript (including React JSX)
 - `.mjs`, `.cjs` - ES modules and CommonJS
 - `.vue` - Vue Single File Components

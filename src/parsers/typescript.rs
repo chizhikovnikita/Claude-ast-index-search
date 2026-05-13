@@ -1,7 +1,7 @@
 //! TypeScript/JavaScript parser for symbol extraction
 //!
 //! Supports:
-//! - TypeScript (.ts, .tsx)
+//! - TypeScript (.ts, .tsx, .mts)
 //! - JavaScript (.js, .jsx, .mjs, .cjs)
 //! - Vue SFC (.vue)
 //! - Svelte (.svelte)
