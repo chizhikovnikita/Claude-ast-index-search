@@ -685,6 +685,33 @@ fn is_module_file(name: &str) -> bool {
         || name == "ya.make"
 }
 
+fn sample_parseable_files_without_ignore(walk_dir: &Path, limit: usize) -> Vec<PathBuf> {
+    use ignore::WalkBuilder;
+
+    let mut builder = WalkBuilder::new(walk_dir);
+    builder
+        .hidden(true)
+        .follow_links(false)
+        .max_depth(Some(50))
+        .git_ignore(false)
+        .git_exclude(false)
+        .filter_entry(|entry| !is_excluded_dir(entry));
+
+    let mut files = Vec::new();
+    for entry in builder.build().filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if parsers::is_supported_extension(ext) {
+                files.push(path.to_path_buf());
+                if files.len() >= limit {
+                    break;
+                }
+            }
+        }
+    }
+    files
+}
+
 /// Result of the filesystem walk in index_directory.
 /// Collects all interesting paths in a single walk to avoid redundant traversals.
 pub struct WalkResult {
@@ -696,6 +723,62 @@ pub struct WalkResult {
     // Android
     pub xml_layout_files: Vec<PathBuf>,  // .xml in /res/(layout|menu|navigation)
     pub res_files: Vec<PathBuf>,         // all files under /res/
+}
+
+#[derive(Debug, Default)]
+struct WalkErrorSummary {
+    count: usize,
+    samples: Vec<String>,
+}
+
+impl WalkErrorSummary {
+    const MAX_SAMPLES: usize = 5;
+
+    fn record(&mut self, err: ignore::Error) {
+        self.record_message(err.to_string());
+    }
+
+    fn record_message(&mut self, message: String) {
+        self.count += 1;
+        if self.samples.len() < Self::MAX_SAMPLES {
+            self.samples.push(message);
+        }
+    }
+
+    fn finish(&self, walk_dir: &Path, source_files: usize, progress: bool, verbose: bool) {
+        if self.count == 0 {
+            return;
+        }
+
+        let should_log = progress || source_files == 0;
+        if !should_log {
+            return;
+        }
+
+        if source_files == 0 {
+            eprintln!(
+                "Warning: filesystem walk under {} hit {} error(s) and found 0 parseable files. The index may be incomplete.",
+                walk_dir.display(),
+                self.count
+            );
+        } else {
+            eprintln!(
+                "Warning: skipped {} filesystem entr{} due to walk errors while indexing {}",
+                self.count,
+                if self.count == 1 { "y" } else { "ies" },
+                walk_dir.display()
+            );
+        }
+
+        if verbose {
+            for sample in &self.samples {
+                eprintln!("[verbose] walk error: {}", sample);
+            }
+        } else if let Some(sample) = self.samples.first() {
+            eprintln!("First walk error: {}", sample);
+            eprintln!("Run with --verbose to show more walk errors.");
+        }
+    }
 }
 
 pub fn index_directory(conn: &mut Connection, root: &Path, progress: bool, no_ignore: bool) -> Result<WalkResult> {
@@ -803,9 +886,17 @@ pub fn index_directory_scoped(conn: &mut Connection, root: &Path, walk_dir: &Pat
     let mut xcassets_dirs: Vec<PathBuf> = Vec::new();
     let mut xml_layout_files: Vec<PathBuf> = Vec::new();
     let mut res_files: Vec<PathBuf> = Vec::new();
+    let mut walk_errors = WalkErrorSummary::default();
 
     let mut walk_entries = 0usize;
-    for entry in walker.filter_map(|e| e.ok()) {
+    for entry in walker {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                walk_errors.record(err);
+                continue;
+            }
+        };
         walk_entries += 1;
         if verbose && walk_entries % 10000 == 0 {
             eprintln!("[verbose] walk: {} entries scanned in {:?}...", walk_entries, walk_start.elapsed());
@@ -845,6 +936,29 @@ pub fn index_directory_scoped(conn: &mut Connection, root: &Path, walk_dir: &Pat
     if verbose {
         eprintln!("[verbose] walk complete: {} total entries, {} source files, {} module files in {:?}",
             walk_entries, files.len(), module_files.len(), walk_start.elapsed());
+    }
+
+    walk_errors.finish(walk_dir, files.len(), progress, verbose);
+
+    if progress && files.is_empty() && !no_ignore {
+        let visible_without_ignore = sample_parseable_files_without_ignore(walk_dir, 5);
+        if !visible_without_ignore.is_empty() {
+            eprintln!(
+                "Warning: ignore rules filtered out all parseable source files under {}.",
+                walk_dir.display()
+            );
+            eprintln!("Try `ast-index rebuild --no-ignore` to confirm.");
+            if arc_root.is_some() {
+                eprintln!(
+                    "Note: in Arc mode ast-index also loads `.gitignore` from the repo root."
+                );
+            }
+            eprintln!("Example files visible without ignore rules:");
+            for path in &visible_without_ignore {
+                let display = path.strip_prefix(root).unwrap_or(path);
+                eprintln!("  - {}", display.display());
+            }
+        }
     }
 
     let total_files = files.len();
@@ -3503,5 +3617,34 @@ mod tests {
 
         let deps = get_module_deps(&conn, "app").unwrap();
         assert!(deps.iter().any(|(n, _, _)| n == "libs.core"));
+    }
+
+    #[test]
+    fn walk_error_summary_zero_files_does_not_fail() {
+        let mut summary = WalkErrorSummary::default();
+        summary.record_message("Permission denied (os error 13)".to_string());
+
+        summary.finish(Path::new("/repo"), 0, false, false);
+    }
+
+    #[test]
+    fn walk_error_summary_allows_partial_success() {
+        let mut summary = WalkErrorSummary::default();
+        summary.record_message("Permission denied (os error 13)".to_string());
+
+        summary.finish(Path::new("/repo"), 1, false, false);
+    }
+
+    #[test]
+    fn sample_parseable_files_without_ignore_finds_sources() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join(".gitignore"), "src/\n").unwrap();
+        fs::write(root.join("src/Main.java"), "class Main {}\n").unwrap();
+
+        let samples = sample_parseable_files_without_ignore(root, 5);
+        assert_eq!(samples.len(), 1);
+        assert!(samples[0].ends_with("src/Main.java"));
     }
 }
