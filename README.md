@@ -28,7 +28,10 @@ Fast code search CLI for 34 programming languages. Native Rust implementation.
 
 Project type is auto-detected.
 
-**[Setup guide for your project](docs/setup-guide.md)** — install, commands, and usage examples.
+**New to ast-index? Start with the [User guide](USER_GUIDE.md).** It covers
+project setup, index updates, git checkouts, worktrees, and AI agent usage.
+
+**[Command setup guide](docs/setup-guide.md)** — install, commands, and usage examples.
 
 ## Installation
 
