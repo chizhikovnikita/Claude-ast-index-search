@@ -72,6 +72,22 @@ indexes new or changed supported source files, and removes deleted files from
 the index. It honors `.gitignore`, built-in ignored directories, and
 `.ast-index.yaml` `include` / `exclude` settings.
 
+Change detection is timestamp-based. During `rebuild` and `update`,
+`ast-index` stores each indexed file's relative path, filesystem modified time
+(`mtime`), and size in SQLite. On the next `update`, it walks the current source
+tree and compares each file's current `mtime` with the stored one:
+
+- path is missing from the database: index it as a new file;
+- current `mtime` is newer than stored `mtime`: re-parse and replace that file's
+  symbols and references;
+- path exists in the database but is no longer found on disk: delete it from the
+  index;
+- current `mtime` is the same or older: leave the existing index rows as-is.
+
+`update` does not use `git diff` and does not hash file contents, so it also
+works after ordinary file edits, generated file changes, branch checkouts, and
+non-git workflows.
+
 `watch` listens for source-file changes and runs the same incremental update
 path after a short debounce. Run it in a long-lived terminal while you work:
 
