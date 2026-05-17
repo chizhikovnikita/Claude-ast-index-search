@@ -242,7 +242,7 @@ All commands: `ast-index <command>`
 
 ## Keep Index Up To Date
 
-After pulling new changes, rebasing, or switching branches, run
+After `git pull`, `git rebase`, `git checkout`, or `git switch`, run
 `ast-index update`.
 
 For active development, keep the watcher running:
