@@ -224,27 +224,92 @@ AST_INDEX_WALK_UP=1 ast-index search "Payment"
 
 ## AI Agent Instructions
 
-Build the project index first, then teach your agent when to use it:
+Build the project index first:
 
 ```bash
 cd /path/to/your/project
 ast-index rebuild
 ```
 
-Add a short rule to your agent instructions:
+Then copy this rule into your project's agent instructions file, for example
+`AGENTS.md`, `CLAUDE.md`, `.cursor/rules`, or another project-level rules file
+used by your agent:
 
-```text
-Use ast-index before grep for code search.
-Use `search` for broad lookup, `file` for file names, `symbol` / `class` for
-definitions, `usages` for references, `callers` for call sites, and
-`implementations` for interfaces or base classes.
-Before reading a file longer than 500 lines, call `outline` first and then read
-only the relevant range.
-If ast-index returns no results, fall back to grep.
+````markdown
+# ast-index Rules
+
+All commands: `ast-index <command>`
+
+## Keep Index Up To Date
+
+After pulling new changes, rebasing, or switching branches, run
+`ast-index update`.
+
+For active development, keep the watcher running:
+
+```bash
+ast-index watch
+# or, from the current shell:
+ast-index watch &
 ```
 
-When spawning subagents, include the same instruction in the subagent prompt.
-Many agent systems do not automatically pass project rules to subagents.
+## Mandatory Search Rules
+
+1. **ALWAYS use ast-index FIRST** for any code search task.
+2. **NEVER duplicate results** — if ast-index found results, that is the complete answer.
+3. **DO NOT run grep** after ast-index returns results.
+4. Use Grep only when ast-index returns empty or for regex/string-literal search.
+
+## Mandatory Read Rules
+
+1. **ALWAYS run `ast-index outline <file>` BEFORE `Read`** for any file longer than 500 lines.
+2. Use the outline to identify the specific symbol or range you need, then `Read` only that slice with `offset` / `limit`.
+3. This rule is mandatory — do not bulk-read large files without an outline first.
+
+## Rules For Subagents
+
+When spawning any agent for code search, ALWAYS include these instructions in
+the prompt. Many agent systems do not automatically pass project rules to
+subagents.
+
+```text
+Use `ast-index` via Bash for code search before grep/Grep:
+- search "query" — universal search
+- file "Name" — find file
+- usages "Name" — find all usages
+- implementations "Name" — find implementations
+- class "Name" — find definition
+- callers "func" — find callers
+
+Use Grep only if ast-index returns empty or when regex/string-literal search is required.
+
+Before using the Read tool on any file longer than 500 lines, first run
+`ast-index outline <file>` to get its structure, then Read only the targeted
+slice via offset/limit. Never bulk-read large files.
+```
+
+## Commands
+
+- **Search:** `search`, `file`, `symbol`, `class` — find files and symbols by name
+- **Usages:** `usages`, `callers`, `call-tree`, `refs` — find where symbols are used
+- **Hierarchy:** `implementations`, `hierarchy`, `extensions` — class hierarchy
+- **Modules:** `module`, `deps`, `dependents`, `api` — module dependencies
+- **Files:** `outline`, `imports`, `changed` — file analysis
+- **iOS:** `storyboard-usages`, `asset-usages`, `asset-unused` — storyboard/asset search
+- **Quality:** `todo`, `deprecated` — find TODOs and deprecated items
+- **Index:** `rebuild`, `update`, `watch`, `stats` — index management
+
+## Common Use Cases
+
+- `ast-index usages "PaymentViewController"` — where is this class used?
+- `ast-index implementations "PaymentProcessing"` — what implements this protocol?
+- `ast-index callers "processPayment"` — what calls this function?
+- `ast-index call-tree "processPayment" -d 3` — call hierarchy
+- `ast-index deps "PaymentFeature"` — module dependencies
+- `ast-index dependents "NetworkKit"` — what depends on this module?
+- `ast-index changed` — what changed in my branch?
+- `ast-index todo` — find all TODOs
+````
 
 ## Optional Claude Code Local Automation
 
