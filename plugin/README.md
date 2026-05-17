@@ -14,7 +14,22 @@ they write different project configuration files.
 
 ## Local Testing
 
-Codex reads the repo marketplace from `.agents/plugins/marketplace.json`.
+Codex can load the skill directly from `~/.codex/skills`:
+
+```bash
+mkdir -p ~/.codex/skills
+ln -s /absolute/path/to/Claude-ast-index-search/plugin/skills/ast-index ~/.codex/skills/ast-index
+```
+
+The repo marketplace at `.agents/plugins/marketplace.json` is kept for Codex
+builds that support plugin marketplaces.
+
+Cursor can load the skill directly from `~/.cursor/skills`:
+
+```bash
+mkdir -p ~/.cursor/skills
+ln -s /absolute/path/to/Claude-ast-index-search/plugin/skills/ast-index ~/.cursor/skills/ast-index
+```
 
 Cursor can load the plugin locally by symlinking this directory:
 

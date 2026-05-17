@@ -147,26 +147,43 @@ ast-index install-codex-mcp
 `ast-index install-codex-mcp --dry-run` to print the command and
 `~/.codex/config.toml` fallback without changing Codex config.
 
-### Codex Plugin
+### Codex Skill / Plugin
 
-This repository includes a Codex plugin manifest at
+Codex can use the shared `ast-index` skill directly. For local development,
+symlink or copy the skill directory into Codex's global skills directory:
+
+```bash
+mkdir -p ~/.codex/skills
+ln -s /absolute/path/to/Claude-ast-index-search/plugin/skills/ast-index ~/.codex/skills/ast-index
+```
+
+This repository also includes a Codex plugin manifest at
 [`plugin/.codex-plugin/plugin.json`](plugin/.codex-plugin/plugin.json) and a
-repo marketplace at [`.agents/plugins/marketplace.json`](.agents/plugins/marketplace.json).
+repo marketplace at [`.agents/plugins/marketplace.json`](.agents/plugins/marketplace.json)
+for Codex builds that support plugin marketplaces.
 
-For local development, restart Codex in this repo and install `ast-index` from
-the repo marketplace. For a remote marketplace, add the repository:
+If your Codex build supports plugin marketplaces, restart Codex in this repo
+and install `ast-index` from the repo marketplace. For a remote marketplace,
+add the repository:
 
 ```bash
 codex plugin marketplace add defendend/Claude-ast-index-search
 ```
 
-The Codex package exposes the `ast-index` skill. Command-style project setup is
-kept out of the Codex manifest because Codex plugins use skills, MCP config,
+The Codex package exposes the same `ast-index` skill. Command-style project
+setup is kept out of the Codex manifest because Codex uses skills, MCP config,
 apps, and hooks as first-class components.
 
-### Cursor Plugin
+### Cursor Skill / Plugin
 
-This repository includes a Cursor plugin manifest at
+Cursor can use the shared skill directly:
+
+```bash
+mkdir -p ~/.cursor/skills
+ln -s /absolute/path/to/Claude-ast-index-search/plugin/skills/ast-index ~/.cursor/skills/ast-index
+```
+
+This repository also includes a Cursor plugin manifest at
 [`plugin/.cursor-plugin/plugin.json`](plugin/.cursor-plugin/plugin.json) and a
 multi-plugin marketplace at [`.cursor-plugin/marketplace.json`](.cursor-plugin/marketplace.json).
 
@@ -177,8 +194,8 @@ mkdir -p ~/.cursor/plugins/local
 ln -s /absolute/path/to/Claude-ast-index-search/plugin ~/.cursor/plugins/local/ast-index
 ```
 
-Reload Cursor after creating the symlink. The Cursor package exposes the shared
-`ast-index` skill, a project rule in `plugin/rules/`, and a Cursor-specific
+Reload Cursor after creating the symlink. The Cursor plugin package exposes the
+shared `ast-index` skill, a project rule in `plugin/rules/`, and a Cursor-specific
 `initialize-ast-index` command that writes `.cursor/rules/ast-index.mdc`.
 
 ### MCP server (Cursor, Codex, Cline, Continue, OpenCode, Windsurf, …)
@@ -576,6 +593,7 @@ exclude:
 ## Changelog
 
 ### 3.41.0
+- **Codex/Cursor skill installation docs** — documented direct skill installs through `~/.codex/skills/ast-index` and `~/.cursor/skills/ast-index`, while keeping plugin marketplace metadata as an optional packaging surface.
 - **Codex and Cursor plugin packaging** — added first-class Codex and Cursor manifests, repo-local marketplaces, a Cursor-specific project rule/initializer command, and a validation script so agent packaging stays in sync with release version bumps. The existing Claude plugin payload remains unchanged.
 - **Add `module-route` command** — find transitive dependency path(s) between two modules. Supports shortest (BFS) and all-paths (iterative DFS) modes, four output formats (`text`, `json`, `mermaid`, `dot`), edge-kind filtering (`--via-kind api|implementation|all`), configurable depth and path caps, and a wall-clock timeout guard. Accepts Gradle-style module names (`:core:utils`, `core/utils`, `core.utils` all resolve to the same module)
 - **Fix `module-route --all` returning "no path" on large graphs when a direct edge exists** — DFS iterated each frame's edges in alphabetical order, so on a `:app` with many siblings it could blow the 2000ms timeout exploring decoy subtrees before reaching an alphabetically late target. Now each frame's edges are reordered so any edge pointing directly at `to` is processed first; the 1-hop direct path is recorded before any deep recursion. When the search still ends empty due to timeout or `max_paths`, the rendered message says so (`truncated_timeout` / `truncated_max_paths`) instead of the misleading "No dependency path"

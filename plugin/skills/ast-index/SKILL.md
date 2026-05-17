@@ -1,6 +1,7 @@
 ---
 name: ast-index
 description: This skill should be used when the user asks to "find a class", "search for symbol", "find usages", "find implementations", "search codebase", "find file", "class hierarchy", "find callers", "module dependencies", "unused dependencies", "project map", "project conventions", "project structure", "what frameworks", "what architecture", "find Perl subs", "Perl exports", "find Python class", "Go struct", "Go interface", "find React component", "find TypeScript interface", "find Rust struct", "find Ruby class", "find C# controller", "find Dart class", "find Flutter widget", "find mixin", "find Scala trait", "find case class", "find object", "find PHP class", "find Laravel model", "find PHP trait", or needs fast code search in Android/Kotlin/Java, iOS/Swift/ObjC, Dart/Flutter, TypeScript/JavaScript, Rust, Ruby, C#, Scala, PHP, Perl, Python, Go, C++, or Protocol Buffers projects. Also triggered by mentions of "ast-index" CLI tool.
+user-invocable: false
 ---
 
 # ast-index - Code Search for Multi-Platform Projects
