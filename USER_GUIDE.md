@@ -8,6 +8,57 @@ files, symbols, references, modules, and inheritance. After the first build,
 most lookups run in milliseconds instead of repeatedly scanning the whole
 repository.
 
+## Installation
+
+Install a ready-made binary with one of the public distribution channels below.
+
+### Homebrew (macOS / Linux)
+
+```bash
+brew tap defendend/ast-index
+brew install ast-index
+```
+
+You can also use the one-line tap form:
+
+```bash
+brew install defendend/ast-index/ast-index
+```
+
+### npm
+
+Install globally:
+
+```bash
+npm install -g @ast-index/cli
+```
+
+Or run without a global install:
+
+```bash
+npx @ast-index/cli rebuild
+npx @ast-index/cli search MyClass
+```
+
+### Winget (Windows)
+
+```powershell
+winget install --id defendend.ast-index
+```
+
+### GitHub Releases
+
+Download the archive for your platform from
+[GitHub Releases](https://github.com/defendend/Claude-ast-index-search/releases),
+unpack it, and put the `ast-index` binary somewhere on your `PATH`.
+
+### Verify Installation
+
+```bash
+ast-index version
+ast-index help
+```
+
 ## Quick Start
 
 Install `ast-index`, then build an index from the project root:
