@@ -8,7 +8,7 @@ use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
 use super::{LanguageParser, parse_tree, node_text, node_line, line_text};
 
-static DART_LANGUAGE: LazyLock<Language> = LazyLock::new(|| tree_sitter_dart_orchard::LANGUAGE.into());
+static DART_LANGUAGE: LazyLock<Language> = LazyLock::new(|| tree_sitter_dart::LANGUAGE.into());
 
 pub static DART_PARSER: DartParser = DartParser;
 
@@ -18,25 +18,20 @@ impl LanguageParser for DartParser {
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &DART_LANGUAGE)?;
         let mut symbols = Vec::new();
-
-        // Walk the tree manually to extract symbols
         walk_node(&tree.root_node(), content, &mut symbols);
-
         Ok(symbols)
     }
 }
 
-/// Recursively walk the AST and extract symbols
 fn walk_node(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
     match node.kind() {
         "import_or_export" => {
             extract_import(node, content, symbols);
         }
-        "class_definition" => {
+        "class_declaration" => {
             extract_class(node, content, symbols);
-            // Continue walking for inner declarations (methods, constructors, etc.)
             walk_class_body(node, content, symbols);
-            return; // Don't recurse further, we handled it
+            return;
         }
         "mixin_declaration" => {
             extract_mixin(node, content, symbols);
@@ -62,111 +57,61 @@ fn walk_node(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
             extract_typedef(node, content, symbols);
             return;
         }
-        // Top-level functions: tree-sitter-dart 0.0.4 wraps them in lambda_expression
-        "lambda_expression" => {
-            if is_top_level(node) {
-                extract_lambda_function(node, content, symbols);
+        // Fall through to recurse into the body — catches local_function_declaration nested inside.
+        "function_declaration" | "external_function_declaration" => {
+            if let Some(sig) = node.child_by_field_name("signature") {
+                extract_function_signature(&sig, content, symbols);
             }
-            return;
         }
-        "function_signature" => {
-            // Only handle top-level function signatures (without body)
-            if is_top_level(node) || is_in_top_level_wrapper(node) {
-                extract_function_signature(node, content, symbols);
+        "getter_declaration" | "external_getter_declaration" => {
+            if let Some(sig) = node.child_by_field_name("signature") {
+                extract_getter(&sig, content, symbols);
             }
-            return;
         }
-        "getter_signature" => {
-            if is_top_level(node) || is_in_top_level_wrapper(node) {
-                extract_getter(node, content, symbols);
+        "setter_declaration" | "external_setter_declaration" => {
+            if let Some(sig) = node.child_by_field_name("signature") {
+                extract_setter(&sig, content, symbols);
             }
-            return;
         }
-        "setter_signature" => {
-            if is_top_level(node) || is_in_top_level_wrapper(node) {
-                extract_setter(node, content, symbols);
+        "local_function_declaration" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "function_signature" {
+                    extract_function_signature(&child, content, symbols);
+                    break;
+                }
             }
-            return;
         }
-        // Top-level variable declarations (tree-sitter-dart 0.0.4 uses local_variable_declaration)
-        "local_variable_declaration" => {
-            if is_top_level(node) || is_in_top_level_wrapper(node) {
-                extract_local_var_as_property(node, content, symbols);
-            }
-            return;
-        }
-        // Top-level variable declarations
-        "initialized_identifier_list" => {
-            if is_top_level(node) || is_in_top_level_wrapper(node) {
-                extract_top_level_vars(node, content, symbols);
-            }
-            return;
-        }
-        "static_final_declaration_list" => {
-            if is_top_level(node) || is_in_top_level_wrapper(node) {
-                extract_top_level_consts(node, content, symbols);
-            }
-            return;
-        }
-        // ERROR recovery: tree-sitter-dart 0.0.4 doesn't know Dart 3 modifiers
-        // sealed/base/final class, extension type, mixin class
-        "ERROR" => {
-            if is_top_level(node) || is_in_top_level_wrapper(node) {
-                try_recover_from_error(node, content, symbols);
-            }
+        "top_level_variable_declaration" | "external_variable_declaration" => {
+            extract_top_level_variable_decl(node, content, symbols);
             return;
         }
         _ => {}
     }
 
-    // Recurse into children
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         walk_node(&child, content, symbols);
     }
 }
 
-/// Check if a node is a direct child of the program (top-level)
-fn is_top_level(node: &Node) -> bool {
-    node.parent()
-        .map(|p| p.kind() == "program")
-        .unwrap_or(false)
-}
-
-/// Check if a node is within a top-level unnamed wrapper (program > anonymous_node > this)
-fn is_in_top_level_wrapper(node: &Node) -> bool {
-    if let Some(parent) = node.parent() {
-        if parent.kind() == "program" {
-            return true;
-        }
-        // Some constructs are wrapped in an unnamed sequence node at top level
-        if let Some(grandparent) = parent.parent() {
-            if grandparent.kind() == "program" {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Extract import/export declaration
+/// Extract an `import`/`export` declaration as a single Import symbol.
+///
+/// Two AST shapes coexist in tree-sitter-dart 0.2.0:
+///   library_import → import_specification → configurable_uri → uri
+///   library_export → configurable_uri → uri        (no import_specification wrapper)
+/// `find_descendant_by_kind` walks both uniformly.
 fn extract_import(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
     let line = node_line(node);
     let sig = line_text(content, line).trim().to_string();
-    let full_text = node_text(content, node);
 
-    // Find URI string in the import
     if let Some(uri_node) = find_descendant_by_kind(node, "uri") {
-        let uri_text = node_text(content, &uri_node);
-        // Strip quotes from the URI
-        let path = uri_text.trim_matches('\'').trim_matches('"');
-        // Extract short name: last segment without .dart
+        let uri_text = node_text(content, &uri_node).trim().to_string();
+        let path = uri_text
+            .trim_start_matches('\'').trim_end_matches('\'')
+            .trim_start_matches('"').trim_end_matches('"');
         let short_name = path.rsplit('/').next().unwrap_or(path)
             .trim_end_matches(".dart");
-
-        // Check if it's an export
-        let _is_export = full_text.trim_start().starts_with("export");
-
         symbols.push(ParsedSymbol {
             name: short_name.to_string(),
             kind: SymbolKind::Import,
@@ -177,7 +122,106 @@ fn extract_import(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
     }
 }
 
-/// Extract class definition
+/// Extract names from nielsenko's top_level_variable_declaration.
+/// Children: initialized_identifier_list, static_final_declaration_list,
+/// or directly initialized_variable_definition for typed declarations.
+///
+/// Workaround: nielsenko grammar misparses `typedef Foo = Future<void> Function(...)`
+/// as top_level_variable_declaration (the `<void>` confuses the parser as relational).
+/// Detect this case by checking if first child is a `type` containing `typedef` keyword.
+fn extract_top_level_variable_decl(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
+    // Scan any child (not just the first) for a `type` wrapper that holds the
+    // literal keyword `typedef` — `@annotation` directives sit before it.
+    let mut cursor = node.walk();
+    let is_misparsed_typedef = node.children(&mut cursor).any(|c| {
+        c.kind() == "type" && node_text(content, &c).trim() == "typedef"
+    });
+    if is_misparsed_typedef {
+        extract_misparsed_typedef(node, content, symbols);
+        return;
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "initialized_identifier_list" => extract_top_level_vars(&child, content, symbols),
+            "static_final_declaration_list" => extract_top_level_consts(&child, content, symbols),
+            "initialized_variable_definition" => {
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    let name = node_text(content, &name_node).to_string();
+                    let line = node_line(&child);
+                    symbols.push(ParsedSymbol {
+                        name,
+                        kind: SymbolKind::Property,
+                        line,
+                        signature: line_text(content, line).trim().to_string(),
+                        parents: vec![],
+                    });
+                }
+            }
+            // `external int x;` produces a bare identifier_list with no initializer.
+            "identifier_list" => {
+                let mut inner = child.walk();
+                for id in child.children(&mut inner) {
+                    if id.kind() == "identifier" {
+                        let line = node_line(&id);
+                        symbols.push(ParsedSymbol {
+                            name: node_text(content, &id).to_string(),
+                            kind: SymbolKind::Property,
+                            line,
+                            signature: line_text(content, line).trim().to_string(),
+                            parents: vec![],
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Extract typedef name from a top_level_variable_declaration that nielsenko misparses.
+/// AST shape:
+///   top_level_variable_declaration
+///     type (text "typedef")
+///     initialized_identifier_list
+///       initialized_identifier
+///         identifier <NAME>   ← extract this
+///         = ...
+fn extract_misparsed_typedef(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
+    let line = node_line(node);
+    let sig = line_text(content, line).trim().to_string();
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "initialized_identifier_list" {
+            let mut inner_cursor = child.walk();
+            for inner in child.children(&mut inner_cursor) {
+                if inner.kind() == "initialized_identifier" {
+                    let mut id_cursor = inner.walk();
+                    for grandchild in inner.children(&mut id_cursor) {
+                        if grandchild.kind() == "identifier" {
+                            let name = node_text(content, &grandchild).to_string();
+                            if !name.is_empty() {
+                                symbols.push(ParsedSymbol {
+                                    name,
+                                    kind: SymbolKind::TypeAlias,
+                                    line,
+                                    signature: sig.clone(),
+                                    parents: vec![],
+                                });
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            return;
+        }
+    }
+}
+
+/// Extract a class declaration as a Class or Interface symbol with its parents.
 fn extract_class(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
     let name = match node.child_by_field_name("name") {
         Some(n) => node_text(content, &n).to_string(),
@@ -187,24 +231,20 @@ fn extract_class(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
     let line = node_line(node);
     let sig = line_text(content, line).trim().to_string();
 
-    // Determine kind: check for "interface" modifier
+    // Detect the `interface class` modifier by scanning the declaration prefix.
     let full_text = node_text(content, node);
     let decl_prefix = full_text.split('{').next().unwrap_or("");
-
     let kind = if decl_prefix.contains("interface class") || decl_prefix.contains("interface  class") {
         SymbolKind::Interface
     } else {
         SymbolKind::Class
     };
 
-    // Extract parents
     let mut parents = Vec::new();
-
     // superclass field
     if let Some(superclass_node) = node.child_by_field_name("superclass") {
         extract_superclass_parents(&superclass_node, content, &mut parents);
     }
-
     // interfaces field
     if let Some(interfaces_node) = node.child_by_field_name("interfaces") {
         extract_interfaces_parents(&interfaces_node, content, &mut parents);
@@ -219,41 +259,51 @@ fn extract_class(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
     });
 }
 
-/// Extract parents from a superclass node
+/// Extract parents from a `superclass` field.
+///
+/// In tree-sitter-dart 0.2.0, `class C extends B<X>` lays out `superclass` as
+///   extends, type 'B', type '<X>', ...
+/// Only the first `type` sibling is the actual superclass; subsequent `type`
+/// siblings wrap type arguments and must not be promoted to parents.
 fn extract_superclass_parents(node: &Node, content: &str, parents: &mut Vec<(String, String)>) {
     let mut cursor = node.walk();
+    let mut took_superclass = false;
     for child in node.children(&mut cursor) {
         match child.kind() {
-            "type_identifier" => {
+            "type_identifier" if !took_superclass => {
                 let name = node_text(content, &child).to_string();
                 let base = name.split('<').next().unwrap_or(&name).trim().to_string();
                 if !base.is_empty() {
                     parents.push((base, "extends".to_string()));
+                    took_superclass = true;
                 }
             }
-            "mixins" => {
-                extract_mixins_parents(&child, content, parents);
-            }
-            _ => {
-                if child.kind() != "extends" && child.named_child_count() > 0 {
-                    extract_type_names_from_node(&child, content, parents, "extends");
+            "type" if !took_superclass => {
+                if let Some(name) = find_first_type_identifier(&child, content) {
+                    let base = name.split('<').next().unwrap_or(&name).trim().to_string();
+                    if !base.is_empty() {
+                        parents.push((base, "extends".to_string()));
+                        took_superclass = true;
+                    }
                 }
             }
+            "mixins" => extract_mixins_parents(&child, content, parents),
+            _ => {}
         }
     }
 }
 
-/// Extract parent types from a mixins node ("with" clause)
+/// Extract parents from a `with` (mixins) clause.
 fn extract_mixins_parents(node: &Node, content: &str, parents: &mut Vec<(String, String)>) {
     extract_type_names_from_node(node, content, parents, "with");
 }
 
-/// Extract parent types from an interfaces node ("implements" clause)
+/// Extract parents from an `implements` (interfaces) clause.
 fn extract_interfaces_parents(node: &Node, content: &str, parents: &mut Vec<(String, String)>) {
     extract_type_names_from_node(node, content, parents, "implements");
 }
 
-/// Recursively extract type_identifier names from a node, for a given relationship kind
+/// Collect every `type_identifier` descendant of `node` as a parent of `kind`.
 fn extract_type_names_from_node(node: &Node, content: &str, parents: &mut Vec<(String, String)>, kind: &str) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -268,59 +318,37 @@ fn extract_type_names_from_node(node: &Node, content: &str, parents: &mut Vec<(S
     }
 }
 
-/// Extract mixin declaration
+/// Extract a `mixin` declaration with its `on` and `implements` parents.
 fn extract_mixin(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
     let line = node_line(node);
     let sig = line_text(content, line).trim().to_string();
 
-    // Check if this is "mixin class" (Dart 3) — tree-sitter-dart 0.0.4 parses it
-    // as mixin_declaration with an ERROR child "class"
-    let has_class_keyword = {
-        let mut cursor = node.walk();
-        let result = node.children(&mut cursor).any(|c| c.kind() == "ERROR" && node_text(content, &c).trim() == "class");
-        result
-    };
-
-    if has_class_keyword {
-        // "mixin class" → treat as Class
-        let name = find_mixin_name(node, content);
-        if name.is_empty() { return; }
-
-        symbols.push(ParsedSymbol {
-            name,
-            kind: SymbolKind::Class,
-            line,
-            signature: sig,
-            parents: vec![],
-        });
-        return;
-    }
-
-    // Regular mixin
     let name = find_mixin_name(node, content);
     if name.is_empty() { return; }
 
     let mut parents = Vec::new();
-
     let node_text_full = node_text(content, node);
     let mut cursor = node.walk();
     let mut found_on = false;
     for child in node.children(&mut cursor) {
-        if child.kind() == "on" {
-            found_on = true;
-        }
-        if child.kind() == "type_identifier" && found_on {
-            let type_name = node_text(content, &child).to_string();
-            if !type_name.is_empty() {
-                parents.push((type_name, "extends".to_string()));
+        match child.kind() {
+            "on" => found_on = true,
+            // nielsenko wraps each on-type in a `type` node containing the type_identifier.
+            "type" if found_on => {
+                if let Some(name) = find_first_type_identifier(&child, content) {
+                    let base = name.split('<').next().unwrap_or(&name).trim().to_string();
+                    if !base.is_empty() {
+                        parents.push((base, "extends".to_string()));
+                    }
+                }
             }
-        }
-        if child.kind() == "interfaces" {
-            extract_interfaces_parents(&child, content, &mut parents);
+            "interfaces" => extract_interfaces_parents(&child, content, &mut parents),
+            _ => {}
         }
     }
 
-    // Fallback: parse from text if no parents found via tree
+    // Fallback: when the grammar doesn't expose `on` types as direct children,
+    // parse them out of the source text.
     if parents.is_empty() && node_text_full.contains(" on ") {
         let on_part = node_text_full.split(" on ").nth(1).unwrap_or("");
         let on_types = on_part.split("implements").next().unwrap_or(on_part);
@@ -351,7 +379,7 @@ fn extract_mixin(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
     });
 }
 
-/// Find the mixin name from a mixin_declaration node
+/// Return the `identifier` child of a `mixin_declaration` as a String.
 fn find_mixin_name(node: &Node, content: &str) -> String {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -362,11 +390,11 @@ fn find_mixin_name(node: &Node, content: &str) -> String {
     String::new()
 }
 
-/// Extract extension declaration
+/// Extract an `extension` declaration with its on-type as the parent.
 fn extract_extension(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
     let name = match node.child_by_field_name("name") {
         Some(n) => node_text(content, &n).to_string(),
-        None => return, // Anonymous extension, skip
+        None => return,
     };
 
     let line = node_line(node);
@@ -374,7 +402,7 @@ fn extract_extension(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>
 
     let mut parents = Vec::new();
 
-    // "on" type is the "class" field in extension_declaration
+    // The on-type lives under the `class` field — nielsenko grammar quirk.
     if let Some(class_node) = node.child_by_field_name("class") {
         let on_type = if class_node.kind() == "type_identifier" {
             node_text(content, &class_node).to_string()
@@ -397,21 +425,48 @@ fn extract_extension(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>
     });
 }
 
-/// Extract extension type declaration
+/// Extract an `extension type` declaration with its `implements` parents.
+///
+/// nielsenko exposes the name either as a dedicated `extension_type_name` node
+/// (when type parameters are present) or as a plain `identifier`; both shapes
+/// are handled. The `implements` clause is a flat sequence of children
+/// (`implements` keyword followed by `type` nodes), not a named field.
 fn extract_extension_type(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
     let name = match node.child_by_field_name("name") {
-        Some(n) => node_text(content, &n).to_string(),
+        Some(n) => {
+            if n.kind() == "extension_type_name" {
+                find_first_identifier(&n, content).unwrap_or_default()
+            } else {
+                node_text(content, &n).to_string()
+            }
+        }
         None => return,
     };
+    if name.is_empty() { return; }
 
     let line = node_line(node);
     let sig = line_text(content, line).trim().to_string();
 
+    // nielsenko does not expose `interfaces` as a field on extension_type_declaration —
+    // the `implements` clause is laid out as a flat sequence of children: `implements`
+    // keyword followed by one or more `type` nodes.
     let mut parents = Vec::new();
-
-    // interfaces
-    if let Some(interfaces_node) = node.child_by_field_name("interfaces") {
-        extract_interfaces_parents(&interfaces_node, content, &mut parents);
+    let mut cursor = node.walk();
+    let mut after_implements = false;
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "implements" => after_implements = true,
+            "type" if after_implements => {
+                if let Some(name) = find_first_type_identifier(&child, content) {
+                    let base = name.split('<').next().unwrap_or(&name).trim().to_string();
+                    if !base.is_empty() {
+                        parents.push((base, "implements".to_string()));
+                    }
+                }
+            }
+            "class_body" => break,
+            _ => {}
+        }
     }
 
     symbols.push(ParsedSymbol {
@@ -423,7 +478,7 @@ fn extract_extension_type(node: &Node, content: &str, symbols: &mut Vec<ParsedSy
     });
 }
 
-/// Extract enum declaration
+/// Extract an `enum` declaration with its `with` and `implements` parents.
 fn extract_enum(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
     let name = match node.child_by_field_name("name") {
         Some(n) => node_text(content, &n).to_string(),
@@ -435,16 +490,11 @@ fn extract_enum(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
 
     let mut parents = Vec::new();
 
-    // Standard tree: mixins and interfaces as children
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
             "mixins" => extract_mixins_parents(&child, content, &mut parents),
             "interfaces" => extract_interfaces_parents(&child, content, &mut parents),
-            // tree-sitter-dart 0.0.4: "with"/"implements" end up in ERROR node
-            "ERROR" => {
-                extract_parents_from_error_text(&child, content, &mut parents);
-            }
             _ => {}
         }
     }
@@ -458,24 +508,28 @@ fn extract_enum(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
     });
 }
 
-/// Extract typedef/type_alias
+/// Extract a `typedef` as a TypeAlias. Handles both new-style `typedef Foo = X`
+/// and old-style C-form `typedef Ret Name(args)` shapes.
 fn extract_typedef(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
     let line = node_line(node);
     let sig = line_text(content, line).trim().to_string();
 
-    let name = find_first_type_identifier(node, content)
+    // Old-style C-form `typedef int OldStyle(int x)` lays out as
+    //   typedef, type 'int', type_identifier 'OldStyle', formal_parameter_list
+    // i.e. the return type appears BEFORE the typedef name. Prefer the
+    // type_identifier that is a direct child (the name); fall back to deeper
+    // search only for the new-style form `typedef Foo = ...` where the name
+    // is the first type_identifier.
+    let name = node.children(&mut node.walk())
+        .find(|c| c.kind() == "type_identifier")
+        .map(|c| node_text(content, &c).to_string())
+        .or_else(|| find_first_type_identifier(node, content))
         .or_else(|| {
             let text = node_text(content, node);
             let after_typedef = text.strip_prefix("typedef")?.trim();
-            let name_part = after_typedef.split(|c: char| c == '=' || c == '(' || c == '<').next()?;
+            let name_part = after_typedef.split(['=', '(', '<']).next()?;
             let tokens: Vec<&str> = name_part.split_whitespace().collect();
-            if tokens.len() >= 2 {
-                Some(tokens[tokens.len() - 1].to_string())
-            } else if tokens.len() == 1 {
-                Some(tokens[0].to_string())
-            } else {
-                None
-            }
+            tokens.last().map(|s| s.to_string())
         });
 
     if let Some(name) = name {
@@ -491,59 +545,27 @@ fn extract_typedef(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) 
     }
 }
 
-/// Extract a function from lambda_expression at top level.
-/// tree-sitter-dart 0.0.4 wraps "void main() {}" as lambda_expression > function_signature + function_body
-fn extract_lambda_function(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
-    // Find function_signature child
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == "function_signature" {
-            if let Some(name_node) = child.child_by_field_name("name") {
-                let name = node_text(content, &name_node).to_string();
-                let line = node_line(&child);
-                let sig = line_text(content, line).trim().to_string();
-
-                symbols.push(ParsedSymbol {
-                    name,
-                    kind: SymbolKind::Function,
-                    line,
-                    signature: sig,
-                    parents: vec![],
-                });
-                return;
-            }
-            // Fallback: find identifier child
-            let mut inner_cursor = child.walk();
-            for inner in child.children(&mut inner_cursor) {
-                if inner.kind() == "identifier" {
-                    let name = node_text(content, &inner).to_string();
-                    let line = node_line(&child);
-                    let sig = line_text(content, line).trim().to_string();
-
-                    symbols.push(ParsedSymbol {
-                        name,
-                        kind: SymbolKind::Function,
-                        line,
-                        signature: sig,
-                        parents: vec![],
-                    });
-                    return;
-                }
-            }
-        }
-    }
-}
-
-/// Extract a function_signature at top level
+/// Extract a `function_signature` as a Function (or Property for `set`/`get` keywords).
 fn extract_function_signature(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
     if let Some(name_node) = node.child_by_field_name("name") {
         let name = node_text(content, &name_node).to_string();
         let line = node_line(node);
         let sig = line_text(content, line).trim().to_string();
 
+        // Top-level `set foo(v) {}` and `get foo => …` parse as function_declaration —
+        // the `set`/`get` keyword surfaces in the return_type slot. Re-classify them
+        // as Property to keep semantic parity with class-level accessors.
+        let kind = match node.child_by_field_name("return_type")
+            .map(|n| node_text(content, &n).trim().to_string())
+            .as_deref()
+        {
+            Some("set") | Some("get") => SymbolKind::Property,
+            _ => SymbolKind::Function,
+        };
+
         symbols.push(ParsedSymbol {
             name,
-            kind: SymbolKind::Function,
+            kind,
             line,
             signature: sig,
             parents: vec![],
@@ -551,7 +573,7 @@ fn extract_function_signature(node: &Node, content: &str, symbols: &mut Vec<Pars
     }
 }
 
-/// Extract getter
+/// Extract a `getter_signature` as a Property.
 fn extract_getter(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
     if let Some(name_node) = node.child_by_field_name("name") {
         let name = node_text(content, &name_node).to_string();
@@ -568,7 +590,7 @@ fn extract_getter(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
     }
 }
 
-/// Extract setter
+/// Extract a `setter_signature` as a Property.
 fn extract_setter(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
     if let Some(name_node) = node.child_by_field_name("name") {
         let name = node_text(content, &name_node).to_string();
@@ -585,28 +607,7 @@ fn extract_setter(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
     }
 }
 
-/// Extract top-level variable from local_variable_declaration.
-/// tree-sitter-dart 0.0.4 uses local_variable_declaration for top-level vars.
-fn extract_local_var_as_property(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
-    // local_variable_declaration > initialized_variable_definition > identifier
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == "initialized_variable_definition" {
-            if let Some(id) = find_first_identifier(&child, content) {
-                let line = node_line(&child);
-                symbols.push(ParsedSymbol {
-                    name: id,
-                    kind: SymbolKind::Property,
-                    line,
-                    signature: line_text(content, line).trim().to_string(),
-                    parents: vec![],
-                });
-            }
-        }
-    }
-}
-
-/// Walk class body for methods, constructors, getters, setters
+/// Walk a class, mixin, enum or extension-type body for member declarations.
 fn walk_class_body(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
     let body = find_descendant_by_kind(node, "class_body")
         .or_else(|| find_descendant_by_kind(node, "enum_body"));
@@ -616,14 +617,14 @@ fn walk_class_body(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) 
     }
 }
 
-/// Walk extension body for methods
+/// Walk an `extension` body for member declarations.
 fn walk_extension_body(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
     if let Some(body) = node.child_by_field_name("body") {
         walk_body_declarations(&body, content, symbols);
     }
 }
 
-/// Walk body for declarations (methods, constructors, getters, setters, properties)
+/// Dispatch each direct child of a body node to `walk_body_member`.
 fn walk_body_declarations(body: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
     let mut cursor = body.walk();
     for child in body.children(&mut cursor) {
@@ -631,35 +632,34 @@ fn walk_body_declarations(body: &Node, content: &str, symbols: &mut Vec<ParsedSy
     }
 }
 
-/// Process a single member in a class/extension body
+/// nielsenko wraps inner declarations in `class_member`; method bodies are
+/// walked recursively so local_function_declaration inside them is captured.
 fn walk_body_member(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
     match node.kind() {
-        "declaration" => {
-            extract_declaration(node, content, symbols);
+        "class_member" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                walk_body_member(&child, content, symbols);
+            }
         }
-        "method_signature" => {
-            extract_method_signature(node, content, symbols);
+        "method_declaration" | "getter_declaration" | "setter_declaration" => {
+            if let Some(sig) = node.child_by_field_name("signature") {
+                dispatch_member_node(&sig, content, symbols);
+            }
+            if let Some(body) = node.child_by_field_name("body") {
+                walk_node(&body, content, symbols);
+            }
         }
-        "function_signature" => {
-            extract_function_signature(node, content, symbols);
-        }
-        "getter_signature" => {
-            extract_getter(node, content, symbols);
-        }
-        "setter_signature" => {
-            extract_setter(node, content, symbols);
-        }
-        "constructor_signature" => {
-            extract_constructor(node, content, symbols);
-        }
-        "factory_constructor_signature" => {
-            extract_factory_constructor(node, content, symbols);
-        }
-        "constant_constructor_signature" => {
-            extract_const_constructor(node, content, symbols);
+        "declaration" | "method_signature" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                dispatch_member_node(&child, content, symbols);
+            }
         }
         _ => {
-            // Recurse one level to find declarations
+            if dispatch_member_node(node, content, symbols) {
+                return;
+            }
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
                 walk_body_member(&child, content, symbols);
@@ -668,69 +668,67 @@ fn walk_body_member(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>)
     }
 }
 
-/// Extract declaration (wraps method_signature, variable decls, etc.)
-fn extract_declaration(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        match child.kind() {
-            "function_signature" => {
-                extract_function_signature(&child, content, symbols);
+/// Single source of truth for handling signature-shaped and field-shaped
+/// children that may appear under `method_declaration > signature`,
+/// `declaration`, or directly inside `class_body`. Returns true if the node
+/// kind was recognised.
+fn dispatch_member_node(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) -> bool {
+    match node.kind() {
+        "function_signature" => extract_function_signature(node, content, symbols),
+        "getter_signature" => extract_getter(node, content, symbols),
+        "setter_signature" => extract_setter(node, content, symbols),
+        "constructor_signature" => extract_constructor(node, content, symbols),
+        "factory_constructor_signature" => extract_factory_constructor(node, content, symbols),
+        "constant_constructor_signature" => extract_const_constructor(node, content, symbols),
+        "operator_signature" => extract_operator(node, content, symbols),
+        // Instance fields: `class C { final int x = 1; }` lives under
+        // declaration > initialized_identifier_list > initialized_identifier.
+        "initialized_identifier_list" => extract_top_level_vars(node, content, symbols),
+        "static_final_declaration_list" => extract_top_level_consts(node, content, symbols),
+        // Wrappers — iterate their children and re-dispatch.
+        "method_signature" | "declaration" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                dispatch_member_node(&child, content, symbols);
             }
-            "getter_signature" => {
-                extract_getter(&child, content, symbols);
-            }
-            "setter_signature" => {
-                extract_setter(&child, content, symbols);
-            }
-            "constructor_signature" => {
-                extract_constructor(&child, content, symbols);
-            }
-            "factory_constructor_signature" => {
-                extract_factory_constructor(&child, content, symbols);
-            }
-            "constant_constructor_signature" => {
-                extract_const_constructor(&child, content, symbols);
-            }
-            _ => {}
         }
+        _ => return false,
     }
+    true
 }
 
-/// Extract method_signature (wraps constructor_signature, function_signature, etc.)
-fn extract_method_signature(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        match child.kind() {
-            "function_signature" => {
-                extract_function_signature(&child, content, symbols);
-            }
-            "getter_signature" => {
-                extract_getter(&child, content, symbols);
-            }
-            "setter_signature" => {
-                extract_setter(&child, content, symbols);
-            }
-            "constructor_signature" => {
-                extract_constructor(&child, content, symbols);
-            }
-            "factory_constructor_signature" => {
-                extract_factory_constructor(&child, content, symbols);
-            }
-            "constant_constructor_signature" => {
-                extract_const_constructor(&child, content, symbols);
-            }
-            _ => {}
-        }
-    }
+/// nielsenko AST for `bool operator ==(C other)`:
+///   operator_signature
+///     type [field=return_type]
+///     operator                     (keyword)
+///     binary_operator [field=operator] '=='
+///     formal_parameter_list
+/// The operator token lives in the `operator` field — its text is the symbol name
+/// (e.g. `==`, `+`, `[]`).
+fn extract_operator(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
+    let op_text = node.child_by_field_name("operator")
+        .map(|n| node_text(content, &n).trim().to_string())
+        .unwrap_or_default();
+    if op_text.is_empty() { return; }
+
+    let line = node_line(node);
+    let sig = line_text(content, line).trim().to_string();
+    symbols.push(ParsedSymbol {
+        name: format!("operator{op_text}"),
+        kind: SymbolKind::Function,
+        line,
+        signature: sig,
+        parents: vec![],
+    });
 }
 
-/// Extract constructor: ClassName(...) or ClassName.named(...)
+/// Extract a `constructor_signature` as a Function (preserving any `.named` part).
 fn extract_constructor(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
     let line = node_line(node);
     let sig = line_text(content, line).trim().to_string();
 
-    // Always use collect_constructor_name to get the full name (ClassName.namedPart)
-    // because child_by_field_name("name") only returns the class part
+    // child_by_field_name("name") returns only the class part — collect the
+    // full `ClassName.namedPart` form manually.
     let name_text = collect_constructor_name(node, content);
 
     if !name_text.is_empty() {
@@ -744,7 +742,8 @@ fn extract_constructor(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbo
     }
 }
 
-/// Collect constructor name from node children (identifiers and dots joined)
+/// Build the full constructor name (e.g. `ClassName.named`) by joining all
+/// identifier children before the parameter list.
 fn collect_constructor_name(node: &Node, content: &str) -> String {
     let mut parts = Vec::new();
     let mut cursor = node.walk();
@@ -752,7 +751,7 @@ fn collect_constructor_name(node: &Node, content: &str) -> String {
         if child.kind() == "identifier" {
             parts.push(node_text(content, &child));
         }
-        // Stop at formal_parameter_list (constructor args)
+        // Parameters may contain `this.foo` identifiers — stop before them.
         if child.kind() == "formal_parameter_list" {
             break;
         }
@@ -760,7 +759,7 @@ fn collect_constructor_name(node: &Node, content: &str) -> String {
     parts.join(".")
 }
 
-/// Extract factory constructor
+/// Extract a `factory_constructor_signature` as a Function.
 fn extract_factory_constructor(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
     let line = node_line(node);
     let sig = line_text(content, line).trim().to_string();
@@ -778,7 +777,7 @@ fn extract_factory_constructor(node: &Node, content: &str, symbols: &mut Vec<Par
     }
 }
 
-/// Extract const constructor
+/// Extract a `constant_constructor_signature` as a Function.
 fn extract_const_constructor(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
     let line = node_line(node);
     let sig = line_text(content, line).trim().to_string();
@@ -796,7 +795,8 @@ fn extract_const_constructor(node: &Node, content: &str, symbols: &mut Vec<Parse
     }
 }
 
-/// Extract top-level variable declarations (final/var/type)
+/// Extract names from an `initialized_identifier_list` as Property symbols
+/// (top-level `final`/`var`/typed declarations and class-level instance fields).
 fn extract_top_level_vars(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -815,7 +815,7 @@ fn extract_top_level_vars(node: &Node, content: &str, symbols: &mut Vec<ParsedSy
     }
 }
 
-/// Extract top-level constant declarations
+/// Extract names from a `static_final_declaration_list` (multi-name `const`/`final`).
 fn extract_top_level_consts(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -834,162 +834,7 @@ fn extract_top_level_consts(node: &Node, content: &str, symbols: &mut Vec<Parsed
     }
 }
 
-/// Try to recover declarations from ERROR nodes.
-/// tree-sitter-dart 0.0.4 doesn't understand Dart 3 modifiers:
-/// - sealed class, base class, final class → ERROR + block sibling
-/// - extension type → ERROR + block sibling
-fn try_recover_from_error(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
-    let text = node_text(content, node).trim().to_string();
-    let line = node_line(node);
-
-    // Check for "sealed class X", "base class X", "final class X"
-    if let Some(class_info) = try_parse_modified_class(&text) {
-        let sig_line = line_text(content, line).trim().to_string();
-        // Try to find block sibling for body methods
-        let mut parents = Vec::new();
-        // Parse parents from the text after the class name
-        parse_parents_from_class_text(&text, &mut parents);
-
-        symbols.push(ParsedSymbol {
-            name: class_info.name,
-            kind: class_info.kind,
-            line,
-            signature: sig_line,
-            parents,
-        });
-
-        // Walk the next sibling (block node) for body declarations
-        if let Some(next) = node.next_sibling() {
-            if next.kind() == "block" {
-                walk_body_declarations(&next, content, symbols);
-            }
-        }
-    }
-
-    // Check for "extension type X(...) implements Y"
-    if text.starts_with("extension type ") || text.starts_with("extension  type ") {
-        if let Some(ext_type_info) = try_parse_extension_type(&text) {
-            let sig_line = line_text(content, line).trim().to_string();
-            symbols.push(ParsedSymbol {
-                name: ext_type_info.name,
-                kind: SymbolKind::Class,
-                line,
-                signature: sig_line,
-                parents: ext_type_info.parents,
-            });
-        }
-    }
-}
-
-struct ClassInfo {
-    name: String,
-    kind: SymbolKind,
-}
-
-struct ExtTypeInfo {
-    name: String,
-    parents: Vec<(String, String)>,
-}
-
-/// Try to parse "sealed/base/final class ClassName" from ERROR text
-fn try_parse_modified_class(text: &str) -> Option<ClassInfo> {
-    // Patterns: "sealed class X", "base class X", "final class X",
-    //           "abstract sealed class X", etc.
-    let words: Vec<&str> = text.split_whitespace().collect();
-
-    // Find "class" keyword
-    let class_idx = words.iter().position(|w| *w == "class")?;
-    if class_idx + 1 >= words.len() { return None; }
-
-    let name = words[class_idx + 1].to_string();
-    // Strip generic parameters
-    let name = name.split('<').next().unwrap_or(&name).trim().to_string();
-
-    if name.is_empty() { return None; }
-
-    // Check for modifiers before "class"
-    let modifiers: Vec<&str> = words[..class_idx].to_vec();
-    let kind = if modifiers.contains(&"interface") {
-        SymbolKind::Interface
-    } else {
-        SymbolKind::Class
-    };
-
-    Some(ClassInfo { name, kind })
-}
-
-/// Parse parents from class declaration text (after class name)
-fn parse_parents_from_class_text(text: &str, parents: &mut Vec<(String, String)>) {
-    // Find "extends", "with", "implements" in the text
-    let parts = text.split_whitespace().collect::<Vec<_>>();
-
-    let mut mode = "";
-    for &word in &parts {
-        match word {
-            "extends" => { mode = "extends"; continue; }
-            "with" => { mode = "with"; continue; }
-            "implements" => { mode = "implements"; continue; }
-            "class" | "sealed" | "base" | "final" | "abstract" | "interface" => continue,
-            _ => {}
-        }
-        if !mode.is_empty() {
-            // This word is a type name
-            let name = word.trim_end_matches(',').split('<').next().unwrap_or("").trim();
-            if !name.is_empty() && name != "{" && name != "}" {
-                parents.push((name.to_string(), mode.to_string()));
-            }
-        }
-    }
-}
-
-/// Try to parse "extension type X(...) implements Y" from ERROR text
-fn try_parse_extension_type(text: &str) -> Option<ExtTypeInfo> {
-    let words: Vec<&str> = text.split_whitespace().collect();
-
-    // Find "type" keyword after "extension"
-    let type_idx = words.iter().position(|w| *w == "type")?;
-    if type_idx + 1 >= words.len() { return None; }
-
-    let name_raw = words[type_idx + 1];
-    let name = name_raw.split('(').next().unwrap_or(name_raw).trim().to_string();
-
-    if name.is_empty() { return None; }
-
-    let mut parents = Vec::new();
-    if let Some(impl_idx) = words.iter().position(|w| *w == "implements") {
-        for &word in &words[impl_idx + 1..] {
-            let type_name = word.trim_end_matches(',').split('<').next().unwrap_or("").trim();
-            if !type_name.is_empty() && type_name != "{" && type_name != "}" {
-                parents.push((type_name.to_string(), "implements".to_string()));
-            }
-        }
-    }
-
-    Some(ExtTypeInfo { name, parents })
-}
-
-/// Extract parents from ERROR node text (for enum with/implements in tree-sitter-dart 0.0.4)
-fn extract_parents_from_error_text(node: &Node, content: &str, parents: &mut Vec<(String, String)>) {
-    let text = node_text(content, node);
-    let words: Vec<&str> = text.split_whitespace().collect();
-
-    let mut mode = "";
-    for &word in &words {
-        match word {
-            "with" => { mode = "with"; continue; }
-            "implements" => { mode = "implements"; continue; }
-            _ => {}
-        }
-        if !mode.is_empty() {
-            let name = word.trim_end_matches(',').split('<').next().unwrap_or("").trim();
-            if !name.is_empty() {
-                parents.push((name.to_string(), mode.to_string()));
-            }
-        }
-    }
-}
-
-/// Find first identifier child node and return its text
+/// Return the first `identifier` direct child of `node`.
 fn find_first_identifier(node: &Node, content: &str) -> Option<String> {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -1000,7 +845,7 @@ fn find_first_identifier(node: &Node, content: &str) -> Option<String> {
     None
 }
 
-/// Find first type_identifier in descendants
+/// Return the first `type_identifier` descendant of `node` (DFS, pre-order).
 fn find_first_type_identifier(node: &Node, content: &str) -> Option<String> {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -1014,7 +859,7 @@ fn find_first_type_identifier(node: &Node, content: &str) -> Option<String> {
     None
 }
 
-/// Find a descendant node by kind
+/// Return the first descendant of `node` whose kind matches `kind` (DFS, pre-order).
 fn find_descendant_by_kind<'a>(node: &Node<'a>, kind: &str) -> Option<Node<'a>> {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -1054,8 +899,8 @@ mod tests {
     fn test_parse_sealed_class() {
         let content = "sealed class Result {\n}\n";
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        let cls = symbols.iter().find(|s| s.name == "Result").expect(
-            &format!("Should find sealed class Result, got: {:?}", symbols));
+        let cls = symbols.iter().find(|s| s.name == "Result")
+            .unwrap_or_else(|| panic!("Should find sealed class Result, got: {symbols:?}"));
         assert_eq!(cls.kind, SymbolKind::Class);
     }
 
@@ -1117,8 +962,8 @@ mod tests {
     fn test_parse_extension_type() {
         let content = "extension type UserId(int id) implements int {\n}\n";
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        let et = symbols.iter().find(|s| s.name == "UserId").expect(
-            &format!("Should find extension type UserId, got: {:?}", symbols));
+        let et = symbols.iter().find(|s| s.name == "UserId")
+            .unwrap_or_else(|| panic!("Should find extension type UserId, got: {symbols:?}"));
         assert_eq!(et.kind, SymbolKind::Class);
         assert!(et.parents.iter().any(|(p, _)| p == "int"),
             "Expected implements int, got: {:?}", et.parents);
@@ -1158,6 +1003,142 @@ mod tests {
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
         let td = symbols.iter().find(|s| s.name == "VoidCallback").unwrap();
         assert_eq!(td.kind, SymbolKind::TypeAlias);
+    }
+
+    // Grammar misparses `typedef Foo = Future<void> Function(...)` as a variable
+    // declaration; extract_misparsed_typedef recovers the name from the
+    // initialized_identifier_list shape.
+    #[test]
+    fn test_parse_misparsed_typedef() {
+        let content = "typedef AsyncCallback = Future<void> Function(int x);\n";
+        let symbols = DART_PARSER.parse_symbols(content).unwrap();
+        let td = symbols.iter().find(|s| s.name == "AsyncCallback")
+            .unwrap_or_else(|| panic!("Should find AsyncCallback, got: {symbols:?}"));
+        assert_eq!(td.kind, SymbolKind::TypeAlias);
+    }
+
+    // Annotations precede the misparsed `typedef`; the detection must scan all
+    // children, not just child(0).
+    #[test]
+    fn test_parse_annotated_misparsed_typedef() {
+        let content = "@deprecated\ntypedef DeprCallback = Future<void> Function();\n";
+        let symbols = DART_PARSER.parse_symbols(content).unwrap();
+        let td = symbols.iter().find(|s| s.name == "DeprCallback")
+            .unwrap_or_else(|| panic!("Should find DeprCallback, got: {symbols:?}"));
+        assert_eq!(td.kind, SymbolKind::TypeAlias);
+    }
+
+    // Old C-form typedef puts the return type before the name; ensure the name
+    // is extracted, not the return type.
+    #[test]
+    fn test_parse_old_style_typedef() {
+        let content = "typedef int OldStyle(int x);\n";
+        let symbols = DART_PARSER.parse_symbols(content).unwrap();
+        let td = symbols.iter().find(|s| s.name == "OldStyle")
+            .unwrap_or_else(|| panic!("Should find OldStyle, got: {symbols:?}"));
+        assert_eq!(td.kind, SymbolKind::TypeAlias);
+        assert!(symbols.iter().all(|s| s.name != "int"),
+            "Must not record return type as the typedef name");
+    }
+
+    // `class C extends B<X>` must yield exactly one parent, not B and X.
+    #[test]
+    fn test_parse_class_extends_generic() {
+        let content = "class C extends B<X> {}\n";
+        let symbols = DART_PARSER.parse_symbols(content).unwrap();
+        let cls = symbols.iter().find(|s| s.name == "C")
+            .unwrap_or_else(|| panic!("Should find class C, got: {symbols:?}"));
+        let extends: Vec<_> = cls.parents.iter()
+            .filter(|(_, kind)| kind == "extends").collect();
+        assert_eq!(extends.len(), 1, "Expected one extends parent, got: {:?}", cls.parents);
+        assert_eq!(extends[0].0, "B");
+    }
+
+    // `mixin M on Base implements I {}` — both relationships must be captured.
+    #[test]
+    fn test_parse_mixin_with_on_and_implements() {
+        let content = "mixin M on Base implements I {}\n";
+        let symbols = DART_PARSER.parse_symbols(content).unwrap();
+        let m = symbols.iter().find(|s| s.name == "M")
+            .unwrap_or_else(|| panic!("Should find mixin M, got: {symbols:?}"));
+        assert!(m.parents.iter().any(|(p, k)| p == "Base" && k == "extends"),
+            "Expected on Base, got: {:?}", m.parents);
+        assert!(m.parents.iter().any(|(p, k)| p == "I" && k == "implements"),
+            "Expected implements I, got: {:?}", m.parents);
+    }
+
+    // Extension type `implements` is a flat sequence in nielsenko (no `interfaces` field).
+    #[test]
+    fn test_parse_extension_type_implements() {
+        let content = "extension type UserId(int id) implements int {}\n";
+        let symbols = DART_PARSER.parse_symbols(content).unwrap();
+        let et = symbols.iter().find(|s| s.name == "UserId")
+            .unwrap_or_else(|| panic!("Should find UserId, got: {symbols:?}"));
+        assert!(et.parents.iter().any(|(p, k)| p == "int" && k == "implements"),
+            "Expected implements int, got: {:?}", et.parents);
+    }
+
+    // `external int x;` produces a bare `identifier_list` instead of the usual
+    // `initialized_identifier_list`.
+    #[test]
+    fn test_parse_external_variable() {
+        let content = "external int x;\n";
+        let symbols = DART_PARSER.parse_symbols(content).unwrap();
+        let x = symbols.iter().find(|s| s.name == "x")
+            .unwrap_or_else(|| panic!("Should find external variable x, got: {symbols:?}"));
+        assert_eq!(x.kind, SymbolKind::Property);
+    }
+
+    #[test]
+    fn test_parse_operator_overload() {
+        let content = "class C { bool operator ==(C other) => false; }\n";
+        let symbols = DART_PARSER.parse_symbols(content).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "operator==" && s.kind == SymbolKind::Function),
+            "Should find operator==, got: {symbols:?}");
+    }
+
+    // Class-level fields (`int x = 1;`) live under
+    // class_member > declaration > initialized_identifier_list.
+    #[test]
+    fn test_parse_class_instance_fields() {
+        let content = "class C { final int x = 1; int y = 0; }\n";
+        let symbols = DART_PARSER.parse_symbols(content).unwrap();
+        for field in ["x", "y"] {
+            let f = symbols.iter().find(|s| s.name == field)
+                .unwrap_or_else(|| panic!("Should find field {field}, got: {symbols:?}"));
+            assert_eq!(f.kind, SymbolKind::Property);
+        }
+    }
+
+    // Top-level `set foo(...) {}` parses as function_declaration; ensure it's
+    // reclassified as Property.
+    #[test]
+    fn test_parse_top_level_setter_only() {
+        let content = "set logLevel(int v) {}\n";
+        let symbols = DART_PARSER.parse_symbols(content).unwrap();
+        let s = symbols.iter().find(|s| s.name == "logLevel")
+            .unwrap_or_else(|| panic!("Should find logLevel, got: {symbols:?}"));
+        assert_eq!(s.kind, SymbolKind::Property);
+    }
+
+    // Nested `void inner() {}` inside a method body must be picked up via the
+    // body recursion in walk_body_member.
+    #[test]
+    fn test_parse_local_function_in_method_body() {
+        let content = "class Foo {\n  void m() {\n    void inner() {}\n    inner();\n  }\n}\n";
+        let symbols = DART_PARSER.parse_symbols(content).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "inner" && s.kind == SymbolKind::Function),
+            "Should find nested local function inner, got: {symbols:?}");
+    }
+
+    // Export form without import_specification — extract_import must
+    // walk into the library_export shape.
+    #[test]
+    fn test_parse_export_with_show_clause() {
+        let content = "export 'src/foo.dart' show Bar, Baz;\n";
+        let symbols = DART_PARSER.parse_symbols(content).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "foo" && s.kind == SymbolKind::Import),
+            "Should find export of foo, got: {symbols:?}");
     }
 
     #[test]
@@ -1428,8 +1409,8 @@ enum Status {
     fn test_parse_base_class() {
         let content = "base class BaseModel {\n}\n";
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        let cls = symbols.iter().find(|s| s.name == "BaseModel").expect(
-            &format!("Should find base class BaseModel, got: {:?}", symbols));
+        let cls = symbols.iter().find(|s| s.name == "BaseModel")
+            .unwrap_or_else(|| panic!("Should find base class BaseModel, got: {symbols:?}"));
         assert_eq!(cls.kind, SymbolKind::Class);
     }
 
@@ -1437,8 +1418,8 @@ enum Status {
     fn test_parse_final_class() {
         let content = "final class FinalModel {\n}\n";
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        let cls = symbols.iter().find(|s| s.name == "FinalModel").expect(
-            &format!("Should find final class FinalModel, got: {:?}", symbols));
+        let cls = symbols.iter().find(|s| s.name == "FinalModel")
+            .unwrap_or_else(|| panic!("Should find final class FinalModel, got: {symbols:?}"));
         assert_eq!(cls.kind, SymbolKind::Class);
     }
 
@@ -1446,8 +1427,8 @@ enum Status {
     fn test_parse_mixin_class() {
         let content = "mixin class MixinClass {\n}\n";
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        let cls = symbols.iter().find(|s| s.name == "MixinClass").expect(
-            &format!("Should find mixin class MixinClass, got: {:?}", symbols));
+        let cls = symbols.iter().find(|s| s.name == "MixinClass")
+            .unwrap_or_else(|| panic!("Should find mixin class MixinClass, got: {symbols:?}"));
         assert_eq!(cls.kind, SymbolKind::Class);
     }
 
