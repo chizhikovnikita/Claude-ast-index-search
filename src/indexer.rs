@@ -11,6 +11,14 @@ use std::time::SystemTime;
 use crate::db;
 use crate::parsers::{self, ParsedRef, ParsedSymbol};
 
+/// Per-worker stack size for the rayon parsing pool.
+///
+/// Tree-sitter parsers recurse on each node of the AST; pathological inputs
+/// (Dart SDK test corpus, deeply nested generics, long expression chains) can
+/// overflow the Rust default (≈ 2 MB on most platforms). 32 MB gives plenty
+/// of headroom without committing the pages eagerly.
+const RAYON_WORKER_STACK_SIZE: usize = 32 * 1024 * 1024;
+
 /// Sorted module lookup for efficient longest-prefix matching.
 /// Entries sorted by path length descending so the longest (most specific) match is found first.
 struct ModuleLookup {
@@ -982,6 +990,7 @@ pub fn index_directory_scoped(conn: &mut Connection, root: &Path, walk_dir: &Pat
     if verbose { eprintln!("[verbose] using {} threads for parsing", num_threads); }
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(num_threads)
+        .stack_size(RAYON_WORKER_STACK_SIZE)
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build thread pool: {}", e))?;
 
@@ -1279,6 +1288,7 @@ pub fn update_directory_incremental(
             .unwrap_or(32);
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(num_threads)
+            .stack_size(RAYON_WORKER_STACK_SIZE)
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to build thread pool: {}", e))?;
 
@@ -2976,6 +2986,7 @@ pub fn index_node_modules_dts(conn: &mut Connection, root: &Path, progress: bool
 
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(num_threads)
+        .stack_size(RAYON_WORKER_STACK_SIZE)
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build thread pool: {}", e))?;
 
