@@ -4,7 +4,9 @@ use anyhow::Result;
 use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
-use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
+use super::{
+    line_text, node_line, node_text, parse_tree, walk_tree_preorder, LanguageParser, WalkControl,
+};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
 
@@ -274,20 +276,19 @@ fn extract_func_signature(content: &str, func_node: &tree_sitter::Node) -> Strin
 
 /// Find the first type_identifier in a node's descendants
 fn find_type_identifier_in(node: &tree_sitter::Node, content: &str) -> Option<String> {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
+    let mut found = None;
+    walk_tree_preorder(node, |child| {
         if child.kind() == "type_identifier" {
             let name = node_text(content, &child);
             let name = name.split('<').next().unwrap_or(name).trim();
             if !name.is_empty() {
-                return Some(name.to_string());
+                found = Some(name.to_string());
+                return WalkControl::Stop;
             }
         }
-        if let Some(found) = find_type_identifier_in(&child, content) {
-            return Some(found);
-        }
-    }
-    None
+        WalkControl::Continue
+    });
+    found
 }
 
 /// Find a capture by index in a match
@@ -414,13 +415,12 @@ fn walk_for_kind<'a>(
     kind: &str,
     callback: &mut dyn FnMut(&tree_sitter::Node<'a>),
 ) {
-    if node.kind() == kind {
-        callback(node);
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        walk_for_kind(&child, kind, callback);
-    }
+    walk_tree_preorder(node, |current| {
+        if current.kind() == kind {
+            callback(&current);
+        }
+        WalkControl::Continue
+    });
 }
 
 #[cfg(test)]

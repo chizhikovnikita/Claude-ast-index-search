@@ -129,3 +129,43 @@ fn node_line(node: &tree_sitter::Node) -> usize {
 fn line_text(content: &str, line: usize) -> &str {
     content.lines().nth(line - 1).unwrap_or("")
 }
+
+/// Controls iterative pre-order tree walking.
+pub(crate) enum WalkControl {
+    Continue,
+    SkipChildren,
+    Stop,
+}
+
+/// Walk a tree in pre-order without recursion.
+///
+/// Tree-sitter trees from generated or heavily nested sources can be deep enough
+/// to overflow the process stack if traversed recursively. This helper keeps the
+/// traversal iterative so language parsers can prune or stop safely.
+pub(crate) fn walk_tree_preorder<'a, F>(root: &tree_sitter::Node<'a>, mut visit: F)
+where
+    F: FnMut(tree_sitter::Node<'a>) -> WalkControl,
+{
+    let mut cursor = root.walk();
+
+    loop {
+        let descend = match visit(cursor.node()) {
+            WalkControl::Continue => true,
+            WalkControl::SkipChildren => false,
+            WalkControl::Stop => return,
+        };
+
+        if descend && cursor.goto_first_child() {
+            continue;
+        }
+
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return;
+            }
+        }
+    }
+}

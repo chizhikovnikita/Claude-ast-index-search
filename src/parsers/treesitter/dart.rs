@@ -1,12 +1,14 @@
 //! Tree-sitter based Dart parser
 
 use anyhow::Result;
-use tree_sitter::{Language, Node};
 use std::sync::LazyLock;
+use tree_sitter::{Language, Node};
 
+use super::{
+    line_text, node_line, node_text, parse_tree, walk_tree_preorder, LanguageParser, WalkControl,
+};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
-use super::{LanguageParser, parse_tree, node_text, node_line, line_text};
 
 static DART_LANGUAGE: LazyLock<Language> = LazyLock::new(|| tree_sitter_dart::LANGUAGE.into());
 
@@ -24,74 +26,78 @@ impl LanguageParser for DartParser {
 }
 
 fn walk_node(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
-    match node.kind() {
-        "import_or_export" => {
-            extract_import(node, content, symbols);
-        }
-        "class_declaration" => {
-            extract_class(node, content, symbols);
-            walk_class_body(node, content, symbols);
-            return;
-        }
-        "mixin_declaration" => {
-            extract_mixin(node, content, symbols);
-            walk_class_body(node, content, symbols);
-            return;
-        }
-        "extension_declaration" => {
-            extract_extension(node, content, symbols);
-            walk_extension_body(node, content, symbols);
-            return;
-        }
-        "extension_type_declaration" => {
-            extract_extension_type(node, content, symbols);
-            walk_class_body(node, content, symbols);
-            return;
-        }
-        "enum_declaration" => {
-            extract_enum(node, content, symbols);
-            walk_class_body(node, content, symbols);
-            return;
-        }
-        "type_alias" => {
-            extract_typedef(node, content, symbols);
-            return;
-        }
-        // Fall through to recurse into the body — catches local_function_declaration nested inside.
-        "function_declaration" | "external_function_declaration" => {
-            if let Some(sig) = node.child_by_field_name("signature") {
-                extract_function_signature(&sig, content, symbols);
+    let mut stack = vec![*node];
+
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "import_or_export" => {
+                extract_import(&node, content, symbols);
             }
-        }
-        "getter_declaration" | "external_getter_declaration" => {
-            if let Some(sig) = node.child_by_field_name("signature") {
-                extract_getter(&sig, content, symbols);
+            "class_declaration" => {
+                extract_class(&node, content, symbols);
+                walk_class_body(&node, content, symbols);
+                continue;
             }
-        }
-        "setter_declaration" | "external_setter_declaration" => {
-            if let Some(sig) = node.child_by_field_name("signature") {
-                extract_setter(&sig, content, symbols);
+            "mixin_declaration" => {
+                extract_mixin(&node, content, symbols);
+                walk_class_body(&node, content, symbols);
+                continue;
             }
-        }
-        "local_function_declaration" => {
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                if child.kind() == "function_signature" {
-                    extract_function_signature(&child, content, symbols);
-                    break;
+            "extension_declaration" => {
+                extract_extension(&node, content, symbols);
+                walk_extension_body(&node, content, symbols);
+                continue;
+            }
+            "extension_type_declaration" => {
+                extract_extension_type(&node, content, symbols);
+                walk_class_body(&node, content, symbols);
+                continue;
+            }
+            "enum_declaration" => {
+                extract_enum(&node, content, symbols);
+                walk_class_body(&node, content, symbols);
+                continue;
+            }
+            "type_alias" => {
+                extract_typedef(&node, content, symbols);
+                continue;
+            }
+            // Fall through to descend into the body — catches nested local functions.
+            "function_declaration" | "external_function_declaration" => {
+                if let Some(sig) = node.child_by_field_name("signature") {
+                    extract_function_signature(&sig, content, symbols);
                 }
             }
+            "getter_declaration" | "external_getter_declaration" => {
+                if let Some(sig) = node.child_by_field_name("signature") {
+                    extract_getter(&sig, content, symbols);
+                }
+            }
+            "setter_declaration" | "external_setter_declaration" => {
+                if let Some(sig) = node.child_by_field_name("signature") {
+                    extract_setter(&sig, content, symbols);
+                }
+            }
+            "local_function_declaration" => {
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if child.kind() == "function_signature" {
+                        extract_function_signature(&child, content, symbols);
+                        break;
+                    }
+                }
+            }
+            "top_level_variable_declaration" | "external_variable_declaration" => {
+                extract_top_level_variable_decl(&node, content, symbols);
+                continue;
+            }
+            _ => {}
         }
-        "top_level_variable_declaration" | "external_variable_declaration" => {
-            extract_top_level_variable_decl(node, content, symbols);
-            return;
-        }
-        _ => {}
-    }
 
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        walk_node(&child, content, symbols);
+        let mut cursor = node.walk();
+        let mut children: Vec<Node> = node.children(&mut cursor).collect();
+        children.reverse();
+        stack.extend(children);
     }
 }
 
@@ -108,9 +114,14 @@ fn extract_import(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
     if let Some(uri_node) = find_descendant_by_kind(node, "uri") {
         let uri_text = node_text(content, &uri_node).trim().to_string();
         let path = uri_text
-            .trim_start_matches('\'').trim_end_matches('\'')
-            .trim_start_matches('"').trim_end_matches('"');
-        let short_name = path.rsplit('/').next().unwrap_or(path)
+            .trim_start_matches('\'')
+            .trim_end_matches('\'')
+            .trim_start_matches('"')
+            .trim_end_matches('"');
+        let short_name = path
+            .rsplit('/')
+            .next()
+            .unwrap_or(path)
             .trim_end_matches(".dart");
         symbols.push(ParsedSymbol {
             name: short_name.to_string(),
@@ -133,9 +144,9 @@ fn extract_top_level_variable_decl(node: &Node, content: &str, symbols: &mut Vec
     // Scan any child (not just the first) for a `type` wrapper that holds the
     // literal keyword `typedef` — `@annotation` directives sit before it.
     let mut cursor = node.walk();
-    let is_misparsed_typedef = node.children(&mut cursor).any(|c| {
-        c.kind() == "type" && node_text(content, &c).trim() == "typedef"
-    });
+    let is_misparsed_typedef = node
+        .children(&mut cursor)
+        .any(|c| c.kind() == "type" && node_text(content, &c).trim() == "typedef");
     if is_misparsed_typedef {
         extract_misparsed_typedef(node, content, symbols);
         return;
@@ -234,11 +245,12 @@ fn extract_class(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
     // Detect the `interface class` modifier by scanning the declaration prefix.
     let full_text = node_text(content, node);
     let decl_prefix = full_text.split('{').next().unwrap_or("");
-    let kind = if decl_prefix.contains("interface class") || decl_prefix.contains("interface  class") {
-        SymbolKind::Interface
-    } else {
-        SymbolKind::Class
-    };
+    let kind =
+        if decl_prefix.contains("interface class") || decl_prefix.contains("interface  class") {
+            SymbolKind::Interface
+        } else {
+            SymbolKind::Class
+        };
 
     let mut parents = Vec::new();
     // superclass field
@@ -304,18 +316,24 @@ fn extract_interfaces_parents(node: &Node, content: &str, parents: &mut Vec<(Str
 }
 
 /// Collect every `type_identifier` descendant of `node` as a parent of `kind`.
-fn extract_type_names_from_node(node: &Node, content: &str, parents: &mut Vec<(String, String)>, kind: &str) {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
+fn extract_type_names_from_node(
+    node: &Node,
+    content: &str,
+    parents: &mut Vec<(String, String)>,
+    kind: &str,
+) {
+    walk_tree_preorder(node, |child| {
+        if child.kind() == "type_arguments" {
+            return WalkControl::SkipChildren;
+        }
         if child.kind() == "type_identifier" {
             let name = node_text(content, &child).to_string();
             if !name.is_empty() {
                 parents.push((name, kind.to_string()));
             }
-        } else if child.named_child_count() > 0 && child.kind() != "type_arguments" {
-            extract_type_names_from_node(&child, content, parents, kind);
         }
-    }
+        WalkControl::Continue
+    });
 }
 
 /// Extract a `mixin` declaration with its `on` and `implements` parents.
@@ -324,7 +342,9 @@ fn extract_mixin(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
     let sig = line_text(content, line).trim().to_string();
 
     let name = find_mixin_name(node, content);
-    if name.is_empty() { return; }
+    if name.is_empty() {
+        return;
+    }
 
     let mut parents = Vec::new();
     let node_text_full = node_text(content, node);
@@ -407,10 +427,14 @@ fn extract_extension(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>
         let on_type = if class_node.kind() == "type_identifier" {
             node_text(content, &class_node).to_string()
         } else {
-            find_first_type_identifier(&class_node, content)
-                .unwrap_or_default()
+            find_first_type_identifier(&class_node, content).unwrap_or_default()
         };
-        let base = on_type.split('<').next().unwrap_or(&on_type).trim().to_string();
+        let base = on_type
+            .split('<')
+            .next()
+            .unwrap_or(&on_type)
+            .trim()
+            .to_string();
         if !base.is_empty() {
             parents.push((base, "extends".to_string()));
         }
@@ -442,7 +466,9 @@ fn extract_extension_type(node: &Node, content: &str, symbols: &mut Vec<ParsedSy
         }
         None => return,
     };
-    if name.is_empty() { return; }
+    if name.is_empty() {
+        return;
+    }
 
     let line = node_line(node);
     let sig = line_text(content, line).trim().to_string();
@@ -520,7 +546,8 @@ fn extract_typedef(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) 
     // type_identifier that is a direct child (the name); fall back to deeper
     // search only for the new-style form `typedef Foo = ...` where the name
     // is the first type_identifier.
-    let name = node.children(&mut node.walk())
+    let name = node
+        .children(&mut node.walk())
         .find(|c| c.kind() == "type_identifier")
         .map(|c| node_text(content, &c).to_string())
         .or_else(|| find_first_type_identifier(node, content))
@@ -555,7 +582,8 @@ fn extract_function_signature(node: &Node, content: &str, symbols: &mut Vec<Pars
         // Top-level `set foo(v) {}` and `get foo => …` parse as function_declaration —
         // the `set`/`get` keyword surfaces in the return_type slot. Re-classify them
         // as Property to keep semantic parity with class-level accessors.
-        let kind = match node.child_by_field_name("return_type")
+        let kind = match node
+            .child_by_field_name("return_type")
             .map(|n| node_text(content, &n).trim().to_string())
             .as_deref()
         {
@@ -635,34 +663,38 @@ fn walk_body_declarations(body: &Node, content: &str, symbols: &mut Vec<ParsedSy
 /// nielsenko wraps inner declarations in `class_member`; method bodies are
 /// walked recursively so local_function_declaration inside them is captured.
 fn walk_body_member(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
-    match node.kind() {
-        "class_member" => {
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                walk_body_member(&child, content, symbols);
+    let mut stack = vec![*node];
+
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "class_member" => {
+                let mut cursor = node.walk();
+                let mut children: Vec<Node> = node.children(&mut cursor).collect();
+                children.reverse();
+                stack.extend(children);
             }
-        }
-        "method_declaration" | "getter_declaration" | "setter_declaration" => {
-            if let Some(sig) = node.child_by_field_name("signature") {
-                dispatch_member_node(&sig, content, symbols);
+            "method_declaration" | "getter_declaration" | "setter_declaration" => {
+                if let Some(sig) = node.child_by_field_name("signature") {
+                    dispatch_member_node(&sig, content, symbols);
+                }
+                if let Some(body) = node.child_by_field_name("body") {
+                    walk_node(&body, content, symbols);
+                }
             }
-            if let Some(body) = node.child_by_field_name("body") {
-                walk_node(&body, content, symbols);
+            "declaration" | "method_signature" => {
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    dispatch_member_node(&child, content, symbols);
+                }
             }
-        }
-        "declaration" | "method_signature" => {
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                dispatch_member_node(&child, content, symbols);
-            }
-        }
-        _ => {
-            if dispatch_member_node(node, content, symbols) {
-                return;
-            }
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                walk_body_member(&child, content, symbols);
+            _ => {
+                if dispatch_member_node(&node, content, symbols) {
+                    continue;
+                }
+                let mut cursor = node.walk();
+                let mut children: Vec<Node> = node.children(&mut cursor).collect();
+                children.reverse();
+                stack.extend(children);
             }
         }
     }
@@ -706,10 +738,13 @@ fn dispatch_member_node(node: &Node, content: &str, symbols: &mut Vec<ParsedSymb
 /// The operator token lives in the `operator` field — its text is the symbol name
 /// (e.g. `==`, `+`, `[]`).
 fn extract_operator(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
-    let op_text = node.child_by_field_name("operator")
+    let op_text = node
+        .child_by_field_name("operator")
         .map(|n| node_text(content, &n).trim().to_string())
         .unwrap_or_default();
-    if op_text.is_empty() { return; }
+    if op_text.is_empty() {
+        return;
+    }
 
     let line = node_line(node);
     let sig = line_text(content, line).trim().to_string();
@@ -847,30 +882,30 @@ fn find_first_identifier(node: &Node, content: &str) -> Option<String> {
 
 /// Return the first `type_identifier` descendant of `node` (DFS, pre-order).
 fn find_first_type_identifier(node: &Node, content: &str) -> Option<String> {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
+    let mut found = None;
+    walk_tree_preorder(node, |child| {
         if child.kind() == "type_identifier" {
-            return Some(node_text(content, &child).to_string());
+            found = Some(node_text(content, &child).to_string());
+            WalkControl::Stop
+        } else {
+            WalkControl::Continue
         }
-        if let Some(found) = find_first_type_identifier(&child, content) {
-            return Some(found);
-        }
-    }
-    None
+    });
+    found
 }
 
 /// Return the first descendant of `node` whose kind matches `kind` (DFS, pre-order).
 fn find_descendant_by_kind<'a>(node: &Node<'a>, kind: &str) -> Option<Node<'a>> {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
+    let mut found = None;
+    walk_tree_preorder(node, |child| {
         if child.kind() == kind {
-            return Some(child);
+            found = Some(child);
+            WalkControl::Stop
+        } else {
+            WalkControl::Continue
         }
-        if let Some(found) = find_descendant_by_kind(&child, kind) {
-            return Some(found);
-        }
-    }
-    None
+    });
+    found
 }
 
 #[cfg(test)]
@@ -883,8 +918,13 @@ mod tests {
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
         let cls = symbols.iter().find(|s| s.name == "MyWidget").unwrap();
         assert_eq!(cls.kind, SymbolKind::Class);
-        assert!(cls.parents.iter().any(|(p, k)| p == "StatefulWidget" && k == "extends"),
-            "Expected extends StatefulWidget, got: {:?}", cls.parents);
+        assert!(
+            cls.parents
+                .iter()
+                .any(|(p, k)| p == "StatefulWidget" && k == "extends"),
+            "Expected extends StatefulWidget, got: {:?}",
+            cls.parents
+        );
     }
 
     #[test]
@@ -899,7 +939,9 @@ mod tests {
     fn test_parse_sealed_class() {
         let content = "sealed class Result {\n}\n";
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        let cls = symbols.iter().find(|s| s.name == "Result")
+        let cls = symbols
+            .iter()
+            .find(|s| s.name == "Result")
             .unwrap_or_else(|| panic!("Should find sealed class Result, got: {symbols:?}"));
         assert_eq!(cls.kind, SymbolKind::Class);
     }
@@ -909,21 +951,44 @@ mod tests {
         let content = "abstract interface class AppScope {\n}\n";
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
         let cls = symbols.iter().find(|s| s.name == "AppScope").unwrap();
-        assert_eq!(cls.kind, SymbolKind::Interface,
-            "abstract interface class should be Interface, got: {:?}", cls.kind);
+        assert_eq!(
+            cls.kind,
+            SymbolKind::Interface,
+            "abstract interface class should be Interface, got: {:?}",
+            cls.kind
+        );
     }
 
     #[test]
     fn test_parse_class_with_parents() {
-        let content = "class ApiService extends BaseService with LoggerMixin implements Disposable {\n}\n";
+        let content =
+            "class ApiService extends BaseService with LoggerMixin implements Disposable {\n}\n";
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        let cls = symbols.iter().find(|s| s.name == "ApiService" && s.kind == SymbolKind::Class).unwrap();
-        assert!(cls.parents.iter().any(|(p, k)| p == "BaseService" && k == "extends"),
-            "Expected extends BaseService, got: {:?}", cls.parents);
-        assert!(cls.parents.iter().any(|(p, k)| p == "LoggerMixin" && k == "with"),
-            "Expected with LoggerMixin, got: {:?}", cls.parents);
-        assert!(cls.parents.iter().any(|(p, k)| p == "Disposable" && k == "implements"),
-            "Expected implements Disposable, got: {:?}", cls.parents);
+        let cls = symbols
+            .iter()
+            .find(|s| s.name == "ApiService" && s.kind == SymbolKind::Class)
+            .unwrap();
+        assert!(
+            cls.parents
+                .iter()
+                .any(|(p, k)| p == "BaseService" && k == "extends"),
+            "Expected extends BaseService, got: {:?}",
+            cls.parents
+        );
+        assert!(
+            cls.parents
+                .iter()
+                .any(|(p, k)| p == "LoggerMixin" && k == "with"),
+            "Expected with LoggerMixin, got: {:?}",
+            cls.parents
+        );
+        assert!(
+            cls.parents
+                .iter()
+                .any(|(p, k)| p == "Disposable" && k == "implements"),
+            "Expected implements Disposable, got: {:?}",
+            cls.parents
+        );
     }
 
     #[test]
@@ -932,20 +997,38 @@ mod tests {
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
         let m = symbols.iter().find(|s| s.name == "LoggerMixin").unwrap();
         assert_eq!(m.kind, SymbolKind::Interface);
-        assert!(m.parents.iter().any(|(p, k)| p == "Object" && k == "extends"),
-            "Expected extends Object, got: {:?}", m.parents);
+        assert!(
+            m.parents
+                .iter()
+                .any(|(p, k)| p == "Object" && k == "extends"),
+            "Expected extends Object, got: {:?}",
+            m.parents
+        );
     }
 
     #[test]
     fn test_parse_mixin_with_implements() {
         let content = "mixin _PublicAppScopeImpl on _AppScopeDeps implements AppScope {\n}\n";
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        let m = symbols.iter().find(|s| s.name == "_PublicAppScopeImpl").unwrap();
+        let m = symbols
+            .iter()
+            .find(|s| s.name == "_PublicAppScopeImpl")
+            .unwrap();
         assert_eq!(m.kind, SymbolKind::Interface);
-        assert!(m.parents.iter().any(|(p, k)| p == "_AppScopeDeps" && k == "extends"),
-            "should have _AppScopeDeps as extends parent, got: {:?}", m.parents);
-        assert!(m.parents.iter().any(|(p, k)| p == "AppScope" && k == "implements"),
-            "should have AppScope as implements parent, got: {:?}", m.parents);
+        assert!(
+            m.parents
+                .iter()
+                .any(|(p, k)| p == "_AppScopeDeps" && k == "extends"),
+            "should have _AppScopeDeps as extends parent, got: {:?}",
+            m.parents
+        );
+        assert!(
+            m.parents
+                .iter()
+                .any(|(p, k)| p == "AppScope" && k == "implements"),
+            "should have AppScope as implements parent, got: {:?}",
+            m.parents
+        );
     }
 
     #[test]
@@ -954,19 +1037,29 @@ mod tests {
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
         let ext = symbols.iter().find(|s| s.name == "DateTimeX").unwrap();
         assert_eq!(ext.kind, SymbolKind::Object);
-        assert!(ext.parents.iter().any(|(p, k)| p == "DateTime" && k == "extends"),
-            "Expected extends DateTime, got: {:?}", ext.parents);
+        assert!(
+            ext.parents
+                .iter()
+                .any(|(p, k)| p == "DateTime" && k == "extends"),
+            "Expected extends DateTime, got: {:?}",
+            ext.parents
+        );
     }
 
     #[test]
     fn test_parse_extension_type() {
         let content = "extension type UserId(int id) implements int {\n}\n";
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        let et = symbols.iter().find(|s| s.name == "UserId")
+        let et = symbols
+            .iter()
+            .find(|s| s.name == "UserId")
             .unwrap_or_else(|| panic!("Should find extension type UserId, got: {symbols:?}"));
         assert_eq!(et.kind, SymbolKind::Class);
-        assert!(et.parents.iter().any(|(p, _)| p == "int"),
-            "Expected implements int, got: {:?}", et.parents);
+        assert!(
+            et.parents.iter().any(|(p, _)| p == "int"),
+            "Expected implements int, got: {:?}",
+            et.parents
+        );
     }
 
     #[test]
@@ -979,14 +1072,23 @@ mod tests {
 
     #[test]
     fn test_parse_enum_with_parents() {
-        let content = "enum EnhancedEnum with Mixin implements Interface {\n  value1,\n  value2;\n}\n";
+        let content =
+            "enum EnhancedEnum with Mixin implements Interface {\n  value1,\n  value2;\n}\n";
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
         let e = symbols.iter().find(|s| s.name == "EnhancedEnum").unwrap();
         assert_eq!(e.kind, SymbolKind::Enum);
-        assert!(e.parents.iter().any(|(p, k)| p == "Mixin" && k == "with"),
-            "Expected with Mixin, got: {:?}", e.parents);
-        assert!(e.parents.iter().any(|(p, k)| p == "Interface" && k == "implements"),
-            "Expected implements Interface, got: {:?}", e.parents);
+        assert!(
+            e.parents.iter().any(|(p, k)| p == "Mixin" && k == "with"),
+            "Expected with Mixin, got: {:?}",
+            e.parents
+        );
+        assert!(
+            e.parents
+                .iter()
+                .any(|(p, k)| p == "Interface" && k == "implements"),
+            "Expected implements Interface, got: {:?}",
+            e.parents
+        );
     }
 
     #[test]
@@ -1012,7 +1114,9 @@ mod tests {
     fn test_parse_misparsed_typedef() {
         let content = "typedef AsyncCallback = Future<void> Function(int x);\n";
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        let td = symbols.iter().find(|s| s.name == "AsyncCallback")
+        let td = symbols
+            .iter()
+            .find(|s| s.name == "AsyncCallback")
             .unwrap_or_else(|| panic!("Should find AsyncCallback, got: {symbols:?}"));
         assert_eq!(td.kind, SymbolKind::TypeAlias);
     }
@@ -1023,7 +1127,9 @@ mod tests {
     fn test_parse_annotated_misparsed_typedef() {
         let content = "@deprecated\ntypedef DeprCallback = Future<void> Function();\n";
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        let td = symbols.iter().find(|s| s.name == "DeprCallback")
+        let td = symbols
+            .iter()
+            .find(|s| s.name == "DeprCallback")
             .unwrap_or_else(|| panic!("Should find DeprCallback, got: {symbols:?}"));
         assert_eq!(td.kind, SymbolKind::TypeAlias);
     }
@@ -1034,11 +1140,15 @@ mod tests {
     fn test_parse_old_style_typedef() {
         let content = "typedef int OldStyle(int x);\n";
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        let td = symbols.iter().find(|s| s.name == "OldStyle")
+        let td = symbols
+            .iter()
+            .find(|s| s.name == "OldStyle")
             .unwrap_or_else(|| panic!("Should find OldStyle, got: {symbols:?}"));
         assert_eq!(td.kind, SymbolKind::TypeAlias);
-        assert!(symbols.iter().all(|s| s.name != "int"),
-            "Must not record return type as the typedef name");
+        assert!(
+            symbols.iter().all(|s| s.name != "int"),
+            "Must not record return type as the typedef name"
+        );
     }
 
     // `class C extends B<X>` must yield exactly one parent, not B and X.
@@ -1046,11 +1156,21 @@ mod tests {
     fn test_parse_class_extends_generic() {
         let content = "class C extends B<X> {}\n";
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        let cls = symbols.iter().find(|s| s.name == "C")
+        let cls = symbols
+            .iter()
+            .find(|s| s.name == "C")
             .unwrap_or_else(|| panic!("Should find class C, got: {symbols:?}"));
-        let extends: Vec<_> = cls.parents.iter()
-            .filter(|(_, kind)| kind == "extends").collect();
-        assert_eq!(extends.len(), 1, "Expected one extends parent, got: {:?}", cls.parents);
+        let extends: Vec<_> = cls
+            .parents
+            .iter()
+            .filter(|(_, kind)| kind == "extends")
+            .collect();
+        assert_eq!(
+            extends.len(),
+            1,
+            "Expected one extends parent, got: {:?}",
+            cls.parents
+        );
         assert_eq!(extends[0].0, "B");
     }
 
@@ -1059,12 +1179,20 @@ mod tests {
     fn test_parse_mixin_with_on_and_implements() {
         let content = "mixin M on Base implements I {}\n";
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        let m = symbols.iter().find(|s| s.name == "M")
+        let m = symbols
+            .iter()
+            .find(|s| s.name == "M")
             .unwrap_or_else(|| panic!("Should find mixin M, got: {symbols:?}"));
-        assert!(m.parents.iter().any(|(p, k)| p == "Base" && k == "extends"),
-            "Expected on Base, got: {:?}", m.parents);
-        assert!(m.parents.iter().any(|(p, k)| p == "I" && k == "implements"),
-            "Expected implements I, got: {:?}", m.parents);
+        assert!(
+            m.parents.iter().any(|(p, k)| p == "Base" && k == "extends"),
+            "Expected on Base, got: {:?}",
+            m.parents
+        );
+        assert!(
+            m.parents.iter().any(|(p, k)| p == "I" && k == "implements"),
+            "Expected implements I, got: {:?}",
+            m.parents
+        );
     }
 
     // Extension type `implements` is a flat sequence in nielsenko (no `interfaces` field).
@@ -1072,10 +1200,17 @@ mod tests {
     fn test_parse_extension_type_implements() {
         let content = "extension type UserId(int id) implements int {}\n";
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        let et = symbols.iter().find(|s| s.name == "UserId")
+        let et = symbols
+            .iter()
+            .find(|s| s.name == "UserId")
             .unwrap_or_else(|| panic!("Should find UserId, got: {symbols:?}"));
-        assert!(et.parents.iter().any(|(p, k)| p == "int" && k == "implements"),
-            "Expected implements int, got: {:?}", et.parents);
+        assert!(
+            et.parents
+                .iter()
+                .any(|(p, k)| p == "int" && k == "implements"),
+            "Expected implements int, got: {:?}",
+            et.parents
+        );
     }
 
     // `external int x;` produces a bare `identifier_list` instead of the usual
@@ -1084,7 +1219,9 @@ mod tests {
     fn test_parse_external_variable() {
         let content = "external int x;\n";
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        let x = symbols.iter().find(|s| s.name == "x")
+        let x = symbols
+            .iter()
+            .find(|s| s.name == "x")
             .unwrap_or_else(|| panic!("Should find external variable x, got: {symbols:?}"));
         assert_eq!(x.kind, SymbolKind::Property);
     }
@@ -1093,8 +1230,12 @@ mod tests {
     fn test_parse_operator_overload() {
         let content = "class C { bool operator ==(C other) => false; }\n";
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "operator==" && s.kind == SymbolKind::Function),
-            "Should find operator==, got: {symbols:?}");
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "operator==" && s.kind == SymbolKind::Function),
+            "Should find operator==, got: {symbols:?}"
+        );
     }
 
     // Class-level fields (`int x = 1;`) live under
@@ -1104,7 +1245,9 @@ mod tests {
         let content = "class C { final int x = 1; int y = 0; }\n";
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
         for field in ["x", "y"] {
-            let f = symbols.iter().find(|s| s.name == field)
+            let f = symbols
+                .iter()
+                .find(|s| s.name == field)
                 .unwrap_or_else(|| panic!("Should find field {field}, got: {symbols:?}"));
             assert_eq!(f.kind, SymbolKind::Property);
         }
@@ -1116,7 +1259,9 @@ mod tests {
     fn test_parse_top_level_setter_only() {
         let content = "set logLevel(int v) {}\n";
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        let s = symbols.iter().find(|s| s.name == "logLevel")
+        let s = symbols
+            .iter()
+            .find(|s| s.name == "logLevel")
             .unwrap_or_else(|| panic!("Should find logLevel, got: {symbols:?}"));
         assert_eq!(s.kind, SymbolKind::Property);
     }
@@ -1127,8 +1272,12 @@ mod tests {
     fn test_parse_local_function_in_method_body() {
         let content = "class Foo {\n  void m() {\n    void inner() {}\n    inner();\n  }\n}\n";
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "inner" && s.kind == SymbolKind::Function),
-            "Should find nested local function inner, got: {symbols:?}");
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "inner" && s.kind == SymbolKind::Function),
+            "Should find nested local function inner, got: {symbols:?}"
+        );
     }
 
     // Export form without import_specification — extract_import must
@@ -1137,32 +1286,51 @@ mod tests {
     fn test_parse_export_with_show_clause() {
         let content = "export 'src/foo.dart' show Bar, Baz;\n";
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "foo" && s.kind == SymbolKind::Import),
-            "Should find export of foo, got: {symbols:?}");
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "foo" && s.kind == SymbolKind::Import),
+            "Should find export of foo, got: {symbols:?}"
+        );
     }
 
     #[test]
     fn test_parse_function() {
         let content = "void main() {\n}\n";
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "main" && s.kind == SymbolKind::Function),
-            "Should find main function, got: {:?}", symbols);
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "main" && s.kind == SymbolKind::Function),
+            "Should find main function, got: {:?}",
+            symbols
+        );
     }
 
     #[test]
     fn test_parse_async_function() {
         let content = "Future<int> fetchData() async {\n  return 0;\n}\n";
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "fetchData" && s.kind == SymbolKind::Function),
-            "Should find fetchData function, got: {:?}", symbols);
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "fetchData" && s.kind == SymbolKind::Function),
+            "Should find fetchData function, got: {:?}",
+            symbols
+        );
     }
 
     #[test]
     fn test_parse_arrow_function() {
         let content = "String formatName(String first, String last) => '$first $last';\n";
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "formatName" && s.kind == SymbolKind::Function),
-            "Should find formatName function, got: {:?}", symbols);
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "formatName" && s.kind == SymbolKind::Function),
+            "Should find formatName function, got: {:?}",
+            symbols
+        );
     }
 
     #[test]
@@ -1175,14 +1343,26 @@ mod tests {
 }
 "#;
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        let getters: Vec<_> = symbols.iter()
+        let getters: Vec<_> = symbols
+            .iter()
             .filter(|s| s.name == "count" && s.kind == SymbolKind::Property)
             .collect();
-        assert!(getters.len() >= 1, "should find getter 'count', got: {:?}", symbols);
-        let setters: Vec<_> = symbols.iter()
-            .filter(|s| s.name == "count" && s.kind == SymbolKind::Property && s.signature.contains("set "))
+        assert!(
+            getters.len() >= 1,
+            "should find getter 'count', got: {:?}",
+            symbols
+        );
+        let setters: Vec<_> = symbols
+            .iter()
+            .filter(|s| {
+                s.name == "count" && s.kind == SymbolKind::Property && s.signature.contains("set ")
+            })
             .collect();
-        assert!(setters.len() >= 1, "should find setter 'count', got: {:?}", symbols);
+        assert!(
+            setters.len() >= 1,
+            "should find setter 'count', got: {:?}",
+            symbols
+        );
     }
 
     #[test]
@@ -1194,47 +1374,87 @@ mod tests {
 }
 "#;
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "MyService" && s.kind == SymbolKind::Class),
-            "Should find class MyService, got: {:?}", symbols);
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "MyService" && s.kind == SymbolKind::Class),
+            "Should find class MyService, got: {:?}",
+            symbols
+        );
         // Named constructors
-        assert!(symbols.iter().any(|s| s.name == "MyService.fromJson" && s.kind == SymbolKind::Function),
-            "Should find MyService.fromJson constructor, got: {:?}", symbols);
-        assert!(symbols.iter().any(|s| s.name == "MyService.create" && s.kind == SymbolKind::Function),
-            "Should find MyService.create factory constructor, got: {:?}", symbols);
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "MyService.fromJson" && s.kind == SymbolKind::Function),
+            "Should find MyService.fromJson constructor, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "MyService.create" && s.kind == SymbolKind::Function),
+            "Should find MyService.create factory constructor, got: {:?}",
+            symbols
+        );
     }
 
     #[test]
     fn test_parse_import() {
         let content = "import 'package:flutter/material.dart';\n";
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "material" && s.kind == SymbolKind::Import),
-            "Should find import 'material', got: {:?}", symbols);
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "material" && s.kind == SymbolKind::Import),
+            "Should find import 'material', got: {:?}",
+            symbols
+        );
     }
 
     #[test]
     fn test_parse_export() {
         let content = "export 'src/my_widget.dart';\n";
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "my_widget" && s.kind == SymbolKind::Import),
-            "Should find export 'my_widget', got: {:?}", symbols);
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "my_widget" && s.kind == SymbolKind::Import),
+            "Should find export 'my_widget', got: {:?}",
+            symbols
+        );
     }
 
     #[test]
     fn test_parse_dart_async_import() {
         let content = "import 'dart:async';\n";
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "dart:async" && s.kind == SymbolKind::Import),
-            "Should find import 'dart:async', got: {:?}", symbols);
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "dart:async" && s.kind == SymbolKind::Import),
+            "Should find import 'dart:async', got: {:?}",
+            symbols
+        );
     }
 
     #[test]
     fn test_parse_property() {
         let content = "final String appName = 'MyApp';\nconst int maxRetries = 3;\n";
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "appName" && s.kind == SymbolKind::Property),
-            "Should find property appName, got: {:?}", symbols);
-        assert!(symbols.iter().any(|s| s.name == "maxRetries" && s.kind == SymbolKind::Property),
-            "Should find property maxRetries, got: {:?}", symbols);
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "appName" && s.kind == SymbolKind::Property),
+            "Should find property appName, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "maxRetries" && s.kind == SymbolKind::Property),
+            "Should find property maxRetries, got: {:?}",
+            symbols
+        );
     }
 
     #[test]
@@ -1246,12 +1466,21 @@ class RealClass {
 }
 "#;
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        assert!(!symbols.iter().any(|s| s.name == "FakeClass"),
-            "Should not find FakeClass in comments");
-        assert!(!symbols.iter().any(|s| s.name == "AnotherFake"),
-            "Should not find AnotherFake in comments");
-        assert!(symbols.iter().any(|s| s.name == "RealClass" && s.kind == SymbolKind::Class),
-            "Should find RealClass, got: {:?}", symbols);
+        assert!(
+            !symbols.iter().any(|s| s.name == "FakeClass"),
+            "Should not find FakeClass in comments"
+        );
+        assert!(
+            !symbols.iter().any(|s| s.name == "AnotherFake"),
+            "Should not find AnotherFake in comments"
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "RealClass" && s.kind == SymbolKind::Class),
+            "Should find RealClass, got: {:?}",
+            symbols
+        );
     }
 
     #[test]
@@ -1262,10 +1491,20 @@ class RealClass {
 }
 "#;
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "init" && s.kind == SymbolKind::Function),
-            "Should find method init, got: {:?}", symbols);
-        assert!(symbols.iter().any(|s| s.name == "doSomething" && s.kind == SymbolKind::Function),
-            "Should find method doSomething, got: {:?}", symbols);
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "init" && s.kind == SymbolKind::Function),
+            "Should find method init, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "doSomething" && s.kind == SymbolKind::Function),
+            "Should find method doSomething, got: {:?}",
+            symbols
+        );
     }
 
     #[test]
@@ -1275,10 +1514,20 @@ class RealClass {
 }
 "#;
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "ApiServiceX" && s.kind == SymbolKind::Object),
-            "Should find extension ApiServiceX, got: {:?}", symbols);
-        assert!(symbols.iter().any(|s| s.name == "ping" && s.kind == SymbolKind::Function),
-            "Should find method ping, got: {:?}", symbols);
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "ApiServiceX" && s.kind == SymbolKind::Object),
+            "Should find extension ApiServiceX, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "ping" && s.kind == SymbolKind::Function),
+            "Should find method ping, got: {:?}",
+            symbols
+        );
     }
 
     #[test]
@@ -1288,10 +1537,20 @@ class RealClass {
 }
 "#;
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "LoggerMixin" && s.kind == SymbolKind::Interface),
-            "Should find mixin LoggerMixin, got: {:?}", symbols);
-        assert!(symbols.iter().any(|s| s.name == "log" && s.kind == SymbolKind::Function),
-            "Should find method log, got: {:?}", symbols);
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "LoggerMixin" && s.kind == SymbolKind::Interface),
+            "Should find mixin LoggerMixin, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "log" && s.kind == SymbolKind::Function),
+            "Should find method log, got: {:?}",
+            symbols
+        );
     }
 
     #[test]
@@ -1341,16 +1600,31 @@ enum Status {
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
 
         // Imports
-        assert!(symbols.iter().any(|s| s.name == "material" && s.kind == SymbolKind::Import),
-            "Should find import 'material', got: {:?}", symbols);
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "material" && s.kind == SymbolKind::Import),
+            "Should find import 'material', got: {:?}",
+            symbols
+        );
 
         // Typedef
-        assert!(symbols.iter().any(|s| s.name == "JsonMap" && s.kind == SymbolKind::TypeAlias),
-            "Should find typedef JsonMap, got: {:?}", symbols);
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "JsonMap" && s.kind == SymbolKind::TypeAlias),
+            "Should find typedef JsonMap, got: {:?}",
+            symbols
+        );
 
         // Property
-        assert!(symbols.iter().any(|s| s.name == "appVersion" && s.kind == SymbolKind::Property),
-            "Should find property appVersion, got: {:?}", symbols);
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "appVersion" && s.kind == SymbolKind::Property),
+            "Should find property appVersion, got: {:?}",
+            symbols
+        );
 
         // Mixin
         let mixin = symbols.iter().find(|s| s.name == "LoggerMixin").unwrap();
@@ -1361,55 +1635,118 @@ enum Status {
         assert_eq!(base.kind, SymbolKind::Class);
 
         // Class with full inheritance
-        let api = symbols.iter().find(|s| s.name == "ApiService" && s.kind == SymbolKind::Class).unwrap();
-        assert!(api.parents.iter().any(|(p, k)| p == "BaseService" && k == "extends"),
-            "Expected extends BaseService, got: {:?}", api.parents);
-        assert!(api.parents.iter().any(|(p, k)| p == "LoggerMixin" && k == "with"),
-            "Expected with LoggerMixin, got: {:?}", api.parents);
-        assert!(api.parents.iter().any(|(p, k)| p == "Disposable" && k == "implements"),
-            "Expected implements Disposable, got: {:?}", api.parents);
+        let api = symbols
+            .iter()
+            .find(|s| s.name == "ApiService" && s.kind == SymbolKind::Class)
+            .unwrap();
+        assert!(
+            api.parents
+                .iter()
+                .any(|(p, k)| p == "BaseService" && k == "extends"),
+            "Expected extends BaseService, got: {:?}",
+            api.parents
+        );
+        assert!(
+            api.parents
+                .iter()
+                .any(|(p, k)| p == "LoggerMixin" && k == "with"),
+            "Expected with LoggerMixin, got: {:?}",
+            api.parents
+        );
+        assert!(
+            api.parents
+                .iter()
+                .any(|(p, k)| p == "Disposable" && k == "implements"),
+            "Expected implements Disposable, got: {:?}",
+            api.parents
+        );
 
         // Constructors
-        assert!(symbols.iter().any(|s| s.name == "ApiService.withDefault" && s.kind == SymbolKind::Function),
-            "Should find constructor ApiService.withDefault, got: {:?}", symbols);
-        assert!(symbols.iter().any(|s| s.name == "ApiService.create" && s.kind == SymbolKind::Function),
-            "Should find factory ApiService.create, got: {:?}", symbols);
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "ApiService.withDefault" && s.kind == SymbolKind::Function),
+            "Should find constructor ApiService.withDefault, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "ApiService.create" && s.kind == SymbolKind::Function),
+            "Should find factory ApiService.create, got: {:?}",
+            symbols
+        );
 
         // Getter/Setter
-        assert!(symbols.iter().any(|s| s.name == "endpoint" && s.kind == SymbolKind::Property),
-            "Should find getter endpoint, got: {:?}", symbols);
-        assert!(symbols.iter().any(|s| s.name == "timeout" && s.kind == SymbolKind::Property),
-            "Should find setter timeout, got: {:?}", symbols);
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "endpoint" && s.kind == SymbolKind::Property),
+            "Should find getter endpoint, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "timeout" && s.kind == SymbolKind::Property),
+            "Should find setter timeout, got: {:?}",
+            symbols
+        );
 
         // Extension
         let ext = symbols.iter().find(|s| s.name == "ApiServiceX").unwrap();
         assert_eq!(ext.kind, SymbolKind::Object);
-        assert!(ext.parents.iter().any(|(p, k)| p == "ApiService" && k == "extends"),
-            "Expected extends ApiService, got: {:?}", ext.parents);
+        assert!(
+            ext.parents
+                .iter()
+                .any(|(p, k)| p == "ApiService" && k == "extends"),
+            "Expected extends ApiService, got: {:?}",
+            ext.parents
+        );
 
         // Enum
-        assert!(symbols.iter().any(|s| s.name == "Status" && s.kind == SymbolKind::Enum),
-            "Should find enum Status, got: {:?}", symbols);
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Status" && s.kind == SymbolKind::Enum),
+            "Should find enum Status, got: {:?}",
+            symbols
+        );
 
         // Function inside class
-        assert!(symbols.iter().any(|s| s.name == "init" && s.kind == SymbolKind::Function),
-            "Should find method init, got: {:?}", symbols);
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "init" && s.kind == SymbolKind::Function),
+            "Should find method init, got: {:?}",
+            symbols
+        );
     }
 
     #[test]
     fn test_parse_class_with_generics() {
         let content = "class Repository<T extends Model> implements BaseRepo<T> {\n}\n";
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        let cls = symbols.iter().find(|s| s.name == "Repository" && s.kind == SymbolKind::Class).unwrap();
-        assert!(cls.parents.iter().any(|(p, k)| p == "BaseRepo" && k == "implements"),
-            "Expected implements BaseRepo, got: {:?}", cls.parents);
+        let cls = symbols
+            .iter()
+            .find(|s| s.name == "Repository" && s.kind == SymbolKind::Class)
+            .unwrap();
+        assert!(
+            cls.parents
+                .iter()
+                .any(|(p, k)| p == "BaseRepo" && k == "implements"),
+            "Expected implements BaseRepo, got: {:?}",
+            cls.parents
+        );
     }
 
     #[test]
     fn test_parse_base_class() {
         let content = "base class BaseModel {\n}\n";
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        let cls = symbols.iter().find(|s| s.name == "BaseModel")
+        let cls = symbols
+            .iter()
+            .find(|s| s.name == "BaseModel")
             .unwrap_or_else(|| panic!("Should find base class BaseModel, got: {symbols:?}"));
         assert_eq!(cls.kind, SymbolKind::Class);
     }
@@ -1418,7 +1755,9 @@ enum Status {
     fn test_parse_final_class() {
         let content = "final class FinalModel {\n}\n";
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        let cls = symbols.iter().find(|s| s.name == "FinalModel")
+        let cls = symbols
+            .iter()
+            .find(|s| s.name == "FinalModel")
             .unwrap_or_else(|| panic!("Should find final class FinalModel, got: {symbols:?}"));
         assert_eq!(cls.kind, SymbolKind::Class);
     }
@@ -1427,7 +1766,9 @@ enum Status {
     fn test_parse_mixin_class() {
         let content = "mixin class MixinClass {\n}\n";
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        let cls = symbols.iter().find(|s| s.name == "MixinClass")
+        let cls = symbols
+            .iter()
+            .find(|s| s.name == "MixinClass")
             .unwrap_or_else(|| panic!("Should find mixin class MixinClass, got: {symbols:?}"));
         assert_eq!(cls.kind, SymbolKind::Class);
     }
@@ -1440,12 +1781,27 @@ import 'package:provider/provider.dart';
 export 'src/utils.dart';
 "#;
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "material" && s.kind == SymbolKind::Import),
-            "Should find material import, got: {:?}", symbols);
-        assert!(symbols.iter().any(|s| s.name == "provider" && s.kind == SymbolKind::Import),
-            "Should find provider import, got: {:?}", symbols);
-        assert!(symbols.iter().any(|s| s.name == "utils" && s.kind == SymbolKind::Import),
-            "Should find utils export, got: {:?}", symbols);
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "material" && s.kind == SymbolKind::Import),
+            "Should find material import, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "provider" && s.kind == SymbolKind::Import),
+            "Should find provider import, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "utils" && s.kind == SymbolKind::Import),
+            "Should find utils export, got: {:?}",
+            symbols
+        );
     }
 
     #[test]
@@ -1455,15 +1811,38 @@ export 'src/utils.dart';
 }
 "#;
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        let cls = symbols.iter().find(|s| s.name == "_AppScopeContainer" && s.kind == SymbolKind::Class).unwrap();
-        assert!(cls.parents.iter().any(|(p, k)| p == "AppScopeContainer" && k == "extends"),
-            "should have AppScopeContainer as extends, got: {:?}", cls.parents);
-        assert!(cls.parents.iter().any(|(p, k)| p == "_AppScopeDeps" && k == "with"),
-            "should have _AppScopeDeps as with, got: {:?}", cls.parents);
-        assert!(cls.parents.iter().any(|(p, k)| p == "_AppScopeInitializeQueue" && k == "with"),
-            "should have _AppScopeInitializeQueue as with, got: {:?}", cls.parents);
-        assert!(cls.parents.iter().any(|(p, k)| p == "_PublicAppScopeImpl" && k == "with"),
-            "should have _PublicAppScopeImpl as with, got: {:?}", cls.parents);
+        let cls = symbols
+            .iter()
+            .find(|s| s.name == "_AppScopeContainer" && s.kind == SymbolKind::Class)
+            .unwrap();
+        assert!(
+            cls.parents
+                .iter()
+                .any(|(p, k)| p == "AppScopeContainer" && k == "extends"),
+            "should have AppScopeContainer as extends, got: {:?}",
+            cls.parents
+        );
+        assert!(
+            cls.parents
+                .iter()
+                .any(|(p, k)| p == "_AppScopeDeps" && k == "with"),
+            "should have _AppScopeDeps as with, got: {:?}",
+            cls.parents
+        );
+        assert!(
+            cls.parents
+                .iter()
+                .any(|(p, k)| p == "_AppScopeInitializeQueue" && k == "with"),
+            "should have _AppScopeInitializeQueue as with, got: {:?}",
+            cls.parents
+        );
+        assert!(
+            cls.parents
+                .iter()
+                .any(|(p, k)| p == "_PublicAppScopeImpl" && k == "with"),
+            "should have _PublicAppScopeImpl as with, got: {:?}",
+            cls.parents
+        );
     }
 
     #[test]
@@ -1473,7 +1852,35 @@ String get appName => 'MyApp';
 set appName(String value) {}
 "#;
         let symbols = DART_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "appName" && s.kind == SymbolKind::Property),
-            "Should find top-level getter appName, got: {:?}", symbols);
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "appName" && s.kind == SymbolKind::Property),
+            "Should find top-level getter appName, got: {:?}",
+            symbols
+        );
+    }
+
+    #[test]
+    fn test_parse_deeply_nested_blocks_without_stack_overflow() {
+        let depth = 12_000;
+        let mut content = String::from("void outer() {\n");
+        for _ in 0..depth {
+            content.push_str("{\n");
+        }
+        content.push_str("void inner() {}\n");
+        for _ in 0..depth {
+            content.push_str("}\n");
+        }
+        content.push_str("}\n");
+
+        let symbols = DART_PARSER.parse_symbols(&content).unwrap();
+
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "outer" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "inner" && s.kind == SymbolKind::Function));
     }
 }

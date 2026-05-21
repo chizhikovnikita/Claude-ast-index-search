@@ -1,12 +1,12 @@
 //! Tree-sitter based Java parser
 
 use anyhow::Result;
-use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 use std::sync::LazyLock;
+use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
+use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
-use super::{LanguageParser, parse_tree, node_text, node_line, line_text};
 
 static JAVA_LANGUAGE: LazyLock<Language> = LazyLock::new(|| tree_sitter_java::LANGUAGE.into());
 
@@ -21,15 +21,45 @@ pub struct JavaParser;
 
 /// Significant Java/Spring annotations to track
 const SIGNIFICANT_ANNOTATIONS: &[&str] = &[
-    "RestController", "Controller", "Service", "Repository", "Component",
-    "Entity", "Table", "Configuration", "Bean",
-    "GetMapping", "PostMapping", "PutMapping", "DeleteMapping", "PatchMapping",
-    "RequestMapping", "Autowired", "Override", "Transactional",
-    "SpringBootApplication", "EnableAutoConfiguration",
-    "Test", "BeforeEach", "AfterEach", "BeforeAll", "AfterAll",
-    "Inject", "Singleton", "Provides", "Binds", "Module",
-    "Data", "Value", "Builder", "AllArgsConstructor", "NoArgsConstructor",
-    "Getter", "Setter", "Slf4j", "Log4j2",
+    "RestController",
+    "Controller",
+    "Service",
+    "Repository",
+    "Component",
+    "Entity",
+    "Table",
+    "Configuration",
+    "Bean",
+    "GetMapping",
+    "PostMapping",
+    "PutMapping",
+    "DeleteMapping",
+    "PatchMapping",
+    "RequestMapping",
+    "Autowired",
+    "Override",
+    "Transactional",
+    "SpringBootApplication",
+    "EnableAutoConfiguration",
+    "Test",
+    "BeforeEach",
+    "AfterEach",
+    "BeforeAll",
+    "AfterAll",
+    "Inject",
+    "Singleton",
+    "Provides",
+    "Binds",
+    "Module",
+    "Data",
+    "Value",
+    "Builder",
+    "AllArgsConstructor",
+    "NoArgsConstructor",
+    "Getter",
+    "Setter",
+    "Slf4j",
+    "Log4j2",
 ];
 
 impl LanguageParser for JavaParser {
@@ -41,7 +71,10 @@ impl LanguageParser for JavaParser {
 
         let capture_names = query.capture_names();
         let idx = |name: &str| -> Option<u32> {
-            capture_names.iter().position(|n| *n == name).map(|i| i as u32)
+            capture_names
+                .iter()
+                .position(|n| *n == name)
+                .map(|i| i as u32)
         };
 
         let idx_class_name = idx("class_name");
@@ -61,8 +94,10 @@ impl LanguageParser for JavaParser {
         let idx_annotation_name = idx("annotation_name");
         let idx_annotation_call_name = idx("annotation_call_name");
 
-        let mut emitted: std::collections::HashSet<(String, usize)> = std::collections::HashSet::new();
-        let mut explicit_methods: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+        let mut emitted: std::collections::HashSet<(String, usize)> =
+            std::collections::HashSet::new();
+        let mut explicit_methods: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
         let mut pending_record_accessors: Vec<(String, String, usize, String)> = Vec::new();
 
         let mut matches = cursor.matches(query, tree.root_node(), content.as_bytes());
@@ -207,10 +242,16 @@ impl LanguageParser for JavaParser {
                         });
                     }
 
-                    let accessor_signature = record_component_accessor_signature(content, &node_cap.node, name);
+                    let accessor_signature =
+                        record_component_accessor_signature(content, &node_cap.node, name);
 
                     // Emit synthetic accessors after we know explicit methods in the same type.
-                    pending_record_accessors.push((owner, name.to_string(), line, accessor_signature));
+                    pending_record_accessors.push((
+                        owner,
+                        name.to_string(),
+                        line,
+                        accessor_signature,
+                    ));
                 }
                 continue;
             }
@@ -275,15 +316,25 @@ impl LanguageParser for JavaParser {
 /// Check if a node is inside a class/interface/enum/record body
 fn is_inside_type_body(node: &tree_sitter::Node) -> bool {
     node.parent()
-        .map(|p| matches!(
-            p.kind(),
-            "class_body" | "interface_body" | "enum_body" | "enum_body_declarations" | "record_body"
-        ))
+        .map(|p| {
+            matches!(
+                p.kind(),
+                "class_body"
+                    | "interface_body"
+                    | "enum_body"
+                    | "enum_body_declarations"
+                    | "record_body"
+            )
+        })
         .unwrap_or(false)
 }
 
 /// Build synthetic accessor signature for a record component (e.g. `String id()`).
-fn record_component_accessor_signature(content: &str, component_node: &tree_sitter::Node, name: &str) -> String {
+fn record_component_accessor_signature(
+    content: &str,
+    component_node: &tree_sitter::Node,
+    name: &str,
+) -> String {
     if let Some(type_node) = component_node.child_by_field_name("type") {
         let mut type_text = node_text(content, &type_node).trim().to_string();
         if let Some(dim_node) = component_node.child_by_field_name("dimensions") {
@@ -298,7 +349,13 @@ fn record_component_accessor_signature(content: &str, component_node: &tree_sitt
 fn enclosing_type_name(content: &str, node: &tree_sitter::Node) -> Option<String> {
     let mut cur = Some(*node);
     while let Some(n) = cur {
-        if matches!(n.kind(), "class_declaration" | "interface_declaration" | "enum_declaration" | "record_declaration") {
+        if matches!(
+            n.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+        ) {
             if let Some(name_node) = n.child_by_field_name("name") {
                 return Some(node_text(content, &name_node).to_string());
             }
@@ -333,7 +390,10 @@ fn extract_class_parents(content: &str, class_node: &tree_sitter::Node) -> Vec<(
 }
 
 /// Extract parent types from an interface_declaration (extends)
-fn extract_interface_parents(content: &str, iface_node: &tree_sitter::Node) -> Vec<(String, String)> {
+fn extract_interface_parents(
+    content: &str,
+    iface_node: &tree_sitter::Node,
+) -> Vec<(String, String)> {
     let mut parents = Vec::new();
     let mut cursor = iface_node.walk();
 
@@ -396,32 +456,36 @@ fn extract_type_list(
     inherit_kind: &str,
     parents: &mut Vec<(String, String)>,
 ) {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        match child.kind() {
-            "type_list" => {
-                // Recurse into type_list
-                extract_type_list(&child, content, inherit_kind, parents);
-            }
-            "type_identifier" => {
-                let name = node_text(content, &child);
-                parents.push((name.to_string(), inherit_kind.to_string()));
-            }
-            "generic_type" => {
-                if let Some(first) = child.named_child(0) {
-                    if first.kind() == "type_identifier" {
-                        let name = node_text(content, &first);
-                        parents.push((name.to_string(), inherit_kind.to_string()));
+    let mut stack = vec![*node];
+
+    while let Some(node) = stack.pop() {
+        let mut cursor = node.walk();
+        let mut children: Vec<tree_sitter::Node> = node.children(&mut cursor).collect();
+        children.reverse();
+
+        for child in children {
+            match child.kind() {
+                "type_list" => stack.push(child),
+                "type_identifier" => {
+                    let name = node_text(content, &child);
+                    parents.push((name.to_string(), inherit_kind.to_string()));
+                }
+                "generic_type" => {
+                    if let Some(first) = child.named_child(0) {
+                        if first.kind() == "type_identifier" {
+                            let name = node_text(content, &first);
+                            parents.push((name.to_string(), inherit_kind.to_string()));
+                        }
                     }
                 }
-            }
-            "scoped_type_identifier" => {
-                let text = node_text(content, &child);
-                if let Some(last) = text.rsplit('.').next() {
-                    parents.push((last.to_string(), inherit_kind.to_string()));
+                "scoped_type_identifier" => {
+                    let text = node_text(content, &child);
+                    if let Some(last) = text.rsplit('.').next() {
+                        parents.push((last.to_string(), inherit_kind.to_string()));
+                    }
                 }
+                _ => {}
             }
-            _ => {}
         }
     }
 }
@@ -443,16 +507,25 @@ mod tests {
     fn test_parse_class() {
         let content = "public class UserService {\n}\n";
         let symbols = JAVA_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "UserService" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "UserService" && s.kind == SymbolKind::Class));
     }
 
     #[test]
     fn test_parse_class_with_extends() {
-        let content = "public class UserController extends BaseController implements Serializable {\n}\n";
+        let content =
+            "public class UserController extends BaseController implements Serializable {\n}\n";
         let symbols = JAVA_PARSER.parse_symbols(content).unwrap();
         let cls = symbols.iter().find(|s| s.name == "UserController").unwrap();
-        assert!(cls.parents.iter().any(|(p, k)| p == "BaseController" && k == "extends"));
-        assert!(cls.parents.iter().any(|(p, k)| p == "Serializable" && k == "implements"));
+        assert!(cls
+            .parents
+            .iter()
+            .any(|(p, k)| p == "BaseController" && k == "extends"));
+        assert!(cls
+            .parents
+            .iter()
+            .any(|(p, k)| p == "Serializable" && k == "implements"));
     }
 
     #[test]
@@ -461,14 +534,19 @@ mod tests {
         let symbols = JAVA_PARSER.parse_symbols(content).unwrap();
         let iface = symbols.iter().find(|s| s.name == "UserRepository").unwrap();
         assert_eq!(iface.kind, SymbolKind::Interface);
-        assert!(iface.parents.iter().any(|(p, k)| p == "JpaRepository" && k == "extends"));
+        assert!(iface
+            .parents
+            .iter()
+            .any(|(p, k)| p == "JpaRepository" && k == "extends"));
     }
 
     #[test]
     fn test_parse_enum() {
         let content = "public enum Status {\n    ACTIVE,\n    INACTIVE;\n}\n";
         let symbols = JAVA_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "Status" && s.kind == SymbolKind::Enum));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Status" && s.kind == SymbolKind::Enum));
     }
 
     #[test]
@@ -480,9 +558,15 @@ mod tests {
 }
 "#;
         let symbols = JAVA_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "getUsers" && s.kind == SymbolKind::Function));
-        assert!(symbols.iter().any(|s| s.name == "validate" && s.kind == SymbolKind::Function));
-        assert!(symbols.iter().any(|s| s.name == "format" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "getUsers" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "validate" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "format" && s.kind == SymbolKind::Function));
     }
 
     #[test]
@@ -495,7 +579,9 @@ mod tests {
 }
 "#;
         let symbols = JAVA_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "User" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "User" && s.kind == SymbolKind::Class));
         // Constructor is indexed as a function with the class name
         assert!(symbols.iter().filter(|s| s.name == "User").count() >= 2);
     }
@@ -509,9 +595,15 @@ mod tests {
 }
 "#;
         let symbols = JAVA_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "apiUrl" && s.kind == SymbolKind::Property));
-        assert!(symbols.iter().any(|s| s.name == "MAX_RETRIES" && s.kind == SymbolKind::Property));
-        assert!(symbols.iter().any(|s| s.name == "items" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "apiUrl" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "MAX_RETRIES" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "items" && s.kind == SymbolKind::Property));
     }
 
     #[test]
@@ -527,10 +619,18 @@ public class UserController {
 }
 "#;
         let symbols = JAVA_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "@RestController" && s.kind == SymbolKind::Annotation));
-        assert!(symbols.iter().any(|s| s.name == "@RequestMapping" && s.kind == SymbolKind::Annotation));
-        assert!(symbols.iter().any(|s| s.name == "@GetMapping" && s.kind == SymbolKind::Annotation));
-        assert!(symbols.iter().any(|s| s.name == "@Override" && s.kind == SymbolKind::Annotation));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "@RestController" && s.kind == SymbolKind::Annotation));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "@RequestMapping" && s.kind == SymbolKind::Annotation));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "@GetMapping" && s.kind == SymbolKind::Annotation));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "@Override" && s.kind == SymbolKind::Annotation));
     }
 
     #[test]
@@ -547,17 +647,30 @@ public class PaymentService {
 }
 "#;
         let symbols = JAVA_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "@Service" && s.kind == SymbolKind::Annotation));
-        assert!(symbols.iter().any(|s| s.name == "@Autowired" && s.kind == SymbolKind::Annotation));
-        assert!(symbols.iter().any(|s| s.name == "@Transactional" && s.kind == SymbolKind::Annotation));
-        assert!(symbols.iter().any(|s| s.name == "PaymentService" && s.kind == SymbolKind::Class));
-        assert!(symbols.iter().any(|s| s.name == "processPayment" && s.kind == SymbolKind::Function));
-        assert!(symbols.iter().any(|s| s.name == "repository" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "@Service" && s.kind == SymbolKind::Annotation));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "@Autowired" && s.kind == SymbolKind::Annotation));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "@Transactional" && s.kind == SymbolKind::Annotation));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "PaymentService" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "processPayment" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "repository" && s.kind == SymbolKind::Property));
     }
 
     #[test]
     fn test_comments_ignored() {
-        let content = "// class FakeClass {}\npublic class RealClass {}\n/* void fakeMethod() {} */\n";
+        let content =
+            "// class FakeClass {}\npublic class RealClass {}\n/* void fakeMethod() {} */\n";
         let symbols = JAVA_PARSER.parse_symbols(content).unwrap();
         assert!(symbols.iter().any(|s| s.name == "RealClass"));
         assert!(!symbols.iter().any(|s| s.name == "FakeClass"));
@@ -577,8 +690,12 @@ public class Foo {
         assert!(!symbols.iter().any(|s| s.name == "@SuppressWarnings"));
         assert!(!symbols.iter().any(|s| s.name == "@Deprecated"));
         // But class and method should still be indexed
-        assert!(symbols.iter().any(|s| s.name == "Foo" && s.kind == SymbolKind::Class));
-        assert!(symbols.iter().any(|s| s.name == "bar" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Foo" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "bar" && s.kind == SymbolKind::Function));
     }
 
     #[test]
@@ -586,8 +703,14 @@ public class Foo {
         let content = "public class UserRepo extends CrudRepository<User, Long> implements UserRepository {\n}\n";
         let symbols = JAVA_PARSER.parse_symbols(content).unwrap();
         let cls = symbols.iter().find(|s| s.name == "UserRepo").unwrap();
-        assert!(cls.parents.iter().any(|(p, k)| p == "CrudRepository" && k == "extends"));
-        assert!(cls.parents.iter().any(|(p, k)| p == "UserRepository" && k == "implements"));
+        assert!(cls
+            .parents
+            .iter()
+            .any(|(p, k)| p == "CrudRepository" && k == "extends"));
+        assert!(cls
+            .parents
+            .iter()
+            .any(|(p, k)| p == "UserRepository" && k == "implements"));
     }
 
     #[test]
@@ -599,21 +722,48 @@ public class Foo {
         let symbols = JAVA_PARSER.parse_symbols(content).unwrap();
         let rec = symbols.iter().find(|s| s.name == "UserDto").unwrap();
         assert_eq!(rec.kind, SymbolKind::Class);
-        assert!(rec.parents.iter().any(|(p, k)| p == "Serializable" && k == "implements"));
-        assert!(symbols.iter().any(|s| s.name == "displayName" && s.kind == SymbolKind::Function));
-        assert!(symbols.iter().any(|s| s.name == "id" && s.kind == SymbolKind::Property && s.signature == "String id"));
-        assert!(symbols.iter().any(|s| s.name == "name" && s.kind == SymbolKind::Property && s.signature == "String name"));
-        assert!(symbols.iter().any(|s| s.name == "id" && s.kind == SymbolKind::Function && s.signature == "String id()"));
-        assert!(symbols.iter().any(|s| s.name == "name" && s.kind == SymbolKind::Function && s.signature == "String name()"));
+        assert!(rec
+            .parents
+            .iter()
+            .any(|(p, k)| p == "Serializable" && k == "implements"));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "displayName" && s.kind == SymbolKind::Function));
+        assert!(symbols.iter().any(|s| s.name == "id"
+            && s.kind == SymbolKind::Property
+            && s.signature == "String id"));
+        assert!(symbols.iter().any(|s| s.name == "name"
+            && s.kind == SymbolKind::Property
+            && s.signature == "String name"));
+        assert!(symbols.iter().any(|s| s.name == "id"
+            && s.kind == SymbolKind::Function
+            && s.signature == "String id()"));
+        assert!(symbols.iter().any(|s| s.name == "name"
+            && s.kind == SymbolKind::Function
+            && s.signature == "String name()"));
     }
 
     #[test]
     fn test_parse_empty_record() {
         let content = "public record Empty() {}\n";
         let symbols = JAVA_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "Empty" && s.kind == SymbolKind::Class));
-        assert_eq!(symbols.iter().filter(|s| s.kind == SymbolKind::Property).count(), 0);
-        assert_eq!(symbols.iter().filter(|s| s.kind == SymbolKind::Function).count(), 0);
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Empty" && s.kind == SymbolKind::Class));
+        assert_eq!(
+            symbols
+                .iter()
+                .filter(|s| s.kind == SymbolKind::Property)
+                .count(),
+            0
+        );
+        assert_eq!(
+            symbols
+                .iter()
+                .filter(|s| s.kind == SymbolKind::Function)
+                .count(),
+            0
+        );
     }
 
     #[test]
@@ -623,8 +773,16 @@ public class Foo {
 }
 "#;
         let symbols = JAVA_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "name" && s.kind == SymbolKind::Property && s.signature == "String name"));
-        assert_eq!(symbols.iter().filter(|s| s.name == "name" && s.kind == SymbolKind::Function).count(), 1);
+        assert!(symbols.iter().any(|s| s.name == "name"
+            && s.kind == SymbolKind::Property
+            && s.signature == "String name"));
+        assert_eq!(
+            symbols
+                .iter()
+                .filter(|s| s.name == "name" && s.kind == SymbolKind::Function)
+                .count(),
+            1
+        );
         assert!(symbols.iter().any(|s| s.name == "name"
             && s.kind == SymbolKind::Function
             && s.signature == "public String name() { return name.toUpperCase(); }"));
