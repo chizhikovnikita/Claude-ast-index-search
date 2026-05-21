@@ -170,8 +170,7 @@ pub fn delete_db(project_root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Initialize the database schema
-pub fn init_db(conn: &Connection) -> Result<()> {
+fn create_base_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
         -- Files table
@@ -181,7 +180,6 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             mtime INTEGER NOT NULL,
             size INTEGER NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);
 
         -- Symbols table (classes, interfaces, functions, etc.)
         CREATE TABLE IF NOT EXISTS symbols (
@@ -194,29 +192,6 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             signature TEXT,
             FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
         );
-        CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
-        CREATE INDEX IF NOT EXISTS idx_symbols_kind ON symbols(kind);
-        CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id);
-
-        -- FTS5 virtual table for full-text search
-        CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
-            name,
-            signature,
-            content=symbols,
-            content_rowid=id
-        );
-
-        -- Triggers to keep FTS in sync
-        CREATE TRIGGER IF NOT EXISTS symbols_ai AFTER INSERT ON symbols BEGIN
-            INSERT INTO symbols_fts(rowid, name, signature) VALUES (new.id, new.name, new.signature);
-        END;
-        CREATE TRIGGER IF NOT EXISTS symbols_ad AFTER DELETE ON symbols BEGIN
-            INSERT INTO symbols_fts(symbols_fts, rowid, name, signature) VALUES('delete', old.id, old.name, old.signature);
-        END;
-        CREATE TRIGGER IF NOT EXISTS symbols_au AFTER UPDATE ON symbols BEGIN
-            INSERT INTO symbols_fts(symbols_fts, rowid, name, signature) VALUES('delete', old.id, old.name, old.signature);
-            INSERT INTO symbols_fts(rowid, name, signature) VALUES (new.id, new.name, new.signature);
-        END;
 
         -- Modules table
         CREATE TABLE IF NOT EXISTS modules (
@@ -225,7 +200,6 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             path TEXT NOT NULL,
             kind TEXT
         );
-        CREATE INDEX IF NOT EXISTS idx_modules_name ON modules(name);
 
         -- Module dependencies
         CREATE TABLE IF NOT EXISTS module_deps (
@@ -236,8 +210,6 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             FOREIGN KEY (module_id) REFERENCES modules(id) ON DELETE CASCADE,
             FOREIGN KEY (dep_module_id) REFERENCES modules(id) ON DELETE CASCADE
         );
-        CREATE INDEX IF NOT EXISTS idx_module_deps_module ON module_deps(module_id);
-        CREATE INDEX IF NOT EXISTS idx_module_deps_dep ON module_deps(dep_module_id);
 
         -- Inheritance/implementation relationships
         CREATE TABLE IF NOT EXISTS inheritance (
@@ -247,8 +219,6 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             kind TEXT NOT NULL,
             FOREIGN KEY (child_id) REFERENCES symbols(id) ON DELETE CASCADE
         );
-        CREATE INDEX IF NOT EXISTS idx_inheritance_child ON inheritance(child_id);
-        CREATE INDEX IF NOT EXISTS idx_inheritance_parent ON inheritance(parent_name);
 
         -- References table (symbol usages)
         CREATE TABLE IF NOT EXISTS refs (
@@ -259,12 +229,6 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             context TEXT,
             FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
         );
-        CREATE INDEX IF NOT EXISTS idx_refs_name ON refs(name);
-        CREATE INDEX IF NOT EXISTS idx_refs_file ON refs(file_id);
-        -- Composite covering index for find_references: lets SQLite avoid
-        -- full table scan when filtering by name AND joining with files
-        -- on large ref tables (millions of rows). See issue #19.
-        CREATE INDEX IF NOT EXISTS idx_refs_name_file_line ON refs(name, file_id, line);
 
         -- XML usages (classes used in XML layouts)
         CREATE TABLE IF NOT EXISTS xml_usages (
@@ -277,8 +241,6 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             element_id TEXT,
             FOREIGN KEY (module_id) REFERENCES modules(id) ON DELETE CASCADE
         );
-        CREATE INDEX IF NOT EXISTS idx_xml_usages_class ON xml_usages(class_name);
-        CREATE INDEX IF NOT EXISTS idx_xml_usages_module ON xml_usages(module_id);
 
         -- Resources definitions
         CREATE TABLE IF NOT EXISTS resources (
@@ -290,9 +252,6 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             line INTEGER,
             FOREIGN KEY (module_id) REFERENCES modules(id) ON DELETE CASCADE
         );
-        CREATE INDEX IF NOT EXISTS idx_resources_name ON resources(name);
-        CREATE INDEX IF NOT EXISTS idx_resources_type ON resources(type);
-        CREATE INDEX IF NOT EXISTS idx_resources_module ON resources(module_id);
 
         -- Resource usages
         CREATE TABLE IF NOT EXISTS resource_usages (
@@ -303,7 +262,6 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             usage_type TEXT,
             FOREIGN KEY (resource_id) REFERENCES resources(id) ON DELETE CASCADE
         );
-        CREATE INDEX IF NOT EXISTS idx_resource_usages_resource ON resource_usages(resource_id);
 
         -- Transitive dependencies cache
         CREATE TABLE IF NOT EXISTS transitive_deps (
@@ -315,8 +273,6 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             FOREIGN KEY (module_id) REFERENCES modules(id) ON DELETE CASCADE,
             FOREIGN KEY (dependency_id) REFERENCES modules(id) ON DELETE CASCADE
         );
-        CREATE INDEX IF NOT EXISTS idx_transitive_deps_module ON transitive_deps(module_id);
-        CREATE INDEX IF NOT EXISTS idx_transitive_deps_dep ON transitive_deps(dependency_id);
 
         -- iOS storyboard/xib usages
         CREATE TABLE IF NOT EXISTS storyboard_usages (
@@ -329,8 +285,6 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             storyboard_id TEXT,
             FOREIGN KEY (module_id) REFERENCES modules(id) ON DELETE CASCADE
         );
-        CREATE INDEX IF NOT EXISTS idx_storyboard_usages_class ON storyboard_usages(class_name);
-        CREATE INDEX IF NOT EXISTS idx_storyboard_usages_module ON storyboard_usages(module_id);
 
         -- iOS assets (from .xcassets)
         CREATE TABLE IF NOT EXISTS ios_assets (
@@ -341,8 +295,6 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             file_path TEXT NOT NULL,
             FOREIGN KEY (module_id) REFERENCES modules(id) ON DELETE CASCADE
         );
-        CREATE INDEX IF NOT EXISTS idx_ios_assets_name ON ios_assets(name);
-        CREATE INDEX IF NOT EXISTS idx_ios_assets_type ON ios_assets(type);
 
         -- iOS asset usages
         CREATE TABLE IF NOT EXISTS ios_asset_usages (
@@ -353,7 +305,6 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             usage_type TEXT,
             FOREIGN KEY (asset_id) REFERENCES ios_assets(id) ON DELETE CASCADE
         );
-        CREATE INDEX IF NOT EXISTS idx_ios_asset_usages_asset ON ios_asset_usages(asset_id);
 
         -- Metadata for storing index settings
         CREATE TABLE IF NOT EXISTS metadata (
@@ -362,6 +313,103 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         );
         "#,
     )?;
+    Ok(())
+}
+
+fn create_secondary_indexes(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);
+        CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
+        CREATE INDEX IF NOT EXISTS idx_symbols_kind ON symbols(kind);
+        CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id);
+        CREATE INDEX IF NOT EXISTS idx_modules_name ON modules(name);
+        CREATE INDEX IF NOT EXISTS idx_module_deps_module ON module_deps(module_id);
+        CREATE INDEX IF NOT EXISTS idx_module_deps_dep ON module_deps(dep_module_id);
+        CREATE INDEX IF NOT EXISTS idx_inheritance_child ON inheritance(child_id);
+        CREATE INDEX IF NOT EXISTS idx_inheritance_parent ON inheritance(parent_name);
+        CREATE INDEX IF NOT EXISTS idx_refs_name ON refs(name);
+        CREATE INDEX IF NOT EXISTS idx_refs_file ON refs(file_id);
+        -- Composite covering index for find_references: lets SQLite avoid
+        -- full table scan when filtering by name AND joining with files
+        -- on large ref tables (millions of rows). See issue #19.
+        CREATE INDEX IF NOT EXISTS idx_refs_name_file_line ON refs(name, file_id, line);
+        CREATE INDEX IF NOT EXISTS idx_xml_usages_class ON xml_usages(class_name);
+        CREATE INDEX IF NOT EXISTS idx_xml_usages_module ON xml_usages(module_id);
+        CREATE INDEX IF NOT EXISTS idx_resources_name ON resources(name);
+        CREATE INDEX IF NOT EXISTS idx_resources_type ON resources(type);
+        CREATE INDEX IF NOT EXISTS idx_resources_module ON resources(module_id);
+        CREATE INDEX IF NOT EXISTS idx_resource_usages_resource ON resource_usages(resource_id);
+        CREATE INDEX IF NOT EXISTS idx_transitive_deps_module ON transitive_deps(module_id);
+        CREATE INDEX IF NOT EXISTS idx_transitive_deps_dep ON transitive_deps(dependency_id);
+        CREATE INDEX IF NOT EXISTS idx_storyboard_usages_class ON storyboard_usages(class_name);
+        CREATE INDEX IF NOT EXISTS idx_storyboard_usages_module ON storyboard_usages(module_id);
+        CREATE INDEX IF NOT EXISTS idx_ios_assets_name ON ios_assets(name);
+        CREATE INDEX IF NOT EXISTS idx_ios_assets_type ON ios_assets(type);
+        CREATE INDEX IF NOT EXISTS idx_ios_asset_usages_asset ON ios_asset_usages(asset_id);
+        "#,
+    )?;
+    Ok(())
+}
+
+fn create_symbols_fts(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
+            name,
+            signature,
+            content=symbols,
+            content_rowid=id
+        );
+
+        CREATE TRIGGER IF NOT EXISTS symbols_ai AFTER INSERT ON symbols BEGIN
+            INSERT INTO symbols_fts(rowid, name, signature) VALUES (new.id, new.name, new.signature);
+        END;
+        CREATE TRIGGER IF NOT EXISTS symbols_ad AFTER DELETE ON symbols BEGIN
+            INSERT INTO symbols_fts(symbols_fts, rowid, name, signature) VALUES('delete', old.id, old.name, old.signature);
+        END;
+        CREATE TRIGGER IF NOT EXISTS symbols_au AFTER UPDATE ON symbols BEGIN
+            INSERT INTO symbols_fts(symbols_fts, rowid, name, signature) VALUES('delete', old.id, old.name, old.signature);
+            INSERT INTO symbols_fts(rowid, name, signature) VALUES (new.id, new.name, new.signature);
+        END;
+        "#,
+    )?;
+    conn.execute("INSERT INTO symbols_fts(symbols_fts) VALUES ('rebuild')", [])?;
+    Ok(())
+}
+
+/// Initialize the full database schema for regular use and tests.
+pub fn init_db(conn: &Connection) -> Result<()> {
+    create_base_schema(conn)?;
+    create_secondary_indexes(conn)?;
+    create_symbols_fts(conn)?;
+    Ok(())
+}
+
+/// Initialize a minimal schema optimized for fresh full rebuilds.
+pub fn init_db_for_rebuild(conn: &Connection) -> Result<()> {
+    create_base_schema(conn)
+}
+
+/// Finalize a rebuild-optimized database by creating indexes and FTS after bulk inserts.
+pub fn finalize_db_after_rebuild(conn: &Connection) -> Result<()> {
+    create_secondary_indexes(conn)?;
+    create_symbols_fts(conn)?;
+    Ok(())
+}
+
+/// Apply aggressive SQLite settings for experimental fast rebuilds.
+///
+/// Keep this intentionally conservative: the experimental fast rebuild flag
+/// should not sacrifice durability or explode memory usage by default.
+pub fn enable_experimental_fast_rebuild_pragmas(conn: &Connection) -> Result<()> {
+    conn.pragma_update(None, "cache_size", "-16000")?; // 16 MB cache
+    Ok(())
+}
+
+/// Restore the regular connection settings after an experimental fast rebuild.
+pub fn restore_default_pragmas(conn: &Connection) -> Result<()> {
+    conn.pragma_update(None, "cache_size", "-8000")?;
     Ok(())
 }
 

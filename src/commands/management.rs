@@ -17,6 +17,75 @@ use crate::indexer;
 
 /// File count threshold for auto-switching to sub-projects mode
 const AUTO_SUB_PROJECTS_THRESHOLD: usize = 65_000;
+/// In experimental fast rebuild mode, a root with this many sub-projects is
+/// treated as a monorepo immediately and skips the expensive quick file count.
+const EXPERIMENTAL_SUB_PROJECTS_SHORTCUT_THRESHOLD: usize = 20;
+
+struct ScopedEnvVar {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl ScopedEnvVar {
+    fn set_bool(key: &'static str, enabled: bool) -> Self {
+        let previous = std::env::var_os(key);
+        if enabled {
+            std::env::set_var(key, "1");
+        } else {
+            std::env::remove_var(key);
+        }
+        Self { key, previous }
+    }
+}
+
+impl Drop for ScopedEnvVar {
+    fn drop(&mut self) {
+        if let Some(prev) = self.previous.take() {
+            std::env::set_var(self.key, prev);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
+}
+
+fn init_rebuild_schema(conn: &rusqlite::Connection, experimental_fast_rebuild: bool) -> Result<()> {
+    if experimental_fast_rebuild {
+        db::enable_experimental_fast_rebuild_pragmas(conn)?;
+        db::init_db_for_rebuild(conn)
+    } else {
+        db::init_db(conn)
+    }
+}
+
+fn finalize_rebuild_schema(
+    conn: &rusqlite::Connection,
+    experimental_fast_rebuild: bool,
+    verbose: bool,
+) -> Result<()> {
+    if experimental_fast_rebuild {
+        let t = Instant::now();
+        db::finalize_db_after_rebuild(conn)?;
+        if verbose {
+            eprintln!("[verbose] finalize_db_after_rebuild in {:?}", t.elapsed());
+        }
+    }
+    Ok(())
+}
+
+fn restore_rebuild_pragmas(
+    conn: &rusqlite::Connection,
+    experimental_fast_rebuild: bool,
+    verbose: bool,
+) -> Result<()> {
+    if experimental_fast_rebuild {
+        let t = Instant::now();
+        db::restore_default_pragmas(conn)?;
+        if verbose {
+            eprintln!("[verbose] restore_default_pragmas in {:?}", t.elapsed());
+        }
+    }
+    Ok(())
+}
 
 /// Build a gitignore-style exclude matcher anchored to `root` from config patterns.
 fn build_exclude_matcher(root: &std::path::Path, patterns: Option<&[String]>) -> Option<ignore::gitignore::Gitignore> {
@@ -28,7 +97,9 @@ fn build_exclude_matcher(root: &std::path::Path, patterns: Option<&[String]>) ->
 }
 
 /// Rebuild the index (full or partial)
-pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: bool, sub_projects: bool, project_type: Option<indexer::ProjectType>, verbose: bool, cli_include: &[String], cli_exclude: &[String], extra_paths: &[String]) -> Result<()> {
+pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: bool, sub_projects: bool, project_type: Option<indexer::ProjectType>, verbose: bool, experimental_fast_rebuild: bool, cli_include: &[String], cli_exclude: &[String], extra_paths: &[String]) -> Result<()> {
+    let _experimental_fast_rebuild_env =
+        ScopedEnvVar::set_bool("AST_INDEX_EXPERIMENTAL_FAST_REBUILD", experimental_fast_rebuild);
     if verbose {
         std::env::set_var("AST_INDEX_VERBOSE", "1");
         eprintln!("[verbose] rebuild started for: {}", root.display());
@@ -72,7 +143,7 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
 
     // Explicit sub-projects mode (--sub-projects flag)
     if sub_projects {
-        return cmd_rebuild_sub_projects(root, index_type, index_deps, no_ignore, verbose,
+        return cmd_rebuild_sub_projects(root, index_type, index_deps, no_ignore, verbose, experimental_fast_rebuild,
                                         config_exclude.as_deref(), config_include.as_deref(), exclude_matcher.as_ref());
     }
 
@@ -97,10 +168,33 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
                 ).yellow()
             );
             return cmd_rebuild_sub_projects(root, index_type, index_deps, no_ignore, verbose,
+                                            experimental_fast_rebuild,
                                             config_exclude.as_deref(), config_include.as_deref(), exclude_matcher.as_ref());
         }
 
         if subs.len() >= 2 {
+            if experimental_fast_rebuild
+                && subs.len() >= EXPERIMENTAL_SUB_PROJECTS_SHORTCUT_THRESHOLD
+            {
+                eprintln!(
+                    "{}",
+                    format!(
+                        "Experimental fast rebuild: detected {} sub-projects — skipping quick file count and switching to sub-projects mode",
+                        subs.len()
+                    ).yellow()
+                );
+                return cmd_rebuild_sub_projects(
+                    root,
+                    index_type,
+                    index_deps,
+                    no_ignore,
+                    verbose,
+                    experimental_fast_rebuild,
+                    config_exclude.as_deref(),
+                    config_include.as_deref(),
+                    exclude_matcher.as_ref(),
+                );
+            }
             if verbose { eprintln!("[verbose] counting files (quick_file_count, limit={})...", AUTO_SUB_PROJECTS_THRESHOLD); }
             let t = Instant::now();
             let file_count = indexer::quick_file_count(root, no_ignore, AUTO_SUB_PROJECTS_THRESHOLD);
@@ -116,6 +210,7 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
                     ).yellow()
                 );
                 return cmd_rebuild_sub_projects(root, index_type, index_deps, no_ignore, verbose,
+                                                experimental_fast_rebuild,
                                                 config_exclude.as_deref(), config_include.as_deref(), exclude_matcher.as_ref());
             }
         }
@@ -161,7 +256,7 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
     if verbose { eprintln!("[verbose] opening new DB..."); }
     let t = Instant::now();
     let mut conn = db::open_db(root)?;
-    db::init_db(&conn)?;
+    init_rebuild_schema(&conn, experimental_fast_rebuild)?;
     if verbose { eprintln!("[verbose] DB opened + schema created in {:?}", t.elapsed()); }
 
     // Merge config roots + saved extra roots + CLI --path args
@@ -324,6 +419,8 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
             }
 
             // Print summary based on project type
+            finalize_rebuild_schema(&conn, experimental_fast_rebuild, verbose)?;
+
             if is_android && is_ios {
                 println!(
                     "{}",
@@ -363,6 +460,7 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
             conn.execute("DELETE FROM symbols", [])?;
             conn.execute("DELETE FROM files", [])?;
             let walk = indexer::index_directory_with_config(&mut conn, root, true, no_ignore, project_type, config_exclude.as_deref())?;
+            finalize_rebuild_schema(&conn, experimental_fast_rebuild, verbose)?;
             println!("{}", format!("Indexed {} files", walk.file_count).green());
         }
         "modules" => {
@@ -375,11 +473,13 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
                 println!("{}", "Indexing module dependencies...".cyan());
                 let gradle_files = indexer::collect_build_files_from_db(&conn, root)?;
                 let dep_count = indexer::index_module_dependencies(&mut conn, root, &gradle_files, true)?;
+                finalize_rebuild_schema(&conn, experimental_fast_rebuild, verbose)?;
                 println!(
                     "{}",
                     format!("Indexed {} modules, {} dependencies", module_count, dep_count).green()
                 );
             } else {
+                finalize_rebuild_schema(&conn, experimental_fast_rebuild, verbose)?;
                 println!("{}", format!("Indexed {} modules", module_count).green());
             }
         }
@@ -387,6 +487,7 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
             println!("{}", "Indexing module dependencies...".cyan());
             let gradle_files = indexer::collect_build_files_from_db(&conn, root)?;
             let dep_count = indexer::index_module_dependencies(&mut conn, root, &gradle_files, true)?;
+            finalize_rebuild_schema(&conn, experimental_fast_rebuild, verbose)?;
             println!("{}", format!("Indexed {} dependencies", dep_count).green());
         }
         _ => {
@@ -397,6 +498,7 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
     if verbose {
         eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
     }
+    restore_rebuild_pragmas(&conn, experimental_fast_rebuild, verbose)?;
     Ok(())
 }
 
@@ -409,6 +511,7 @@ fn cmd_rebuild_sub_projects(
     _index_deps: bool,
     no_ignore: bool,
     verbose: bool,
+    experimental_fast_rebuild: bool,
     extra_exclude: Option<&[String]>,
     config_include: Option<&[String]>,
     exclude_matcher: Option<&ignore::gitignore::Gitignore>,
@@ -448,7 +551,7 @@ fn cmd_rebuild_sub_projects(
         return Err(e);
     }
     let mut conn = db::open_db(root)?;
-    db::init_db(&conn)?;
+    init_rebuild_schema(&conn, experimental_fast_rebuild)?;
     if verbose { eprintln!("[verbose] DB created in {:?}", t.elapsed()); }
 
     if no_ignore {
@@ -545,6 +648,8 @@ fn cmd_rebuild_sub_projects(
         }
     }
 
+    finalize_rebuild_schema(&conn, experimental_fast_rebuild, verbose)?;
+
     println!();
     println!(
         "{}",
@@ -556,6 +661,7 @@ fn cmd_rebuild_sub_projects(
     if verbose {
         eprintln!("{}", format!("Total time: {:?}", start.elapsed()).dimmed());
     }
+    restore_rebuild_pragmas(&conn, experimental_fast_rebuild, verbose)?;
     Ok(())
 }
 

@@ -4,7 +4,8 @@ use regex::Regex;
 use rusqlite::Connection;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::LazyLock;
 use std::time::SystemTime;
 
@@ -18,9 +19,38 @@ use crate::parsers::{self, ParsedRef, ParsedSymbol};
 /// overflow the Rust default (≈ 2 MB on most platforms). 32 MB gives plenty
 /// of headroom without committing the pages eagerly.
 const RAYON_WORKER_STACK_SIZE: usize = 32 * 1024 * 1024;
+const DEFAULT_PARALLELISM_CAP: usize = 8;
+
+fn is_experimental_fast_rebuild_enabled() -> bool {
+    std::env::var("AST_INDEX_EXPERIMENTAL_FAST_REBUILD").is_ok()
+}
+
+fn effective_num_threads() -> usize {
+    std::env::var("AST_INDEX_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get().min(DEFAULT_PARALLELISM_CAP))
+                .unwrap_or(4)
+        })
+}
+
+fn effective_chunk_size(total_files: usize) -> usize {
+    if !is_experimental_fast_rebuild_enabled() {
+        return 500;
+    }
+    if total_files >= 20_000 {
+        1_000
+    } else {
+        500
+    }
+}
 
 /// Sorted module lookup for efficient longest-prefix matching.
 /// Entries sorted by path length descending so the longest (most specific) match is found first.
+#[derive(Clone)]
 struct ModuleLookup {
     sorted: Vec<(String, i64)>, // (path, module_id) sorted by path length desc
 }
@@ -823,6 +853,130 @@ impl WalkErrorSummary {
             eprintln!("Run with --verbose to show more walk errors.");
         }
     }
+
+    fn merge_from(&mut self, other: Self) {
+        self.count += other.count;
+        let remaining = Self::MAX_SAMPLES.saturating_sub(self.samples.len());
+        self.samples.extend(other.samples.into_iter().take(remaining));
+    }
+}
+
+#[derive(Default)]
+struct CollectedWalkData {
+    files: Vec<PathBuf>,
+    module_files: Vec<PathBuf>,
+    storyboard_files: Vec<PathBuf>,
+    xcassets_dirs: Vec<PathBuf>,
+    xml_layout_files: Vec<PathBuf>,
+    res_files: Vec<PathBuf>,
+    walk_errors: WalkErrorSummary,
+}
+
+fn collect_walk_entry(data: &mut CollectedWalkData, entry: &ignore::DirEntry) {
+    let path = entry.path();
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        if is_module_file(name) {
+            data.module_files.push(path.to_path_buf());
+        }
+    }
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        if parsers::is_supported_extension(ext) {
+            data.files.push(path.to_path_buf());
+        }
+        if ext == "storyboard" || ext == "xib" {
+            data.storyboard_files.push(path.to_path_buf());
+        }
+        if ext == "xcassets" && path.is_dir() {
+            data.xcassets_dirs.push(path.to_path_buf());
+        }
+        let path_str = path.to_string_lossy();
+        if path_str.contains("/res/") {
+            data.res_files.push(path.to_path_buf());
+            if ext == "xml"
+                && (path_str.contains("/layout")
+                    || path_str.contains("/menu")
+                    || path_str.contains("/navigation"))
+            {
+                data.xml_layout_files.push(path.to_path_buf());
+            }
+        }
+    }
+}
+
+struct ParallelWalkCollectorBuilder {
+    shared: Arc<Mutex<CollectedWalkData>>,
+    entries_seen: Arc<AtomicUsize>,
+    verbose: bool,
+    walk_start: std::time::Instant,
+}
+
+struct ParallelWalkCollector {
+    shared: Arc<Mutex<CollectedWalkData>>,
+    entries_seen: Arc<AtomicUsize>,
+    verbose: bool,
+    walk_start: std::time::Instant,
+    local: CollectedWalkData,
+}
+
+impl<'s> ignore::ParallelVisitorBuilder<'s> for ParallelWalkCollectorBuilder {
+    fn build(&mut self) -> Box<dyn ignore::ParallelVisitor + 's> {
+        Box::new(ParallelWalkCollector {
+            shared: self.shared.clone(),
+            entries_seen: self.entries_seen.clone(),
+            verbose: self.verbose,
+            walk_start: self.walk_start,
+            local: CollectedWalkData::default(),
+        })
+    }
+}
+
+impl ignore::ParallelVisitor for ParallelWalkCollector {
+    fn visit(&mut self, entry: Result<ignore::DirEntry, ignore::Error>) -> ignore::WalkState {
+        match entry {
+            Ok(entry) => {
+                let seen = self.entries_seen.fetch_add(1, Ordering::Relaxed) + 1;
+                if self.verbose && seen % 10000 == 0 {
+                    eprintln!(
+                        "[verbose] walk: {} entries scanned in {:?}...",
+                        seen,
+                        self.walk_start.elapsed()
+                    );
+                }
+                collect_walk_entry(&mut self.local, &entry);
+            }
+            Err(err) => self.local.walk_errors.record(err),
+        }
+        ignore::WalkState::Continue
+    }
+}
+
+impl Drop for ParallelWalkCollector {
+    fn drop(&mut self) {
+        if self.local.files.is_empty()
+            && self.local.module_files.is_empty()
+            && self.local.storyboard_files.is_empty()
+            && self.local.xcassets_dirs.is_empty()
+            && self.local.xml_layout_files.is_empty()
+            && self.local.res_files.is_empty()
+            && self.local.walk_errors.count == 0
+        {
+            return;
+        }
+
+        let mut shared = self.shared.lock().unwrap();
+        shared.files.append(&mut self.local.files);
+        shared.module_files.append(&mut self.local.module_files);
+        shared
+            .storyboard_files
+            .append(&mut self.local.storyboard_files);
+        shared.xcassets_dirs.append(&mut self.local.xcassets_dirs);
+        shared
+            .xml_layout_files
+            .append(&mut self.local.xml_layout_files);
+        shared.res_files.append(&mut self.local.res_files);
+        let local_errors = std::mem::take(&mut self.local.walk_errors);
+        shared.walk_errors.merge_from(local_errors);
+    }
 }
 
 pub fn index_directory(
@@ -877,14 +1031,11 @@ pub fn index_directory_scoped(
     extra_exclude: Option<&[String]>,
 ) -> Result<WalkResult> {
     use ignore::WalkBuilder;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
 
     let verbose = std::env::var("AST_INDEX_VERBOSE").is_ok();
-
-    // Small chunks: parse CHUNK_SIZE files in parallel → write to DB → free memory → next chunk
-    // Peak memory: ~CHUNK_SIZE × (file content + ParsedFile), then freed each iteration
-    const CHUNK_SIZE: usize = 500;
+    let experimental_parallel_walk =
+        std::env::var("AST_INDEX_EXPERIMENTAL_PARALLEL_WALK").is_ok();
 
     // Detect project type (or use override)
     let project_type = project_type_override.unwrap_or_else(|| detect_project_type(walk_dir));
@@ -978,72 +1129,60 @@ pub fn index_directory_scoped(
         }
     }
 
+    // Thread count: --threads flag > AST_INDEX_THREADS env > CPU cores (max 8 for local, higher for network FS)
+    let num_threads = effective_num_threads();
+
     if verbose {
         eprintln!("[verbose] starting file walk...");
     }
     let walk_start = Instant::now();
-    let walker = builder.build();
+    let mut collected = CollectedWalkData::default();
 
-    let mut files: Vec<PathBuf> = Vec::new();
-    let mut module_files: Vec<PathBuf> = Vec::new();
-    let mut storyboard_files: Vec<PathBuf> = Vec::new();
-    let mut xcassets_dirs: Vec<PathBuf> = Vec::new();
-    let mut xml_layout_files: Vec<PathBuf> = Vec::new();
-    let mut res_files: Vec<PathBuf> = Vec::new();
-    let mut walk_errors = WalkErrorSummary::default();
-
-    let mut walk_entries = 0usize;
-    for entry in walker {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(err) => {
-                walk_errors.record(err);
-                continue;
-            }
+    let walk_entries = if experimental_parallel_walk {
+        builder.threads(num_threads);
+        let shared = Arc::new(Mutex::new(CollectedWalkData::default()));
+        let entries_seen = Arc::new(AtomicUsize::new(0));
+        let mut collector = ParallelWalkCollectorBuilder {
+            shared: shared.clone(),
+            entries_seen: entries_seen.clone(),
+            verbose,
+            walk_start,
         };
-        walk_entries += 1;
-        if verbose && walk_entries % 10000 == 0 {
-            eprintln!(
-                "[verbose] walk: {} entries scanned in {:?}...",
-                walk_entries,
-                walk_start.elapsed()
-            );
-        }
-        let path = entry.path();
-        // Collect module-related files for index_modules
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if is_module_file(name) {
-                module_files.push(path.to_path_buf());
-            }
-        }
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            // Collect parseable source files
-            if parsers::is_supported_extension(ext) {
-                files.push(path.to_path_buf());
-            }
-            // Collect storyboard/xib files (iOS)
-            if ext == "storyboard" || ext == "xib" {
-                storyboard_files.push(path.to_path_buf());
-            }
-            // Collect .xcassets directories (iOS)
-            if ext == "xcassets" && path.is_dir() {
-                xcassets_dirs.push(path.to_path_buf());
-            }
-            // Collect Android resource files
-            let path_str = path.to_string_lossy();
-            if path_str.contains("/res/") {
-                res_files.push(path.to_path_buf());
-                // XML layout/menu/navigation files
-                if ext == "xml"
-                    && (path_str.contains("/layout")
-                        || path_str.contains("/menu")
-                        || path_str.contains("/navigation"))
-                {
-                    xml_layout_files.push(path.to_path_buf());
+        builder.build_parallel().visit(&mut collector);
+        let mut shared = shared.lock().unwrap();
+        collected = std::mem::take(&mut *shared);
+        entries_seen.load(Ordering::Relaxed)
+    } else {
+        let walker = builder.build();
+        let mut walk_entries = 0usize;
+        for entry in walker {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    collected.walk_errors.record(err);
+                    continue;
                 }
+            };
+            walk_entries += 1;
+            if verbose && walk_entries % 10000 == 0 {
+                eprintln!(
+                    "[verbose] walk: {} entries scanned in {:?}...",
+                    walk_entries,
+                    walk_start.elapsed()
+                );
             }
+            collect_walk_entry(&mut collected, &entry);
         }
-    }
+        walk_entries
+    };
+
+    let files = collected.files;
+    let module_files = collected.module_files;
+    let storyboard_files = collected.storyboard_files;
+    let xcassets_dirs = collected.xcassets_dirs;
+    let xml_layout_files = collected.xml_layout_files;
+    let res_files = collected.res_files;
+    let walk_errors = collected.walk_errors;
 
     if verbose {
         eprintln!(
@@ -1079,23 +1218,13 @@ pub fn index_directory_scoped(
     }
 
     let total_files = files.len();
+    let chunk_size = effective_chunk_size(total_files);
     if progress {
         eprintln!("Found {} files to parse...", total_files);
     }
 
     let mut total_count = 0;
     let parsed_global = Arc::new(AtomicUsize::new(0));
-
-    // Thread count: --threads flag > AST_INDEX_THREADS env > CPU cores (max 8 for local, higher for network FS)
-    let num_threads = std::env::var("AST_INDEX_THREADS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get().min(8))
-                .unwrap_or(4)
-        });
     if verbose {
         eprintln!("[verbose] using {} threads for parsing", num_threads);
     }
@@ -1106,8 +1235,8 @@ pub fn index_directory_scoped(
         .map_err(|e| anyhow::anyhow!("Failed to build thread pool: {}", e))?;
 
     let root_buf = root.to_path_buf();
-    let total_chunks = (files.len() + CHUNK_SIZE - 1) / CHUNK_SIZE;
-    for (chunk_idx, chunk) in files.chunks(CHUNK_SIZE).enumerate() {
+    let total_chunks = (files.len() + chunk_size - 1) / chunk_size;
+    for (chunk_idx, chunk) in files.chunks(chunk_size).enumerate() {
         let root_clone = root_buf.clone();
         let counter = parsed_global.clone();
         let total = total_files;
@@ -1122,7 +1251,7 @@ pub fn index_directory_scoped(
         }
         let chunk_start = Instant::now();
 
-        // Parse chunk in parallel — at most CHUNK_SIZE ParsedFiles in memory
+        // Parse chunk in parallel — at most `chunk_size` ParsedFiles in memory
         let parsed_files: Vec<ParsedFile> = pool.install(|| {
             chunk
                 .par_iter()
@@ -1434,7 +1563,13 @@ pub fn update_directory_incremental(
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|&n| n > 0)
-            .unwrap_or(32);
+            .unwrap_or_else(|| {
+                if is_experimental_fast_rebuild_enabled() {
+                    effective_num_threads().max(16)
+                } else {
+                    32
+                }
+            });
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(num_threads)
             .stack_size(RAYON_WORKER_STACK_SIZE)
@@ -1925,6 +2060,8 @@ pub fn index_module_dependencies(
     gradle_files: &[PathBuf],
     progress: bool,
 ) -> Result<usize> {
+    let experimental_fast_rebuild =
+        std::env::var("AST_INDEX_EXPERIMENTAL_FAST_REBUILD").is_ok();
     // Regex patterns for dependency declarations
     // Gradle projects DSL style: modules { api(projects.features.payments.api) }
     static PROJECTS_DEP_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -2014,210 +2151,380 @@ pub fn index_module_dependencies(
         });
         let maven_dep_re = &*MAVEN_DEP_RE;
 
-        for path in gradle_files {
-            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            let parent = match path.parent() {
-                Some(p) => p,
-                None => continue,
-            };
+        let edges: Vec<(i64, i64, String)> = if experimental_fast_rebuild {
+            let num_threads = effective_num_threads();
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(num_threads)
+                .stack_size(RAYON_WORKER_STACK_SIZE)
+                .build()
+                .map_err(|e| anyhow::anyhow!("Failed to build thread pool: {}", e))?;
+            let root_buf = root.to_path_buf();
+            let mono_root = mono_root.clone();
+            let module_ids = Arc::new(module_ids.clone());
 
-            // Compute the source module name per build-system flavor (the key used in `modules.name`)
-            let source_module_name: String = match file_name {
-                "ya.make" => {
-                    let rel = if let Some(ref mono) = mono_root {
-                        parent.strip_prefix(mono).ok()
-                    } else {
-                        None
-                    }
-                    .or_else(|| parent.strip_prefix(root).ok())
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| parent.to_path_buf());
-                    rel.to_string_lossy().replace('\\', "/")
-                }
-                "pyproject.toml" | "setup.py" | "setup.cfg" => {
-                    let module_path = parent
-                        .strip_prefix(root)
-                        .unwrap_or(parent)
-                        .to_string_lossy()
-                        .to_string();
-                    if module_path.is_empty() {
-                        // Root project — try pyproject.toml name, fall back to root dir name
-                        if file_name == "pyproject.toml" {
-                            fs::read_to_string(path)
-                                .ok()
-                                .as_deref()
-                                .and_then(extract_python_module_name)
-                                .unwrap_or_else(|| {
-                                    root.file_name()
-                                        .and_then(|n| n.to_str())
-                                        .unwrap_or("root")
-                                        .to_string()
-                                })
+            pool.install(|| {
+                gradle_files
+                    .par_iter()
+                    .flat_map_iter(|path| {
+                        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                        let parent = match path.parent() {
+                            Some(p) => p,
+                            None => return Vec::new(),
+                        };
+
+                        let source_module_name: String = match file_name {
+                            "ya.make" => {
+                                let rel = if let Some(ref mono) = mono_root {
+                                    parent.strip_prefix(mono).ok()
+                                } else {
+                                    None
+                                }
+                                .or_else(|| parent.strip_prefix(&root_buf).ok())
+                                .map(|p| p.to_path_buf())
+                                .unwrap_or_else(|| parent.to_path_buf());
+                                rel.to_string_lossy().replace('\\', "/")
+                            }
+                            "pyproject.toml" | "setup.py" | "setup.cfg" => {
+                                let module_path = parent
+                                    .strip_prefix(&root_buf)
+                                    .unwrap_or(parent)
+                                    .to_string_lossy()
+                                    .to_string();
+                                if module_path.is_empty() {
+                                    if file_name == "pyproject.toml" {
+                                        fs::read_to_string(path)
+                                            .ok()
+                                            .as_deref()
+                                            .and_then(extract_python_module_name)
+                                            .unwrap_or_else(|| {
+                                                root_buf
+                                                    .file_name()
+                                                    .and_then(|n| n.to_str())
+                                                    .unwrap_or("root")
+                                                    .to_string()
+                                            })
+                                    } else {
+                                        root_buf
+                                            .file_name()
+                                            .and_then(|n| n.to_str())
+                                            .unwrap_or("root")
+                                            .to_string()
+                                    }
+                                } else {
+                                    module_path.replace('/', ".")
+                                }
+                            }
+                            _ => parent
+                                .strip_prefix(&root_buf)
+                                .unwrap_or(parent)
+                                .to_string_lossy()
+                                .replace('/', "."),
+                        };
+
+                        let module_id = match module_ids.get(&source_module_name) {
+                            Some(&id) => id,
+                            None => return Vec::new(),
+                        };
+
+                        let content = match fs::read_to_string(path) {
+                            Ok(c) => c,
+                            Err(_) => return Vec::new(),
+                        };
+
+                        let mut edges = Vec::new();
+                        match file_name {
+                            "pom.xml" => {
+                                for caps in maven_dep_re.captures_iter(&content) {
+                                    let artifact_id = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                                    for (mod_name, &mod_id) in module_ids.iter() {
+                                        let last_segment = mod_name.rsplit('.').next().unwrap_or(mod_name);
+                                        if last_segment == artifact_id {
+                                            edges.push((module_id, mod_id, "compile".to_string()));
+                                        }
+                                    }
+                                }
+                            }
+                            "ya.make" => {
+                                for caps in peerdir_re.captures_iter(&content) {
+                                    let raw = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                                    for token in raw.split_ascii_whitespace() {
+                                        let dep_name = token.trim_end_matches(',').trim();
+                                        if dep_name.is_empty() || dep_name.starts_with('#') {
+                                            continue;
+                                        }
+                                        let dep_name = dep_name.replace('\\', "/");
+                                        if let Some(&dep_id) = module_ids.get(&dep_name) {
+                                            edges.push((module_id, dep_id, "peerdir".to_string()));
+                                        }
+                                    }
+                                }
+                            }
+                            "pyproject.toml" => {
+                                for caps in py_project_deps_re.captures_iter(&content) {
+                                    let body = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                                    for raw in extract_py_list_strings(body) {
+                                        let dep_name = strip_py_version(&raw);
+                                        if let Some(&dep_id) = module_ids.get(&dep_name) {
+                                            edges.push((module_id, dep_id, "compile".to_string()));
+                                        }
+                                    }
+                                }
+                                if let Some(caps) = py_poetry_section_re.captures(&content) {
+                                    let section = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                                    for line in section.lines() {
+                                        let line = line.trim();
+                                        if line.is_empty() || line.starts_with('#') || line.starts_with('[') {
+                                            continue;
+                                        }
+                                        if let Some(eq_pos) = line.find('=') {
+                                            let dep_name = line[..eq_pos].trim().trim_matches('"').trim_matches('\'');
+                                            if dep_name == "python" || dep_name.is_empty() {
+                                                continue;
+                                            }
+                                            if let Some(&dep_id) = module_ids.get(dep_name) {
+                                                edges.push((module_id, dep_id, "compile".to_string()));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            "setup.py" | "setup.cfg" => {
+                                for caps in py_setup_deps_re.captures_iter(&content) {
+                                    let body = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                                    for raw in extract_py_list_strings(body) {
+                                        let dep_name = strip_py_version(&raw);
+                                        if let Some(&dep_id) = module_ids.get(&dep_name) {
+                                            edges.push((module_id, dep_id, "compile".to_string()));
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {
+                                let mut inserted: std::collections::HashSet<(i64, i64)> =
+                                    std::collections::HashSet::new();
+                                for caps in projects_dep_re.captures_iter(&content) {
+                                    let dep_kind =
+                                        caps.get(1).map(|m| m.as_str()).unwrap_or("implementation");
+                                    let dep_name = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+                                    if let Some(&dep_id) = module_ids.get(dep_name) {
+                                        if inserted.insert((module_id, dep_id)) {
+                                            edges.push((module_id, dep_id, dep_kind.to_string()));
+                                        }
+                                    }
+                                }
+                                for caps in gradle_project_re.captures_iter(&content) {
+                                    let dep_kind =
+                                        caps.get(1).map(|m| m.as_str()).unwrap_or("implementation");
+                                    let dep_path = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+                                    let dep_name = dep_path.trim_start_matches(':').replace(':', ".");
+                                    if let Some(&dep_id) = module_ids.get(&dep_name) {
+                                        if inserted.insert((module_id, dep_id)) {
+                                            edges.push((module_id, dep_id, dep_kind.to_string()));
+                                        }
+                                    }
+                                }
+                                for (b_start, b_end) in find_forma_deps_blocks(&content) {
+                                    let block = strip_kt_line_comments(&content[b_start..b_end]);
+                                    for caps in project_only_re.captures_iter(&block) {
+                                        let dep_path = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                                        let dep_name = dep_path.trim_start_matches(':').replace(':', ".");
+                                        if let Some(&dep_id) = module_ids.get(&dep_name) {
+                                            if inserted.insert((module_id, dep_id)) {
+                                                edges.push((
+                                                    module_id,
+                                                    dep_id,
+                                                    "implementation".to_string(),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        edges
+                    })
+                    .collect()
+            })
+        } else {
+            let mut edges = Vec::new();
+            for path in gradle_files {
+                let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                let parent = match path.parent() {
+                    Some(p) => p,
+                    None => continue,
+                };
+
+                let source_module_name: String = match file_name {
+                    "ya.make" => {
+                        let rel = if let Some(ref mono) = mono_root {
+                            parent.strip_prefix(mono).ok()
                         } else {
-                            root.file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("root")
-                                .to_string()
+                            None
                         }
-                    } else {
-                        module_path.replace('/', ".")
+                        .or_else(|| parent.strip_prefix(root).ok())
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| parent.to_path_buf());
+                        rel.to_string_lossy().replace('\\', "/")
                     }
-                }
-                _ => {
-                    // Gradle / Maven: dot-separated path relative to rebuild root
-                    parent
+                    "pyproject.toml" | "setup.py" | "setup.cfg" => {
+                        let module_path = parent
+                            .strip_prefix(root)
+                            .unwrap_or(parent)
+                            .to_string_lossy()
+                            .to_string();
+                        if module_path.is_empty() {
+                            if file_name == "pyproject.toml" {
+                                fs::read_to_string(path)
+                                    .ok()
+                                    .as_deref()
+                                    .and_then(extract_python_module_name)
+                                    .unwrap_or_else(|| {
+                                        root.file_name()
+                                            .and_then(|n| n.to_str())
+                                            .unwrap_or("root")
+                                            .to_string()
+                                    })
+                            } else {
+                                root.file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or("root")
+                                    .to_string()
+                            }
+                        } else {
+                            module_path.replace('/', ".")
+                        }
+                    }
+                    _ => parent
                         .strip_prefix(root)
                         .unwrap_or(parent)
                         .to_string_lossy()
-                        .replace('/', ".")
-                }
-            };
+                        .replace('/', "."),
+                };
 
-            let module_id = match module_ids.get(&source_module_name) {
-                Some(&id) => id,
-                None => continue,
-            };
+                let module_id = match module_ids.get(&source_module_name) {
+                    Some(&id) => id,
+                    None => continue,
+                };
 
-            let content = match fs::read_to_string(path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
+                let content = match fs::read_to_string(path) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
 
-            match file_name {
-                "pom.xml" => {
-                    for caps in maven_dep_re.captures_iter(&content) {
-                        let artifact_id = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                        for (mod_name, &mod_id) in &module_ids {
-                            let last_segment = mod_name.rsplit('.').next().unwrap_or(mod_name);
-                            if last_segment == artifact_id {
-                                dep_stmt
-                                    .execute(rusqlite::params![module_id, mod_id, "compile"])?;
-                                dep_count += 1;
+                match file_name {
+                    "pom.xml" => {
+                        for caps in maven_dep_re.captures_iter(&content) {
+                            let artifact_id = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                            for (mod_name, &mod_id) in &module_ids {
+                                let last_segment = mod_name.rsplit('.').next().unwrap_or(mod_name);
+                                if last_segment == artifact_id {
+                                    edges.push((module_id, mod_id, "compile".to_string()));
+                                }
                             }
                         }
                     }
-                }
-                "ya.make" => {
-                    for caps in peerdir_re.captures_iter(&content) {
-                        let raw = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                        for token in raw.split_ascii_whitespace() {
-                            // Trim trailing comments and separators
-                            let dep_name = token.trim_end_matches(',').trim();
-                            if dep_name.is_empty() || dep_name.starts_with('#') {
-                                continue;
-                            }
-                            let dep_name = dep_name.replace('\\', "/");
-                            if let Some(&dep_id) = module_ids.get(&dep_name) {
-                                dep_stmt
-                                    .execute(rusqlite::params![module_id, dep_id, "peerdir"])?;
-                                dep_count += 1;
-                            }
-                        }
-                    }
-                }
-                "pyproject.toml" => {
-                    // [project] dependencies = [...]
-                    for caps in py_project_deps_re.captures_iter(&content) {
-                        let body = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                        for raw in extract_py_list_strings(body) {
-                            let dep_name = strip_py_version(&raw);
-                            if let Some(&dep_id) = module_ids.get(&dep_name) {
-                                dep_stmt
-                                    .execute(rusqlite::params![module_id, dep_id, "compile"])?;
-                                dep_count += 1;
-                            }
-                        }
-                    }
-                    // [tool.poetry.dependencies] section — "name = ..." lines
-                    if let Some(caps) = py_poetry_section_re.captures(&content) {
-                        let section = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                        for line in section.lines() {
-                            let line = line.trim();
-                            if line.is_empty() || line.starts_with('#') || line.starts_with('[') {
-                                continue;
-                            }
-                            if let Some(eq_pos) = line.find('=') {
-                                let dep_name =
-                                    line[..eq_pos].trim().trim_matches('"').trim_matches('\'');
-                                if dep_name == "python" || dep_name.is_empty() {
+                    "ya.make" => {
+                        for caps in peerdir_re.captures_iter(&content) {
+                            let raw = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                            for token in raw.split_ascii_whitespace() {
+                                let dep_name = token.trim_end_matches(',').trim();
+                                if dep_name.is_empty() || dep_name.starts_with('#') {
                                     continue;
                                 }
-                                if let Some(&dep_id) = module_ids.get(dep_name) {
-                                    dep_stmt
-                                        .execute(rusqlite::params![module_id, dep_id, "compile"])?;
-                                    dep_count += 1;
+                                let dep_name = dep_name.replace('\\', "/");
+                                if let Some(&dep_id) = module_ids.get(&dep_name) {
+                                    edges.push((module_id, dep_id, "peerdir".to_string()));
                                 }
                             }
                         }
                     }
-                }
-                "setup.py" | "setup.cfg" => {
-                    for caps in py_setup_deps_re.captures_iter(&content) {
-                        let body = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                        for raw in extract_py_list_strings(body) {
-                            let dep_name = strip_py_version(&raw);
-                            if let Some(&dep_id) = module_ids.get(&dep_name) {
-                                dep_stmt
-                                    .execute(rusqlite::params![module_id, dep_id, "compile"])?;
-                                dep_count += 1;
+                    "pyproject.toml" => {
+                        for caps in py_project_deps_re.captures_iter(&content) {
+                            let body = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                            for raw in extract_py_list_strings(body) {
+                                let dep_name = strip_py_version(&raw);
+                                if let Some(&dep_id) = module_ids.get(&dep_name) {
+                                    edges.push((module_id, dep_id, "compile".to_string()));
+                                }
+                            }
+                        }
+                        if let Some(caps) = py_poetry_section_re.captures(&content) {
+                            let section = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                            for line in section.lines() {
+                                let line = line.trim();
+                                if line.is_empty() || line.starts_with('#') || line.starts_with('[') {
+                                    continue;
+                                }
+                                if let Some(eq_pos) = line.find('=') {
+                                    let dep_name = line[..eq_pos].trim().trim_matches('"').trim_matches('\'');
+                                    if dep_name == "python" || dep_name.is_empty() {
+                                        continue;
+                                    }
+                                    if let Some(&dep_id) = module_ids.get(dep_name) {
+                                        edges.push((module_id, dep_id, "compile".to_string()));
+                                    }
+                                }
                             }
                         }
                     }
-                }
-                _ => {
-                    // Gradle
-                    // Track inserted deps to avoid duplicates from overlapping regex patterns
-                    let mut inserted: std::collections::HashSet<(i64, i64)> =
-                        std::collections::HashSet::new();
-                    for caps in projects_dep_re.captures_iter(&content) {
-                        let dep_kind = caps.get(1).map(|m| m.as_str()).unwrap_or("implementation");
-                        let dep_name = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-                        if let Some(&dep_id) = module_ids.get(dep_name) {
-                            if inserted.insert((module_id, dep_id)) {
-                                dep_stmt.execute(rusqlite::params![module_id, dep_id, dep_kind])?;
-                                dep_count += 1;
+                    "setup.py" | "setup.cfg" => {
+                        for caps in py_setup_deps_re.captures_iter(&content) {
+                            let body = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                            for raw in extract_py_list_strings(body) {
+                                let dep_name = strip_py_version(&raw);
+                                if let Some(&dep_id) = module_ids.get(&dep_name) {
+                                    edges.push((module_id, dep_id, "compile".to_string()));
+                                }
                             }
                         }
                     }
-                    for caps in gradle_project_re.captures_iter(&content) {
-                        let dep_kind = caps.get(1).map(|m| m.as_str()).unwrap_or("implementation");
-                        let dep_path = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-                        let dep_name = dep_path.trim_start_matches(':').replace(':', ".");
-                        if let Some(&dep_id) = module_ids.get(&dep_name) {
-                            if inserted.insert((module_id, dep_id)) {
-                                dep_stmt.execute(rusqlite::params![module_id, dep_id, dep_kind])?;
-                                dep_count += 1;
+                    _ => {
+                        let mut inserted: std::collections::HashSet<(i64, i64)> =
+                            std::collections::HashSet::new();
+                        for caps in projects_dep_re.captures_iter(&content) {
+                            let dep_kind = caps.get(1).map(|m| m.as_str()).unwrap_or("implementation");
+                            let dep_name = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+                            if let Some(&dep_id) = module_ids.get(dep_name) {
+                                if inserted.insert((module_id, dep_id)) {
+                                    edges.push((module_id, dep_id, dep_kind.to_string()));
+                                }
                             }
                         }
-                    }
-                    // Fallback: catch project(":path") not matched by main regex
-                    // (e.g., when other deps are between deps( and project()).
-                    // Scoped to Forma-style `dependencies = wrapper(...) [+ wrapper(...)]*`
-                    // blocks so unrelated `project("...")` text (comments, string literals,
-                    // dead code) cannot inflate the dependency graph.
-                    for (b_start, b_end) in find_forma_deps_blocks(&content) {
-                        let block = strip_kt_line_comments(&content[b_start..b_end]);
-                        for caps in project_only_re.captures_iter(&block) {
-                            let dep_path = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                        for caps in gradle_project_re.captures_iter(&content) {
+                            let dep_kind = caps.get(1).map(|m| m.as_str()).unwrap_or("implementation");
+                            let dep_path = caps.get(2).map(|m| m.as_str()).unwrap_or("");
                             let dep_name = dep_path.trim_start_matches(':').replace(':', ".");
                             if let Some(&dep_id) = module_ids.get(&dep_name) {
                                 if inserted.insert((module_id, dep_id)) {
-                                    // Forma's `dependencies = deps(project(...), ...)` carries
-                                    // no per-dep configuration; default to "implementation".
-                                    // The wrapper-anchored regex runs first and preserves real
-                                    // kinds (api/compileOnly/...) when the source uses them.
-                                    dep_stmt.execute(rusqlite::params![
-                                        module_id,
-                                        dep_id,
-                                        "implementation"
-                                    ])?;
-                                    dep_count += 1;
+                                    edges.push((module_id, dep_id, dep_kind.to_string()));
+                                }
+                            }
+                        }
+                        for (b_start, b_end) in find_forma_deps_blocks(&content) {
+                            let block = strip_kt_line_comments(&content[b_start..b_end]);
+                            for caps in project_only_re.captures_iter(&block) {
+                                let dep_path = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                                let dep_name = dep_path.trim_start_matches(':').replace(':', ".");
+                                if let Some(&dep_id) = module_ids.get(&dep_name) {
+                                    if inserted.insert((module_id, dep_id)) {
+                                        edges.push((
+                                            module_id,
+                                            dep_id,
+                                            "implementation".to_string(),
+                                        ));
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
+            edges
+        };
+
+        for (module_id, dep_id, dep_kind) in edges {
+            dep_stmt.execute(rusqlite::params![module_id, dep_id, dep_kind])?;
+            dep_count += 1;
         }
     }
 
@@ -2295,6 +2602,8 @@ pub fn index_xml_usages(
     xml_layout_files: &[PathBuf],
     progress: bool,
 ) -> Result<usize> {
+    let experimental_fast_rebuild =
+        std::env::var("AST_INDEX_EXPERIMENTAL_FAST_REBUILD").is_ok();
     let module_lookup = ModuleLookup::from_db(conn)?;
 
     // Regex for class names in XML
@@ -2334,60 +2643,146 @@ pub fn index_xml_usages(
             "INSERT INTO xml_usages (module_id, file_path, line, class_name, usage_type, element_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
         )?;
 
-        for xml_path in xml_layout_files {
-            let rel_path = xml_path
-                .strip_prefix(root)
-                .unwrap_or(xml_path)
-                .to_string_lossy()
-                .to_string();
+        let usage_rows: Vec<(Option<i64>, String, i64, String, &'static str, Option<String>)> =
+            if experimental_fast_rebuild {
+                let num_threads = effective_num_threads();
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(num_threads)
+                    .stack_size(RAYON_WORKER_STACK_SIZE)
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("Failed to build thread pool: {}", e))?;
+                let root_buf = root.to_path_buf();
+                let module_lookup = module_lookup.clone();
 
-            // Find module for this file
-            let module_id = module_lookup.find(&rel_path);
-
-            if let Ok(content) = fs::read_to_string(xml_path) {
-                for (line_num, line) in content.lines().enumerate() {
-                    let line_num = line_num + 1;
-
-                    // Extract element_id if present on this line
-                    let element_id = id_re
-                        .captures(line)
-                        .map(|c| c.get(1).unwrap().as_str().to_string());
-
-                    // Full class name tags
-                    for caps in full_class_re.captures_iter(line) {
-                        let class_name = caps.get(1).unwrap().as_str();
-                        stmt.execute(rusqlite::params![
-                            module_id,
-                            rel_path,
-                            line_num as i64,
-                            class_name,
-                            "view_tag",
-                            element_id
-                        ])?;
-                        count += 1;
-                    }
-
-                    // class="..." or android:name="..." attributes
-                    for caps in class_attr_re.captures_iter(line) {
-                        let class_name = caps.get(1).unwrap().as_str();
-                        let usage_type =
-                            if line.contains("<fragment") || line.contains("android:name") {
-                                "fragment"
-                            } else {
-                                "view_class_attr"
+                pool.install(|| {
+                    xml_layout_files
+                        .par_iter()
+                        .flat_map_iter(|xml_path| {
+                            let rel_path = xml_path
+                                .strip_prefix(&root_buf)
+                                .unwrap_or(xml_path)
+                                .to_string_lossy()
+                                .to_string();
+                            let module_id = module_lookup.find(&rel_path);
+                            let content = match fs::read_to_string(xml_path) {
+                                Ok(content) => content,
+                                Err(_) => return Vec::new(),
                             };
-                        stmt.execute(rusqlite::params![
-                            module_id,
-                            rel_path,
-                            line_num as i64,
-                            class_name,
-                            usage_type,
-                            element_id
-                        ])?;
-                        count += 1;
+
+                            let mut rows = Vec::new();
+                            for (line_idx, line) in content.lines().enumerate() {
+                                if !line.contains('.') && !line.contains("class") && !line.contains("android:name") {
+                                    continue;
+                                }
+
+                                let line_num = line_idx as i64 + 1;
+                                let element_id = id_re
+                                    .captures(line)
+                                    .map(|c| c.get(1).unwrap().as_str().to_string());
+
+                                if line.contains('<') && line.contains('.') {
+                                    for caps in full_class_re.captures_iter(line) {
+                                        rows.push((
+                                            module_id,
+                                            rel_path.clone(),
+                                            line_num,
+                                            caps.get(1).unwrap().as_str().to_string(),
+                                            "view_tag",
+                                            element_id.clone(),
+                                        ));
+                                    }
+                                }
+
+                                if line.contains("class") || line.contains("android:name") {
+                                    let usage_type = if line.contains("<fragment")
+                                        || line.contains("android:name")
+                                    {
+                                        "fragment"
+                                    } else {
+                                        "view_class_attr"
+                                    };
+                                    for caps in class_attr_re.captures_iter(line) {
+                                        rows.push((
+                                            module_id,
+                                            rel_path.clone(),
+                                            line_num,
+                                            caps.get(1).unwrap().as_str().to_string(),
+                                            usage_type,
+                                            element_id.clone(),
+                                        ));
+                                    }
+                                }
+                            }
+                            rows
+                        })
+                        .collect()
+                })
+            } else {
+                let mut rows = Vec::new();
+                for xml_path in xml_layout_files {
+                    let rel_path = xml_path
+                        .strip_prefix(root)
+                        .unwrap_or(xml_path)
+                        .to_string_lossy()
+                        .to_string();
+                    let module_id = module_lookup.find(&rel_path);
+
+                    if let Ok(content) = fs::read_to_string(xml_path) {
+                        for (line_num, line) in content.lines().enumerate() {
+                            let line_num = line_num as i64 + 1;
+
+                            let element_id = id_re
+                                .captures(line)
+                                .map(|c| c.get(1).unwrap().as_str().to_string());
+
+                            if line.contains('<') && line.contains('.') {
+                                for caps in full_class_re.captures_iter(line) {
+                                    rows.push((
+                                        module_id,
+                                        rel_path.clone(),
+                                        line_num,
+                                        caps.get(1).unwrap().as_str().to_string(),
+                                        "view_tag",
+                                        element_id.clone(),
+                                    ));
+                                }
+                            }
+
+                            if line.contains("class") || line.contains("android:name") {
+                                let usage_type =
+                                    if line.contains("<fragment") || line.contains("android:name")
+                                    {
+                                        "fragment"
+                                    } else {
+                                        "view_class_attr"
+                                    };
+                                for caps in class_attr_re.captures_iter(line) {
+                                    rows.push((
+                                        module_id,
+                                        rel_path.clone(),
+                                        line_num,
+                                        caps.get(1).unwrap().as_str().to_string(),
+                                        usage_type,
+                                        element_id.clone(),
+                                    ));
+                                }
+                            }
+                        }
                     }
                 }
-            }
+                rows
+            };
+
+        for (module_id, rel_path, line_num, class_name, usage_type, element_id) in usage_rows {
+            stmt.execute(rusqlite::params![
+                module_id,
+                rel_path,
+                line_num,
+                class_name,
+                usage_type,
+                element_id
+            ])?;
+            count += 1;
         }
     }
 
@@ -2447,6 +2842,8 @@ pub fn index_resources(
     res_files: &[PathBuf],
     progress: bool,
 ) -> Result<(usize, usize)> {
+    let experimental_fast_rebuild =
+        std::env::var("AST_INDEX_EXPERIMENTAL_FAST_REBUILD").is_ok();
     let module_lookup = ModuleLookup::from_db(conn)?;
 
     if progress {
@@ -2621,51 +3018,138 @@ pub fn index_resources(
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
             rows.filter_map(|r| r.ok()).collect()
         };
+        if experimental_fast_rebuild {
+            if progress {
+                eprintln!("Experimental fast rebuild: scanning resource usages in parallel...");
+            }
 
-        for rel_path in &code_rel_paths {
-            let file_path = root.join(rel_path);
+            let num_threads = effective_num_threads();
 
-            if let Ok(content) = fs::read_to_string(file_path) {
-                let is_xml = rel_path.ends_with(".xml");
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(num_threads)
+                .stack_size(RAYON_WORKER_STACK_SIZE)
+                .build()
+                .map_err(|e| anyhow::anyhow!("Failed to build thread pool: {}", e))?;
 
-                for (line_num, line) in content.lines().enumerate() {
-                    let line_num = line_num + 1;
+            let root_buf = root.to_path_buf();
+            let resource_ids = Arc::new(resource_ids);
+            let usage_batches: Vec<Vec<(i64, String, i64, &'static str)>> = pool.install(|| {
+                code_rel_paths
+                    .par_iter()
+                    .map(|rel_path| {
+                        let file_path = root_buf.join(rel_path);
+                        let content = match fs::read_to_string(file_path) {
+                            Ok(content) => content,
+                            Err(_) => return Vec::new(),
+                        };
 
-                    // R.type.name references (Kotlin/Java)
-                    if !is_xml {
-                        for caps in r_ref_re.captures_iter(line) {
-                            let res_type = caps.get(1).unwrap().as_str();
-                            let res_name = caps.get(2).unwrap().as_str();
+                        let is_xml = rel_path.ends_with(".xml");
+                        let mut usages = Vec::new();
 
-                            if let Some(&resource_id) =
-                                resource_ids.get(res_type).and_then(|m| m.get(res_name))
-                            {
-                                usage_stmt.execute(rusqlite::params![
-                                    resource_id,
-                                    rel_path,
-                                    line_num as i64,
-                                    "code"
-                                ])?;
-                                usage_count += 1;
+                        for (line_idx, line) in content.lines().enumerate() {
+                            let line_num = line_idx as i64 + 1;
+
+                            if !is_xml && line.contains("R.") {
+                                for caps in r_ref_re.captures_iter(line) {
+                                    let res_type = caps.get(1).unwrap().as_str();
+                                    let res_name = caps.get(2).unwrap().as_str();
+
+                                    if let Some(&resource_id) =
+                                        resource_ids.get(res_type).and_then(|m| m.get(res_name))
+                                    {
+                                        usages.push((
+                                            resource_id,
+                                            rel_path.clone(),
+                                            line_num,
+                                            "code",
+                                        ));
+                                    }
+                                }
+                            }
+
+                            if line.contains('@') {
+                                for caps in xml_ref_re.captures_iter(line) {
+                                    let res_type = caps.get(1).unwrap().as_str();
+                                    let res_name = caps.get(2).unwrap().as_str();
+
+                                    if let Some(&resource_id) =
+                                        resource_ids.get(res_type).and_then(|m| m.get(res_name))
+                                    {
+                                        usages.push((
+                                            resource_id,
+                                            rel_path.clone(),
+                                            line_num,
+                                            "xml",
+                                        ));
+                                    }
+                                }
                             }
                         }
-                    }
 
-                    // @type/name references (XML)
-                    for caps in xml_ref_re.captures_iter(line) {
-                        let res_type = caps.get(1).unwrap().as_str();
-                        let res_name = caps.get(2).unwrap().as_str();
+                        usages
+                    })
+                    .collect()
+            });
 
-                        if let Some(&resource_id) =
-                            resource_ids.get(res_type).and_then(|m| m.get(res_name))
-                        {
-                            usage_stmt.execute(rusqlite::params![
-                                resource_id,
-                                rel_path,
-                                line_num as i64,
-                                "xml"
-                            ])?;
-                            usage_count += 1;
+            for batch in usage_batches {
+                for (resource_id, rel_path, line_num, usage_type) in batch {
+                    usage_stmt.execute(rusqlite::params![
+                        resource_id,
+                        rel_path,
+                        line_num,
+                        usage_type
+                    ])?;
+                    usage_count += 1;
+                }
+            }
+        } else {
+            for rel_path in &code_rel_paths {
+                let file_path = root.join(rel_path);
+
+                if let Ok(content) = fs::read_to_string(file_path) {
+                    let is_xml = rel_path.ends_with(".xml");
+
+                    for (line_num, line) in content.lines().enumerate() {
+                        let line_num = line_num + 1;
+
+                        // R.type.name references (Kotlin/Java)
+                        if !is_xml && line.contains("R.") {
+                            for caps in r_ref_re.captures_iter(line) {
+                                let res_type = caps.get(1).unwrap().as_str();
+                                let res_name = caps.get(2).unwrap().as_str();
+
+                                if let Some(&resource_id) =
+                                    resource_ids.get(res_type).and_then(|m| m.get(res_name))
+                                {
+                                    usage_stmt.execute(rusqlite::params![
+                                        resource_id,
+                                        rel_path,
+                                        line_num as i64,
+                                        "code"
+                                    ])?;
+                                    usage_count += 1;
+                                }
+                            }
+                        }
+
+                        // @type/name references (XML)
+                        if line.contains('@') {
+                            for caps in xml_ref_re.captures_iter(line) {
+                                let res_type = caps.get(1).unwrap().as_str();
+                                let res_name = caps.get(2).unwrap().as_str();
+
+                                if let Some(&resource_id) =
+                                    resource_ids.get(res_type).and_then(|m| m.get(res_name))
+                                {
+                                    usage_stmt.execute(rusqlite::params![
+                                        resource_id,
+                                        rel_path,
+                                        line_num as i64,
+                                        "xml"
+                                    ])?;
+                                    usage_count += 1;
+                                }
+                            }
                         }
                     }
                 }
@@ -3334,19 +3818,11 @@ pub fn index_node_modules_dts(conn: &mut Connection, root: &Path, progress: bool
     // Parse in parallel and write to DB in chunks.
     // Uses parse_dts_file which takes an explicit rel_path (since real paths
     // may be in pnpm store, outside project root).
-    const CHUNK_SIZE: usize = 500;
     let parsed_global = Arc::new(AtomicUsize::new(0));
     let total_files = dts_files.len();
+    let chunk_size = effective_chunk_size(total_files);
 
-    let num_threads = std::env::var("AST_INDEX_THREADS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get().min(8))
-                .unwrap_or(4)
-        });
+    let num_threads = effective_num_threads();
 
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(num_threads)
@@ -3356,7 +3832,7 @@ pub fn index_node_modules_dts(conn: &mut Connection, root: &Path, progress: bool
 
     let mut total_count = 0;
 
-    for chunk in dts_files.chunks(CHUNK_SIZE) {
+    for chunk in dts_files.chunks(chunk_size) {
         let counter = parsed_global.clone();
         let total = total_files;
 

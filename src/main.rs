@@ -256,6 +256,9 @@ enum Commands {
         /// Verbose logging with timing for each step
         #[arg(long, short)]
         verbose: bool,
+        /// Experimental: use faster rebuild settings (defer indexes/FTS and relax SQLite durability during rebuild)
+        #[arg(long)]
+        experimental_fast_rebuild: bool,
         /// Number of parallel threads (default: CPU cores, max 8; increase for network filesystems)
         #[arg(long, short = 'j')]
         threads: Option<usize>,
@@ -747,12 +750,12 @@ fn main() -> Result<()> {
         Commands::Flows { query, limit } => commands::grep::cmd_flows(&root, query.as_deref(), limit),
         Commands::Previews { query, limit } => commands::grep::cmd_previews(&root, query.as_deref(), limit),
         // Management commands
-        Commands::Rebuild { r#type, no_deps, no_ignore, sub_projects, project_type, verbose, threads, include, exclude, paths } => {
+        Commands::Rebuild { r#type, no_deps, no_ignore, sub_projects, project_type, verbose, experimental_fast_rebuild, threads, include, exclude, paths } => {
             if let Some(t) = threads {
                 std::env::set_var("AST_INDEX_THREADS", t.to_string());
             }
             let pt_override = project_type.as_ref().and_then(|s| indexer::ProjectType::from_str(s));
-            commands::management::cmd_rebuild(&root, &r#type, !no_deps, no_ignore, sub_projects, pt_override, verbose, &include, &exclude, &paths)
+            commands::management::cmd_rebuild(&root, &r#type, !no_deps, no_ignore, sub_projects, pt_override, verbose, experimental_fast_rebuild, &include, &exclude, &paths)
         }
         Commands::Update { verbose } => commands::management::cmd_update(&root, verbose),
         Commands::Restore { path } => commands::management::cmd_restore(&root, &path),
