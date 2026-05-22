@@ -592,6 +592,9 @@ exclude:
 
 ## Changelog
 
+### 3.43.2
+- **Preserve root-level files in sub-project rebuilds** — experimental fast rebuild no longer drops files and module markers that live directly under the selected root when it switches large monorepos into sub-project mode
+
 ### 3.43.1
 - **Propagate `--experimental-fast-rebuild` mode to `update` and `watch`** — once a project is rebuilt with the experimental fast pipeline, subsequent incremental updates and file watching now automatically reuse the same mode from index metadata instead of falling back to the default slower path
 
