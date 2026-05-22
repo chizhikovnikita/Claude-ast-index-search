@@ -574,6 +574,30 @@ fn cmd_rebuild_sub_projects(
     let mut any_android = false;
     let mut any_ios = false;
 
+    if config_include.is_none() {
+        let t = Instant::now();
+        match indexer::index_directory_direct_entries(&mut conn, root, false, no_ignore, None, extra_exclude) {
+            Ok(walk) => {
+                total_files += walk.file_count;
+                all_module_files.extend(walk.module_files);
+                all_xml_files.extend(walk.xml_layout_files);
+                all_res_files.extend(walk.res_files);
+                all_storyboard_files.extend(walk.storyboard_files);
+                all_xcassets_dirs.extend(walk.xcassets_dirs);
+                if verbose {
+                    eprintln!("[verbose] root direct entries: {} files in {:?}", walk.file_count, t.elapsed());
+                }
+            }
+            Err(e) => {
+                if verbose {
+                    eprintln!("[verbose] root direct entries: FAILED in {:?}: {}", t.elapsed(), e);
+                }
+                println!("{}", format!("  Root direct entries failed: {}", e).red());
+                fail_count += 1;
+            }
+        }
+    }
+
     for (i, (path, pt)) in sub_projects.iter().enumerate() {
         let name = path.strip_prefix(root).unwrap_or(path).to_string_lossy();
         println!(

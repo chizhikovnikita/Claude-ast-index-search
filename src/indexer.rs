@@ -1017,6 +1017,31 @@ pub fn index_directory_with_config(
     )
 }
 
+/// Index only direct entries under `root`.
+///
+/// Sub-project rebuild mode walks each child project separately. This helper
+/// preserves root-level files and module markers without recursively walking
+/// the same child trees again.
+pub fn index_directory_direct_entries(
+    conn: &mut Connection,
+    root: &Path,
+    progress: bool,
+    no_ignore: bool,
+    project_type: Option<ProjectType>,
+    extra_exclude: Option<&[String]>,
+) -> Result<WalkResult> {
+    index_directory_scoped_with_max_depth(
+        conn,
+        root,
+        root,
+        progress,
+        no_ignore,
+        project_type,
+        extra_exclude,
+        Some(1),
+    )
+}
+
 /// Index a directory, walking `walk_dir` but storing paths relative to `root`.
 /// When walk_dir == root, behaves identically to index_directory.
 /// When walk_dir is a subdirectory of root, only indexes that subdirectory.
@@ -1029,6 +1054,28 @@ pub fn index_directory_scoped(
     no_ignore: bool,
     project_type_override: Option<ProjectType>,
     extra_exclude: Option<&[String]>,
+) -> Result<WalkResult> {
+    index_directory_scoped_with_max_depth(
+        conn,
+        root,
+        walk_dir,
+        progress,
+        no_ignore,
+        project_type_override,
+        extra_exclude,
+        Some(50),
+    )
+}
+
+fn index_directory_scoped_with_max_depth(
+    conn: &mut Connection,
+    root: &Path,
+    walk_dir: &Path,
+    progress: bool,
+    no_ignore: bool,
+    project_type_override: Option<ProjectType>,
+    extra_exclude: Option<&[String]>,
+    max_depth: Option<usize>,
 ) -> Result<WalkResult> {
     use ignore::WalkBuilder;
     use std::time::Instant;
@@ -1094,7 +1141,7 @@ pub fn index_directory_scoped(
     builder
         .hidden(true)
         .follow_links(false) // Never follow symlinks — prevents loops in monorepos
-        .max_depth(Some(50)) // Prevent runaway traversal in deeply nested structures
+        .max_depth(max_depth) // Prevent runaway traversal in deeply nested structures
         .git_ignore(use_git) // Respect .gitignore only if .git exists
         .git_exclude(use_git)
         .filter_entry(move |entry| {

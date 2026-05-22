@@ -7,7 +7,8 @@
 use std::fs;
 
 use ast_index::commands::management::{
-    cmd_add_root, cmd_clear, cmd_db_path, cmd_list_roots, cmd_query, cmd_remove_root,
+    cmd_add_root, cmd_clear, cmd_db_path, cmd_list_roots, cmd_query, cmd_rebuild,
+    cmd_remove_root,
 };
 use ast_index::db;
 use tempfile::TempDir;
@@ -19,6 +20,24 @@ fn open_fresh_db(project_root: &std::path::Path) -> rusqlite::Connection {
     let conn = db::open_db(project_root).unwrap();
     db::init_db(&conn).unwrap();
     conn
+}
+
+fn db_has_file(conn: &rusqlite::Connection, path: &str) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM files WHERE path = ?1)",
+        [path],
+        |row| row.get::<_, bool>(0),
+    )
+    .unwrap()
+}
+
+fn db_has_module(conn: &rusqlite::Connection, name: &str, path: &str) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM modules WHERE name = ?1 AND path = ?2)",
+        rusqlite::params![name, path],
+        |row| row.get::<_, bool>(0),
+    )
+    .unwrap()
 }
 
 // ----------------------------------------------------------------------
@@ -230,4 +249,53 @@ fn cmd_db_path_runs_without_db() {
     // db_path is a pure-print helper; must not require a DB to exist.
     let dir = TempDir::new().unwrap();
     cmd_db_path(dir.path()).expect("db_path must succeed even without DB");
+}
+
+// ----------------------------------------------------------------------
+// cmd_rebuild
+// ----------------------------------------------------------------------
+
+#[test]
+fn rebuild_sub_projects_keeps_root_direct_entries() {
+    let repo = TempDir::new().unwrap();
+    fs::create_dir(repo.path().join(".arc")).unwrap();
+    fs::write(repo.path().join(".arc").join("HEAD"), "trunk\n").unwrap();
+
+    let root = repo.path().join("workspace");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("ya.make"), "LIBRARY()\nEND()\n").unwrap();
+    fs::write(
+        root.join("root.sh"),
+        "ROOT_VAR=1\nroot_func() {\n  echo ok\n}\n",
+    )
+    .unwrap();
+
+    fs::create_dir_all(root.join("app")).unwrap();
+    fs::write(root.join("app").join("ya.make"), "PROGRAM()\nEND()\n").unwrap();
+    fs::write(
+        root.join("app").join("main.sh"),
+        "APP_VAR=1\napp_func() {\n  echo ok\n}\n",
+    )
+    .unwrap();
+
+    cmd_rebuild(
+        &root,
+        "all",
+        false,
+        false,
+        true,
+        None,
+        false,
+        true,
+        &[],
+        &[],
+        &[],
+    )
+    .expect("sub-project rebuild must succeed");
+
+    let conn = db::open_db(&root).unwrap();
+    assert!(db_has_file(&conn, "root.sh"));
+    assert!(db_has_file(&conn, "app/main.sh"));
+    assert!(db_has_module(&conn, "workspace", ""));
+    assert!(db_has_module(&conn, "workspace/app", "app"));
 }
