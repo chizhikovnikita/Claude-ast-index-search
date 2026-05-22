@@ -592,6 +592,9 @@ exclude:
 
 ## Changelog
 
+### 3.43.1
+- **Propagate `--experimental-fast-rebuild` mode to `update` and `watch`** — once a project is rebuilt with the experimental fast pipeline, subsequent incremental updates and file watching now automatically reuse the same mode from index metadata instead of falling back to the default slower path
+
 ### 3.43.0
 - **Add `--experimental-fast-rebuild` for large monorepos** — opt-in rebuild pipeline that leaves the default `rebuild` behavior unchanged while speeding up big trees via deferred index/FTS creation, monorepo sub-project shortcuts, and faster dependency/XML/resource indexing. On `taxi/mobile/go-client-android`, local rebuild time dropped from about 62s to about 16s
 

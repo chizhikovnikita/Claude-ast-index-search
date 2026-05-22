@@ -1493,6 +1493,27 @@ pub fn get_extra_roots(conn: &Connection) -> Result<Vec<String>> {
     }
 }
 
+pub fn is_experimental_fast_rebuild_enabled_in_db(conn: &Connection) -> bool {
+    let result: Result<String, _> = conn.query_row(
+        "SELECT value FROM metadata WHERE key = 'experimental_fast_rebuild'",
+        [],
+        |row| row.get(0),
+    );
+    result.map(|v| v == "1").unwrap_or(false)
+}
+
+pub fn set_experimental_fast_rebuild_enabled(
+    conn: &Connection,
+    enabled: bool,
+) -> Result<()> {
+    let value = if enabled { "1" } else { "0" };
+    conn.execute(
+        "INSERT OR REPLACE INTO metadata (key, value) VALUES ('experimental_fast_rebuild', ?1)",
+        [value],
+    )?;
+    Ok(())
+}
+
 /// Add an extra source root
 pub fn add_extra_root(conn: &Connection, path: &str) -> Result<()> {
     let mut roots = get_extra_roots(conn)?;

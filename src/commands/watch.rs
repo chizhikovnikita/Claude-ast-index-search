@@ -10,6 +10,7 @@ use notify::RecursiveMode;
 use notify_debouncer_mini::new_debouncer;
 
 use crate::{db, indexer, parsers};
+use crate::commands::{self, management::ScopedEnvVar};
 
 /// Acquire an exclusive lock for watch mode, scoped to project root.
 /// Returns the lock file handle (lock held while handle is alive).
@@ -146,6 +147,11 @@ pub fn cmd_watch(root: &Path) -> Result<()> {
 }
 
 fn update_index(root: &Path) -> Result<(usize, usize)> {
+    let _experimental_fast_rebuild_env = ScopedEnvVar::set_bool(
+        "AST_INDEX_EXPERIMENTAL_FAST_REBUILD",
+        commands::is_experimental_fast_rebuild_enabled(root),
+    );
+
     let mut conn = db::open_db(root)?;
 
     // Honour .ast-index.yaml so watch stays scoped to the same paths as rebuild/update.

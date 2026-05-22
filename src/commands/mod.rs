@@ -94,6 +94,14 @@ pub fn is_no_ignore_enabled(root: &Path) -> bool {
     false
 }
 
+/// Check if the last rebuild for this project used experimental fast rebuild mode.
+pub fn is_experimental_fast_rebuild_enabled(root: &Path) -> bool {
+    if let Ok(conn) = db::open_db(root) {
+        return db::is_experimental_fast_rebuild_enabled_in_db(&conn);
+    }
+    false
+}
+
 /// Get number of available CPU cores
 pub fn num_cpus() -> usize {
     std::thread::available_parallelism()

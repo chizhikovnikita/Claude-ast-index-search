@@ -21,13 +21,13 @@ const AUTO_SUB_PROJECTS_THRESHOLD: usize = 65_000;
 /// treated as a monorepo immediately and skips the expensive quick file count.
 const EXPERIMENTAL_SUB_PROJECTS_SHORTCUT_THRESHOLD: usize = 20;
 
-struct ScopedEnvVar {
+pub(crate) struct ScopedEnvVar {
     key: &'static str,
     previous: Option<std::ffi::OsString>,
 }
 
 impl ScopedEnvVar {
-    fn set_bool(key: &'static str, enabled: bool) -> Self {
+    pub(crate) fn set_bool(key: &'static str, enabled: bool) -> Self {
         let previous = std::env::var_os(key);
         if enabled {
             std::env::set_var(key, "1");
@@ -306,6 +306,7 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
         ).ok();
         println!("{}", "Including gitignored files (build/, etc.)...".yellow());
     }
+    db::set_experimental_fast_rebuild_enabled(&conn, experimental_fast_rebuild).ok();
 
     // Detect project type — check actual platform markers for Mixed projects
     let _project_type = indexer::detect_project_type(root);
@@ -560,6 +561,7 @@ fn cmd_rebuild_sub_projects(
             [],
         ).ok();
     }
+    db::set_experimental_fast_rebuild_enabled(&conn, experimental_fast_rebuild).ok();
 
     let mut total_files = 0;
     let mut success_count = 0;
@@ -677,6 +679,11 @@ pub fn cmd_update(root: &Path, verbose: bool) -> Result<()> {
         );
         return Ok(());
     }
+
+    let _experimental_fast_rebuild_env = ScopedEnvVar::set_bool(
+        "AST_INDEX_EXPERIMENTAL_FAST_REBUILD",
+        crate::commands::is_experimental_fast_rebuild_enabled(root),
+    );
 
     let mut conn = db::open_db(root)?;
 
