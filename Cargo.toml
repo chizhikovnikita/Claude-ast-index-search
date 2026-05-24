@@ -28,6 +28,10 @@ grep-matcher = "0.1"
 # SQLite + FTS5
 rusqlite = { version = "0.31", features = ["bundled"] }
 
+# Encoding detection + decoding for non-UTF-8 source files (CP1251 etc.)
+encoding_rs = "0.8"
+chardetng = "0.1"
+
 # Utilities
 walkdir = "2"
 anyhow = "1"

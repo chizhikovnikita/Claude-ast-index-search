@@ -15,6 +15,10 @@ testing, release). This file is the starting point.
   fallbacks for Perl, WSDL/XSD, Vue/Svelte scripts.
 - **Storage:** SQLite via `rusqlite`, cache at `~/Library/Caches/ast-index/<hash>/`
   on macOS and `$XDG_CACHE_HOME/ast-index/<hash>/` on Linux.
+- **File encoding:** UTF-8 fast path with `encoding_rs` + `chardetng` fallback
+  for Windows-1251 and other legacy encodings. All file reads go through
+  `crate::encoding::read_file_to_string` — never raw `fs::read_to_string`
+  (except for config files known to be UTF-8 by spec).
 - **CLI:** `clap` derive with a single global `--format {text,json}` flag.
 - **Workspace:** two crates — root `ast-index` (library + binary),
   `crates/ast-index-mcp` (MCP server). Default build produces only the root

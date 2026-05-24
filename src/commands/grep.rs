@@ -263,7 +263,7 @@ fn find_caller_functions(root: &Path, function_name: &str, limit: usize) -> Resu
     for (file_path, call_lines) in files_with_calls {
         if results.len() >= limit { break; }
 
-        let content = match std::fs::read_to_string(&file_path) {
+        let content = match crate::encoding::read_file_to_string(&file_path) {
             Ok(c) => c,
             Err(_) => continue,
         };
@@ -336,7 +336,7 @@ pub fn cmd_provides(root: &Path, type_name: &str, limit: usize) -> Result<()> {
             continue;
         }
 
-        if let Ok(content) = std::fs::read_to_string(path) {
+        if let Ok(content) = crate::encoding::read_file_to_string(path) {
             let lines: Vec<&str> = content.lines().collect();
             let kotlin_re = Regex::new(&format!(r":\s*\w*{}\b", regex::escape(type_name))).ok();
             let java_re = Regex::new(&format!(r"\b\w*{}\s+\w+\s*\(", regex::escape(type_name))).ok();
@@ -436,7 +436,7 @@ pub fn cmd_composables(root: &Path, query: Option<&str>, limit: usize) -> Result
     sorted_files.sort();
 
     for file_path in &sorted_files {
-        let content = match std::fs::read_to_string(file_path) {
+        let content = match crate::encoding::read_file_to_string(file_path) {
             Ok(c) => c,
             Err(_) => continue,
         };
@@ -722,7 +722,7 @@ pub fn cmd_previews(root: &Path, query: Option<&str>, limit: usize) -> Result<()
     sorted_files.sort();
 
     for file_path in &sorted_files {
-        let content = match std::fs::read_to_string(file_path) {
+        let content = match crate::encoding::read_file_to_string(file_path) {
             Ok(c) => c,
             Err(_) => continue,
         };

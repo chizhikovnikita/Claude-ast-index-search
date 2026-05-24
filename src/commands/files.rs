@@ -75,7 +75,7 @@ pub fn cmd_outline(root: &Path, file: &str) -> Result<()> {
         return Ok(());
     }
 
-    let content = std::fs::read_to_string(&file_path)?;
+    let content = crate::encoding::read_file_to_string(&file_path)?;
 
     // Detect file type
     let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -161,7 +161,7 @@ pub fn cmd_imports(root: &Path, file: &str) -> Result<()> {
         return Ok(());
     }
 
-    let content = std::fs::read_to_string(&file_path)?;
+    let content = crate::encoding::read_file_to_string(&file_path)?;
 
     // Detect file type by extension
     let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -455,7 +455,7 @@ pub fn cmd_changed(root: &Path, base: &str) -> Result<()> {
         let file_path = root.join(file);
         if !file_path.exists() { continue; }
 
-        let content = match std::fs::read_to_string(&file_path) {
+        let content = match crate::encoding::read_file_to_string(&file_path) {
             Ok(c) => c,
             Err(_) => continue,
         };

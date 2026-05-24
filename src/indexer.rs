@@ -443,7 +443,7 @@ pub fn detect_project_type(root: &Path) -> ProjectType {
                         .filter(|e| e.path().extension().map(|ext| ext == "m").unwrap_or(false))
                         .take(3)
                         .any(|e| {
-                            fs::read_to_string(e.path())
+                            crate::encoding::read_file_to_string(e.path())
                                 .map(|content| {
                                     let trimmed = content.trim_start();
                                     trimmed.starts_with("classdef")
@@ -575,7 +575,7 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
         });
     }
 
-    let content = fs::read_to_string(file_path)?;
+    let content = crate::encoding::read_file_to_string(file_path)?;
 
     // Detect file type by extension, with content-based sniffing for .m files
     let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -1745,7 +1745,7 @@ pub fn index_modules_from_files(
                         .to_string();
 
                     // Read Package.swift and extract targets
-                    if let Ok(content) = fs::read_to_string(path) {
+                    if let Ok(content) = crate::encoding::read_file_to_string(path) {
                         for caps in spm_target_re.captures_iter(&content) {
                             let target_name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                             if !target_name.is_empty() {
@@ -1773,7 +1773,7 @@ pub fn index_modules_from_files(
 
             // Perl modules (.pm files with package declarations)
             if name_str.ends_with(".pm") {
-                if let Ok(content) = fs::read_to_string(path) {
+                if let Ok(content) = crate::encoding::read_file_to_string(path) {
                     static PERL_PACKAGE_RE: LazyLock<Regex> = LazyLock::new(|| {
                         Regex::new(r"^\s*package\s+([A-Za-z_][A-Za-z0-9_:]*)\s*;").unwrap()
                     });
@@ -1808,7 +1808,7 @@ pub fn index_modules_from_files(
                         .to_string_lossy()
                         .to_string();
 
-                    if let Ok(content) = fs::read_to_string(path) {
+                    if let Ok(content) = crate::encoding::read_file_to_string(path) {
                         static ARTIFACT_RE: LazyLock<Regex> = LazyLock::new(|| {
                             Regex::new(r"<artifactId>\s*([^<]+?)\s*</artifactId>").unwrap()
                         });
@@ -1877,7 +1877,7 @@ pub fn index_modules_from_files(
                     let module_name = if module_path.is_empty() {
                         // Root project — try to extract name from pyproject.toml
                         if name_str == "pyproject.toml" {
-                            if let Ok(content) = fs::read_to_string(path) {
+                            if let Ok(content) = crate::encoding::read_file_to_string(path) {
                                 extract_python_module_name(&content).unwrap_or_else(|| {
                                     root.file_name()
                                         .and_then(|n| n.to_str())
@@ -2239,7 +2239,7 @@ pub fn index_module_dependencies(
                                     .to_string();
                                 if module_path.is_empty() {
                                     if file_name == "pyproject.toml" {
-                                        fs::read_to_string(path)
+                                        crate::encoding::read_file_to_string(path)
                                             .ok()
                                             .as_deref()
                                             .and_then(extract_python_module_name)
@@ -2273,7 +2273,7 @@ pub fn index_module_dependencies(
                             None => return Vec::new(),
                         };
 
-                        let content = match fs::read_to_string(path) {
+                        let content = match crate::encoding::read_file_to_string(path) {
                             Ok(c) => c,
                             Err(_) => return Vec::new(),
                         };
@@ -2421,7 +2421,7 @@ pub fn index_module_dependencies(
                             .to_string();
                         if module_path.is_empty() {
                             if file_name == "pyproject.toml" {
-                                fs::read_to_string(path)
+                                crate::encoding::read_file_to_string(path)
                                     .ok()
                                     .as_deref()
                                     .and_then(extract_python_module_name)
@@ -2453,7 +2453,7 @@ pub fn index_module_dependencies(
                     None => continue,
                 };
 
-                let content = match fs::read_to_string(path) {
+                let content = match crate::encoding::read_file_to_string(path) {
                     Ok(c) => c,
                     Err(_) => continue,
                 };
@@ -2711,7 +2711,7 @@ pub fn index_xml_usages(
                                 .to_string_lossy()
                                 .to_string();
                             let module_id = module_lookup.find(&rel_path);
-                            let content = match fs::read_to_string(xml_path) {
+                            let content = match crate::encoding::read_file_to_string(xml_path) {
                                 Ok(content) => content,
                                 Err(_) => return Vec::new(),
                             };
@@ -2774,7 +2774,7 @@ pub fn index_xml_usages(
                         .to_string();
                     let module_id = module_lookup.find(&rel_path);
 
-                    if let Ok(content) = fs::read_to_string(xml_path) {
+                    if let Ok(content) = crate::encoding::read_file_to_string(xml_path) {
                         for (line_num, line) in content.lines().enumerate() {
                             let line_num = line_num as i64 + 1;
 
@@ -2980,7 +2980,7 @@ pub fn index_resources(
 
             // Values files (strings, colors, dimens, styles)
             if rel_path.contains("/values") && rel_path.ends_with(".xml") {
-                if let Ok(content) = fs::read_to_string(res_path) {
+                if let Ok(content) = crate::encoding::read_file_to_string(res_path) {
                     for (line_num, line) in content.lines().enumerate() {
                         let line_num = line_num + 1;
 
@@ -3085,7 +3085,7 @@ pub fn index_resources(
                     .par_iter()
                     .map(|rel_path| {
                         let file_path = root_buf.join(rel_path);
-                        let content = match fs::read_to_string(file_path) {
+                        let content = match crate::encoding::read_file_to_string(file_path) {
                             Ok(content) => content,
                             Err(_) => return Vec::new(),
                         };
@@ -3153,7 +3153,7 @@ pub fn index_resources(
             for rel_path in &code_rel_paths {
                 let file_path = root.join(rel_path);
 
-                if let Ok(content) = fs::read_to_string(file_path) {
+                if let Ok(content) = crate::encoding::read_file_to_string(file_path) {
                     let is_xml = rel_path.ends_with(".xml");
 
                     for (line_num, line) in content.lines().enumerate() {
@@ -3383,7 +3383,7 @@ pub fn index_storyboard_usages(
             // Find module for this file
             let module_id = module_lookup.find(&rel_path);
 
-            if let Ok(content) = fs::read_to_string(sb_path) {
+            if let Ok(content) = crate::encoding::read_file_to_string(sb_path) {
                 for (line_num, line) in content.lines().enumerate() {
                     let line_num = line_num + 1;
 
@@ -3590,7 +3590,7 @@ pub fn index_ios_assets(
         for rel_path in &swift_rel_paths {
             let file_path = root.join(rel_path);
 
-            if let Ok(content) = fs::read_to_string(file_path) {
+            if let Ok(content) = crate::encoding::read_file_to_string(file_path) {
                 for (line_num, line) in content.lines().enumerate() {
                     let line_num = line_num + 1;
 
@@ -3642,7 +3642,7 @@ pub fn index_ios_package_managers(conn: &Connection, root: &Path, progress: bool
     // CocoaPods: Podfile
     let podfile = root.join("Podfile");
     if podfile.exists() {
-        if let Ok(content) = fs::read_to_string(&podfile) {
+        if let Ok(content) = crate::encoding::read_file_to_string(&podfile) {
             // pod 'PodName', '~> 1.0'
             static POD_RE: LazyLock<Regex> =
                 LazyLock::new(|| Regex::new(r#"pod\s+['"]([^'"]+)['"]"#).unwrap());
@@ -3663,7 +3663,7 @@ pub fn index_ios_package_managers(conn: &Connection, root: &Path, progress: bool
     // Podfile.lock for exact versions
     let podfile_lock = root.join("Podfile.lock");
     if podfile_lock.exists() {
-        if let Ok(content) = fs::read_to_string(&podfile_lock) {
+        if let Ok(content) = crate::encoding::read_file_to_string(&podfile_lock) {
             // PODS:
             //   - PodName (1.0.0)
             static POD_LOCK_RE: LazyLock<Regex> =
@@ -3687,7 +3687,7 @@ pub fn index_ios_package_managers(conn: &Connection, root: &Path, progress: bool
     // Carthage: Cartfile
     let cartfile = root.join("Cartfile");
     if cartfile.exists() {
-        if let Ok(content) = fs::read_to_string(&cartfile) {
+        if let Ok(content) = crate::encoding::read_file_to_string(&cartfile) {
             // github "owner/repo" ~> 1.0
             static CARTHAGE_RE: LazyLock<Regex> =
                 LazyLock::new(|| Regex::new(r#"github\s+["']([^"']+)["']"#).unwrap());
@@ -3709,7 +3709,7 @@ pub fn index_ios_package_managers(conn: &Connection, root: &Path, progress: bool
     // Carthage.resolved for exact versions
     let cartfile_resolved = root.join("Cartfile.resolved");
     if cartfile_resolved.exists() {
-        if let Ok(content) = fs::read_to_string(&cartfile_resolved) {
+        if let Ok(content) = crate::encoding::read_file_to_string(&cartfile_resolved) {
             static CARTHAGE_RE: LazyLock<Regex> =
                 LazyLock::new(|| Regex::new(r#"github\s+["']([^"']+)["']"#).unwrap());
 
@@ -3932,7 +3932,7 @@ fn parse_dts_file(file_path: &Path, rel_path: &str) -> Result<ParsedFile> {
         });
     }
 
-    let content = fs::read_to_string(file_path)?;
+    let content = crate::encoding::read_file_to_string(file_path)?;
     let (symbols, refs) = parsers::parse_file_symbols(&content, parsers::FileType::TypeScript)?;
 
     Ok(ParsedFile {

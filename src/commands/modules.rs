@@ -552,7 +552,7 @@ fn get_module_public_symbols(conn: &Connection, root: &Path, module_path: &str) 
                         .unwrap_or(false)
                 })
             {
-                if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                if let Ok(content) = crate::encoding::read_file_to_string(entry.path()) {
                     for caps in class_re.captures_iter(&content) {
                         if let Some(name) = caps.get(1) {
                             symbols.push(name.as_str().to_string());

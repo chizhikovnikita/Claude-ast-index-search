@@ -6,13 +6,34 @@
 //! - stats: Show index statistics
 
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use anyhow::Result;
 use colored::Colorize;
 
 use crate::db;
+use crate::encoding;
 use crate::indexer;
+
+fn start_encoding_tracking(verbose: bool) {
+    encoding::VERBOSE_DECODE.store(verbose, Ordering::Relaxed);
+    let _ = encoding::take_fallback_count();
+}
+
+fn report_encoding_summary() {
+    let n = encoding::take_fallback_count();
+    if n > 0 {
+        eprintln!(
+            "{}",
+            format!(
+                "[encoding] decoded {} file(s) via fallback from non-UTF-8 (re-run with --verbose to list)",
+                n
+            )
+            .yellow()
+        );
+    }
+}
 
 
 /// File count threshold for auto-switching to sub-projects mode
@@ -98,6 +119,7 @@ fn build_exclude_matcher(root: &std::path::Path, patterns: Option<&[String]>) ->
 
 /// Rebuild the index (full or partial)
 pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: bool, sub_projects: bool, project_type: Option<indexer::ProjectType>, verbose: bool, experimental_fast_rebuild: bool, cli_include: &[String], cli_exclude: &[String], extra_paths: &[String]) -> Result<()> {
+    start_encoding_tracking(verbose);
     let _experimental_fast_rebuild_env =
         ScopedEnvVar::set_bool("AST_INDEX_EXPERIMENTAL_FAST_REBUILD", experimental_fast_rebuild);
     if verbose {
@@ -500,6 +522,7 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
         eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
     }
     restore_rebuild_pragmas(&conn, experimental_fast_rebuild, verbose)?;
+    report_encoding_summary();
     Ok(())
 }
 
@@ -688,13 +711,14 @@ fn cmd_rebuild_sub_projects(
         eprintln!("{}", format!("Total time: {:?}", start.elapsed()).dimmed());
     }
     restore_rebuild_pragmas(&conn, experimental_fast_rebuild, verbose)?;
+    report_encoding_summary();
     Ok(())
 }
 
 /// Incrementally update the index
 pub fn cmd_update(root: &Path, verbose: bool) -> Result<()> {
     let start = Instant::now();
-
+    start_encoding_tracking(verbose);
 
     if !db::db_exists(root) {
         println!(
@@ -755,6 +779,7 @@ pub fn cmd_update(root: &Path, verbose: bool) -> Result<()> {
     if verbose {
         eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
     }
+    report_encoding_summary();
     Ok(())
 }
 

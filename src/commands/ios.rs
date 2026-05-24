@@ -290,7 +290,7 @@ pub fn cmd_swiftui(root: &Path, query: Option<&str>, limit: usize) -> Result<()>
         if results.len() >= limit {
             break;
         }
-        if let Ok(content) = std::fs::read_to_string(file_path) {
+        if let Ok(content) = crate::encoding::read_file_to_string(file_path) {
             if let Ok(wrappers) = find_property_wrappers(&content) {
                 for pw in wrappers {
                     if results.len() >= limit {
@@ -362,7 +362,7 @@ pub fn cmd_async_funcs(root: &Path, query: Option<&str>, limit: usize) -> Result
         if results.len() >= limit {
             break;
         }
-        if let Ok(content) = std::fs::read_to_string(file_path) {
+        if let Ok(content) = crate::encoding::read_file_to_string(file_path) {
             if let Ok(funcs) = find_async_funcs(&content) {
                 for f in funcs {
                     if results.len() >= limit {

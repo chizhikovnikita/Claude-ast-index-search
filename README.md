@@ -33,6 +33,28 @@ project setup, index updates, git checkouts, worktrees, and AI agent usage.
 
 **[Command setup guide](docs/setup-guide.md)** — install, commands, and usage examples.
 
+### File encodings
+
+Source files are read as UTF-8 by default (the zero-overhead fast path). If
+a file isn't valid UTF-8, its encoding is auto-detected (`chardetng`) and
+decoded (`encoding_rs`) — Windows-1251, KOI8-R, ISO-8859-*, Shift-JIS,
+and other legacy encodings work without pre-conversion. Mixed-encoding
+projects (e.g. legacy PHP/HTML/JS in `/var/www/html` with some UTF-8 and
+some CP1251 files) index correctly.
+
+After `rebuild`/`update`, a one-line stderr summary reports how many files
+needed fallback decoding. Pass `--verbose` to see each file and its
+detected encoding:
+
+```bash
+ast-index rebuild --verbose
+# [encoding] decoded /var/www/html/legacy/order.php as windows-1251
+# [encoding] decoded 47 file(s) via fallback from non-UTF-8 …
+```
+
+Decoding is fault-tolerant: unmappable bytes become `U+FFFD` rather than
+errors, so a partially garbled file still yields useful symbols.
+
 ## Installation
 
 ### Homebrew (macOS/Linux)
@@ -591,6 +613,9 @@ exclude:
 ```
 
 ## Changelog
+
+### 3.44.0
+- **Support Windows-1251 (and other legacy) encoded source files** — every file read now flows through a single `crate::encoding::read_file_to_string` helper that takes a UTF-8 fast path (zero overhead for the common case) and falls back to `chardetng` auto-detection + `encoding_rs` decoding for the rest. Legacy mixed-encoding projects (e.g. `/var/www/html` with PHP/HTML/JS in Windows-1251 alongside UTF-8) now `rebuild`, `search`, `grep`, and `outline` correctly without any pre-conversion on disk. Decoding is fault-tolerant — unmappable bytes become `U+FFFD` rather than errors, so partially garbled files still yield useful symbols. After `rebuild`/`update`, a one-line stderr summary reports the number of fallback decodings; `--verbose` lists each file and its detected encoding (e.g. `[encoding] decoded /var/www/html/legacy/order.php as windows-1251`)
 
 ### 3.43.2
 - **Preserve root-level files in sub-project rebuilds** — experimental fast rebuild no longer drops files and module markers that live directly under the selected root when it switches large monorepos into sub-project mode
