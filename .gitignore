@@ -11,6 +11,7 @@
 !/.claude/rules/testing.md
 !/.claude/rules/release.md
 !/.claude/rules/verify.md
+!/.claude/rules/fork-workflow.md
 !/.claude/agents/
 /.claude/agents/*
 !/.claude/agents/bug-fix.md

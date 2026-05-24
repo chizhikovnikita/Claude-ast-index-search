@@ -92,6 +92,7 @@ PR is welcome but not enforced by CI yet.
 
 ## When in doubt
 
+- Starting work in this fork? Read `.claude/rules/fork-workflow.md`.
 - Adding a command? Read `.claude/rules/commands.md`.
 - Adding a language? Read `.claude/rules/parsers.md`.
 - Writing tests? Read `.claude/rules/testing.md`.
