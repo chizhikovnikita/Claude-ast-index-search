@@ -24,48 +24,60 @@ fi
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# Cross-platform `sed -i` wrapper. BSD sed (macOS) requires an explicit
+# backup-suffix argument after `-i` (empty string for "no backup"); GNU sed
+# (Linux) treats `-i ''` as `-i` plus an empty script, which then mis-parses
+# the next arg. This shim normalizes both.
+sedi() {
+    if [[ "$(uname)" == "Darwin" ]]; then
+        sed -i '' "$@"
+    else
+        sed -i "$@"
+    fi
+}
+
 # Detect current version from Cargo.toml
 CURRENT=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
 echo "Bumping $CURRENT → $VERSION"
 
 # 1. Cargo.toml
-sed -i '' "s/^version = \"$CURRENT\"/version = \"$VERSION\"/" Cargo.toml
+sedi "s/^version = \"$CURRENT\"/version = \"$VERSION\"/" Cargo.toml
 echo "  ✓ Cargo.toml"
 
 # 2. README.md title
-sed -i '' "s/# ast-index v$CURRENT/# ast-index v$VERSION/" README.md
+sedi "s/# ast-index v$CURRENT/# ast-index v$VERSION/" README.md
 echo "  ✓ README.md"
 
 # 3. plugin/.claude-plugin/plugin.json
-sed -i '' "s/\"version\": \"$CURRENT\"/\"version\": \"$VERSION\"/" plugin/.claude-plugin/plugin.json
+sedi "s/\"version\": \"$CURRENT\"/\"version\": \"$VERSION\"/" plugin/.claude-plugin/plugin.json
 echo "  ✓ plugin/.claude-plugin/plugin.json"
 
 # 4. plugin/.codex-plugin/plugin.json
-sed -i '' "s/\"version\": \"$CURRENT\"/\"version\": \"$VERSION\"/" plugin/.codex-plugin/plugin.json
+sedi "s/\"version\": \"$CURRENT\"/\"version\": \"$VERSION\"/" plugin/.codex-plugin/plugin.json
 echo "  ✓ plugin/.codex-plugin/plugin.json"
 
 # 5. plugin/.cursor-plugin/plugin.json
-sed -i '' "s/\"version\": \"$CURRENT\"/\"version\": \"$VERSION\"/" plugin/.cursor-plugin/plugin.json
+sedi "s/\"version\": \"$CURRENT\"/\"version\": \"$VERSION\"/" plugin/.cursor-plugin/plugin.json
 echo "  ✓ plugin/.cursor-plugin/plugin.json"
 
 # 6. .claude-plugin/plugin.json
-sed -i '' "s/\"version\": \"$CURRENT\"/\"version\": \"$VERSION\"/" .claude-plugin/plugin.json
+sedi "s/\"version\": \"$CURRENT\"/\"version\": \"$VERSION\"/" .claude-plugin/plugin.json
 echo "  ✓ .claude-plugin/plugin.json"
 
 # 7. .claude-plugin/marketplace.json
-sed -i '' "s/\"version\": \"$CURRENT\"/\"version\": \"$VERSION\"/" .claude-plugin/marketplace.json
+sedi "s/\"version\": \"$CURRENT\"/\"version\": \"$VERSION\"/" .claude-plugin/marketplace.json
 echo "  ✓ .claude-plugin/marketplace.json"
 
 # 8. npm/package.json (version + optionalDependencies)
 if [ -f npm/package.json ]; then
-    sed -i '' "s/$CURRENT/$VERSION/g" npm/package.json
+    sedi "s/$CURRENT/$VERSION/g" npm/package.json
     echo "  ✓ npm/package.json"
 fi
 
 # 9. npm platform packages
 for pkg in npm/platforms/*/package.json; do
     if [ -f "$pkg" ]; then
-        sed -i '' "s/$CURRENT/$VERSION/g" "$pkg"
+        sedi "s/$CURRENT/$VERSION/g" "$pkg"
         echo "  ✓ $pkg"
     fi
 done
