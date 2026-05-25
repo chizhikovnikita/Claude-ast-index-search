@@ -250,9 +250,6 @@ enum Commands {
         /// Index each sub-project separately (for large monorepo directories)
         #[arg(long)]
         sub_projects: bool,
-        /// Force project type (e.g., dart, android, ios, python, go, rust, csharp, cpp, php, ruby, scala, bsl, frontend, perl, bazel)
-        #[arg(long)]
-        project_type: Option<String>,
         /// Verbose logging with timing for each step
         #[arg(long, short)]
         verbose: bool,
@@ -750,12 +747,11 @@ fn main() -> Result<()> {
         Commands::Flows { query, limit } => commands::grep::cmd_flows(&root, query.as_deref(), limit),
         Commands::Previews { query, limit } => commands::grep::cmd_previews(&root, query.as_deref(), limit),
         // Management commands
-        Commands::Rebuild { r#type, no_deps, no_ignore, sub_projects, project_type, verbose, experimental_fast_rebuild, threads, include, exclude, paths } => {
+        Commands::Rebuild { r#type, no_deps, no_ignore, sub_projects, verbose, experimental_fast_rebuild, threads, include, exclude, paths } => {
             if let Some(t) = threads {
                 std::env::set_var("AST_INDEX_THREADS", t.to_string());
             }
-            let pt_override = project_type.as_ref().and_then(|s| indexer::ProjectType::from_str(s));
-            commands::management::cmd_rebuild(&root, &r#type, !no_deps, no_ignore, sub_projects, pt_override, verbose, experimental_fast_rebuild, &include, &exclude, &paths)
+            commands::management::cmd_rebuild(&root, &r#type, !no_deps, no_ignore, sub_projects, verbose, experimental_fast_rebuild, &include, &exclude, &paths)
         }
         Commands::Update { verbose } => commands::management::cmd_update(&root, verbose),
         Commands::Restore { path } => commands::management::cmd_restore(&root, &path),

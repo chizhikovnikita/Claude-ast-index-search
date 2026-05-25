@@ -97,7 +97,7 @@ fn build_exclude_matcher(root: &std::path::Path, patterns: Option<&[String]>) ->
 }
 
 /// Rebuild the index (full or partial)
-pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: bool, sub_projects: bool, project_type: Option<indexer::ProjectType>, verbose: bool, experimental_fast_rebuild: bool, cli_include: &[String], cli_exclude: &[String], extra_paths: &[String]) -> Result<()> {
+pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: bool, sub_projects: bool, verbose: bool, experimental_fast_rebuild: bool, cli_include: &[String], cli_exclude: &[String], extra_paths: &[String]) -> Result<()> {
     let _experimental_fast_rebuild_env =
         ScopedEnvVar::set_bool("AST_INDEX_EXPERIMENTAL_FAST_REBUILD", experimental_fast_rebuild);
     if verbose {
@@ -115,9 +115,6 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
 
     // Apply config fallbacks: CLI flags > config > defaults
     let no_ignore = if no_ignore { true } else { config.no_ignore.unwrap_or(false) };
-    let project_type = project_type.or_else(|| {
-        config.project_type.as_deref().and_then(indexer::ProjectType::from_str)
-    });
     // Merge CLI flags with config: CLI overrides config
     let mut merged_exclude: Vec<String> = config.exclude.unwrap_or_default();
     for e in cli_exclude {
@@ -308,8 +305,7 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
     }
     db::set_experimental_fast_rebuild_enabled(&conn, experimental_fast_rebuild).ok();
 
-    // Detect project type — check actual platform markers for Mixed projects
-    let _project_type = indexer::detect_project_type(root);
+    // Check actual platform markers for mixed mobile repos.
     let is_ios = indexer::has_ios_markers(root);
     let is_android = indexer::has_android_markers(root);
 
@@ -318,7 +314,7 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
             println!("{}", "Rebuilding full index...".cyan());
             if verbose { eprintln!("[verbose] starting file walk + parse..."); }
             let t = Instant::now();
-            let walk = indexer::index_directory_with_config(&mut conn, root, true, no_ignore, project_type, config_exclude.as_deref())?;
+            let walk = indexer::index_directory_with_config(&mut conn, root, true, no_ignore, config_exclude.as_deref())?;
             let mut file_count = walk.file_count;
             if verbose { eprintln!("[verbose] index_directory: {} files in {:?}", file_count, t.elapsed()); }
 
@@ -332,7 +328,7 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
                 if extra_path.exists() {
                     if verbose { eprintln!("[verbose] indexing extra root: {}", extra_root); }
                     let t = Instant::now();
-                    let extra_walk = indexer::index_directory_with_config(&mut conn, extra_path, true, no_ignore, None, config_exclude.as_deref())?;
+                    let extra_walk = indexer::index_directory_with_config(&mut conn, extra_path, true, no_ignore, config_exclude.as_deref())?;
                     file_count += extra_walk.file_count;
                     all_module_files.extend(extra_walk.module_files);
                     if verbose { eprintln!("[verbose] extra root: {} files in {:?}", extra_walk.file_count, t.elapsed()); }
@@ -460,7 +456,7 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
             println!("{}", "Rebuilding symbols index...".cyan());
             conn.execute("DELETE FROM symbols", [])?;
             conn.execute("DELETE FROM files", [])?;
-            let walk = indexer::index_directory_with_config(&mut conn, root, true, no_ignore, project_type, config_exclude.as_deref())?;
+            let walk = indexer::index_directory_with_config(&mut conn, root, true, no_ignore, config_exclude.as_deref())?;
             finalize_rebuild_schema(&conn, experimental_fast_rebuild, verbose)?;
             println!("{}", format!("Indexed {} files", walk.file_count).green());
         }
@@ -836,17 +832,8 @@ pub fn cmd_stats(root: &Path, format: &str) -> Result<()> {
         .map(|m| m.len())
         .unwrap_or(0);
 
-    // Load config for project_type override
-    let config = indexer::load_config(root);
-    let config_project_type = config.as_ref()
-        .and_then(|c| c.project_type.as_deref())
-        .and_then(indexer::ProjectType::from_str);
-
     if format == "json" {
-        let detected = indexer::detect_project_type(root);
-        let project_type = config_project_type.unwrap_or(detected);
         let result = serde_json::json!({
-            "project": project_type.as_str(),
             "stats": stats,
             "db_size_bytes": db_size,
             "db_path": db_path.display().to_string(),
@@ -855,12 +842,7 @@ pub fn cmd_stats(root: &Path, format: &str) -> Result<()> {
         return Ok(());
     }
 
-    // Detect project type (config overrides auto-detect)
-    let detected = indexer::detect_project_type(root);
-    let project_type = config_project_type.unwrap_or(detected);
-
     println!("{}", "Index Statistics:".bold());
-    println!("  Project:    {}", project_type.as_str());
     println!("  Files:      {}", stats.file_count);
     println!("  Symbols:    {}", stats.symbol_count);
     println!("  Refs:       {}", stats.refs_count);
