@@ -22,6 +22,20 @@ fn symbol_display_name(symbol: &db::SearchResult) -> &str {
     symbol.display_name()
 }
 
+fn auto_pattern_from_name<'a>(
+    name: Option<&'a str>,
+    pattern: Option<&'a str>,
+) -> (Option<&'a str>, Option<&'a str>) {
+    if pattern.is_some() {
+        return (name, pattern);
+    }
+
+    match name {
+        Some(n) if n.contains('*') || n.contains('?') => (None, Some(n)),
+        _ => (name, pattern),
+    }
+}
+
 /// Full-text search across files, symbols, and file contents
 pub fn cmd_search(
     root: &Path,
@@ -250,6 +264,8 @@ pub fn cmd_symbol(
         return Ok(());
     }
 
+    let (name, pattern) = auto_pattern_from_name(name, pattern);
+
     if name.is_none() && pattern.is_none() {
         println!("{}", "Either a symbol name or --pattern is required.".red());
         return Ok(());
@@ -324,6 +340,8 @@ pub fn cmd_class(
         return Ok(());
     }
 
+    let (name, pattern) = auto_pattern_from_name(name, pattern);
+
     if name.is_none() && pattern.is_none() {
         println!("{}", "Either a class name or --pattern is required.".red());
         return Ok(());
@@ -387,6 +405,39 @@ pub fn cmd_class(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::auto_pattern_from_name;
+
+    #[test]
+    fn auto_pattern_keeps_explicit_pattern() {
+        let (name, pattern) = auto_pattern_from_name(Some("Client"), Some("foo*"));
+        assert_eq!(name, Some("Client"));
+        assert_eq!(pattern, Some("foo*"));
+    }
+
+    #[test]
+    fn auto_pattern_promotes_star_name() {
+        let (name, pattern) = auto_pattern_from_name(Some("AcceptanceOperationInitiator::*"), None);
+        assert_eq!(name, None);
+        assert_eq!(pattern, Some("AcceptanceOperationInitiator::*"));
+    }
+
+    #[test]
+    fn auto_pattern_promotes_question_name() {
+        let (name, pattern) = auto_pattern_from_name(Some("Client?"), None);
+        assert_eq!(name, None);
+        assert_eq!(pattern, Some("Client?"));
+    }
+
+    #[test]
+    fn auto_pattern_leaves_exact_name_alone() {
+        let (name, pattern) = auto_pattern_from_name(Some("kAntifraud"), None);
+        assert_eq!(name, Some("kAntifraud"));
+        assert_eq!(pattern, None);
+    }
 }
 
 /// Find implementations of interface/class

@@ -68,6 +68,13 @@
 (enum_specifier
   name: (type_identifier) @enum_name)
 
+; enum values
+(enum_specifier
+  name: (type_identifier) @enum_name
+  body: (enumerator_list
+    (enumerator
+      name: (identifier) @enum_value)))
+
 ; === Type Aliases ===
 
 ; typedef ... TypeName; (simple)

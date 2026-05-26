@@ -69,6 +69,7 @@ impl LanguageParser for CppParser {
         // Other captures
         let idx_namespace_name = idx("namespace_name");
         let idx_enum_name = idx("enum_name");
+        let idx_enum_value = idx("enum_value");
         let idx_typedef_name = idx("typedef_name");
         let idx_typedef_node = idx("typedef_node");
         let idx_using_alias_name = idx("using_alias_name");
@@ -307,6 +308,18 @@ impl LanguageParser for CppParser {
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
                 });
+
+                if let Some(value_cap) = find_capture(m, idx_enum_value) {
+                    let value = node_text(content, &value_cap.node);
+                    let value_line = node_line(&value_cap.node);
+                    symbols.push(ParsedSymbol {
+                        name: value.to_string(),
+                        kind: SymbolKind::Constant,
+                        line: value_line,
+                        signature: line_text(content, value_line).trim().to_string(),
+                        parents: vec![(name.to_string(), "member".to_string())],
+                    });
+                }
                 continue;
             }
 
@@ -429,6 +442,7 @@ pub fn collect_qualified_names(content: &str) -> Result<HashMap<(String, usize, 
     let idx_destructor_name = idx("destructor_name");
     let idx_namespace_name = idx("namespace_name");
     let idx_enum_name = idx("enum_name");
+    let idx_enum_value = idx("enum_value");
     let idx_typedef_name = idx("typedef_name");
     let idx_typedef_node = idx("typedef_node");
     let idx_using_alias_name = idx("using_alias_name");
@@ -590,6 +604,19 @@ pub fn collect_qualified_names(content: &str) -> Result<HashMap<(String, usize, 
                 node_text(content, &cap.node),
                 node_text_with_namespace(content, &cap.node),
             );
+
+            if let Some(value_cap) = find_capture(m, idx_enum_value) {
+                let enum_name = node_text(content, &cap.node);
+                let value_name = node_text(content, &value_cap.node);
+                let qualified_value = qualify_enum_value(content, &cap.node, enum_name, value_name);
+                remember_qualified_name(
+                    &mut qualified,
+                    SymbolKind::Constant,
+                    node_line(&value_cap.node),
+                    value_name,
+                    qualified_value,
+                );
+            }
             continue;
         }
 
@@ -688,6 +715,27 @@ fn node_text_with_namespace(content: &str, node: &Node) -> String {
 fn qualify_typedef_name(content: &str, type_def_node: &tree_sitter::Node, name: &str) -> String {
     let mut parts = enclosing_namespaces(content, *type_def_node);
     parts.push(name);
+    parts.join("::")
+}
+
+fn qualify_enum_value(
+    content: &str,
+    enum_name_node: &tree_sitter::Node,
+    enum_name: &str,
+    value_name: &str,
+) -> String {
+    let enum_node = enum_name_node.parent();
+    let enum_text = enum_node
+        .as_ref()
+        .map(|node| node_text(content, node))
+        .unwrap_or("");
+
+    let mut parts = enclosing_namespaces(content, *enum_name_node);
+    // Scoped enums (`enum class` / `enum struct`) require EnumName::Value.
+    if enum_text.contains("enum class") || enum_text.contains("enum struct") {
+        parts.push(enum_name);
+    }
+    parts.push(value_name);
     parts.join("::")
 }
 
@@ -1128,6 +1176,27 @@ enum Color {
             "Expected enum Color, got: {:?}",
             symbols
         );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Constant && s.name == "RED"),
+            "Expected enum value RED, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Constant && s.name == "GREEN"),
+            "Expected enum value GREEN, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Constant && s.name == "BLUE"),
+            "Expected enum value BLUE, got: {:?}",
+            symbols
+        );
     }
 
     #[test]
@@ -1145,6 +1214,27 @@ enum class Status {
                 .iter()
                 .any(|s| s.kind == SymbolKind::Enum && s.name == "Status"),
             "Expected enum class Status, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Constant && s.name == "Active"),
+            "Expected enum class value Active, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Constant && s.name == "Inactive"),
+            "Expected enum class value Inactive, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Constant && s.name == "Deleted"),
+            "Expected enum class value Deleted, got: {:?}",
             symbols
         );
     }
@@ -1336,6 +1426,13 @@ namespace arcanum {
         assert!(
             symbols
                 .iter()
+                .any(|s| s.kind == SymbolKind::Constant && s.name == "Fast"),
+            "Expected enum class value Fast, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
                 .any(|s| s.kind == SymbolKind::Function && s.name == "makeClient"),
             "Expected function makeClient, got: {:?}",
             symbols
@@ -1452,6 +1549,27 @@ enum class Color : uint8_t {
                 .iter()
                 .any(|s| s.kind == SymbolKind::Enum && s.name == "Color"),
             "Expected enum class Color with underlying type, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Constant && s.name == "Red"),
+            "Expected enum class value Red, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Constant && s.name == "Green"),
+            "Expected enum class value Green, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Constant && s.name == "Blue"),
+            "Expected enum class value Blue, got: {:?}",
             symbols
         );
     }
@@ -1573,6 +1691,18 @@ using StringRef = const std::string&;
         assert!(symbols
             .iter()
             .any(|s| s.kind == SymbolKind::Enum && s.name == "LogLevel"));
+        assert!(symbols
+            .iter()
+            .any(|s| s.kind == SymbolKind::Constant && s.name == "Debug"));
+        assert!(symbols
+            .iter()
+            .any(|s| s.kind == SymbolKind::Constant && s.name == "Info"));
+        assert!(symbols
+            .iter()
+            .any(|s| s.kind == SymbolKind::Constant && s.name == "Warning"));
+        assert!(symbols
+            .iter()
+            .any(|s| s.kind == SymbolKind::Constant && s.name == "Error"));
 
         // Class
         assert!(symbols

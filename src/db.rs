@@ -766,6 +766,43 @@ pub fn find_symbols_by_name(
             return Ok(results);
         }
 
+        let suffix_query = if kind.is_some() {
+            r#"
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+            FROM symbols s
+            JOIN files f ON s.file_id = f.id
+            WHERE s.qualified_name LIKE ?1 AND s.kind = ?2
+            ORDER BY length(s.qualified_name)
+            LIMIT ?3
+            "#
+        } else {
+            r#"
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+            FROM symbols s
+            JOIN files f ON s.file_id = f.id
+            WHERE s.qualified_name LIKE ?1
+            ORDER BY length(s.qualified_name)
+            LIMIT ?2
+            "#
+        };
+
+        let mut stmt = conn.prepare(suffix_query)?;
+        let suffix_pattern = format!("%::{}", name);
+        let results = if let Some(k) = kind {
+            stmt.query_map(
+                params![suffix_pattern, k, limit as i64],
+                row_to_search_result,
+            )?
+            .collect::<Result<Vec<_>, _>>()?
+        } else {
+            stmt.query_map(params![suffix_pattern, limit as i64], row_to_search_result)?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        if !results.is_empty() {
+            return Ok(results);
+        }
+
         let prefix_query = if kind.is_some() {
             r#"
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
@@ -821,10 +858,10 @@ pub fn find_symbols_by_name(
 
     let results: Vec<SearchResult> = if let Some(k) = kind {
         stmt.query_map(params![name, k, limit as i64], row_to_search_result)?
-        .collect::<Result<Vec<_>, _>>()?
+            .collect::<Result<Vec<_>, _>>()?
     } else {
         stmt.query_map(params![name, limit as i64], row_to_search_result)?
-        .collect::<Result<Vec<_>, _>>()?
+            .collect::<Result<Vec<_>, _>>()?
     };
 
     // If no exact match, try prefix match
@@ -853,10 +890,10 @@ pub fn find_symbols_by_name(
         let mut stmt = conn.prepare(prefix_query)?;
         let results: Vec<SearchResult> = if let Some(k) = kind {
             stmt.query_map(params![pattern, k, limit as i64], row_to_search_result)?
-            .collect::<Result<Vec<_>, _>>()?
+                .collect::<Result<Vec<_>, _>>()?
         } else {
             stmt.query_map(params![pattern, limit as i64], row_to_search_result)?
-            .collect::<Result<Vec<_>, _>>()?
+                .collect::<Result<Vec<_>, _>>()?
         };
         return Ok(results);
     }
@@ -901,6 +938,25 @@ pub fn find_class_like(conn: &Connection, name: &str, limit: usize) -> Result<Ve
             .collect::<Result<Vec<_>, _>>()?;
         if !exact.is_empty() {
             return Ok(exact);
+        }
+
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+            FROM symbols s
+            JOIN files f ON s.file_id = f.id
+            WHERE s.qualified_name LIKE ?1
+              AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')
+            ORDER BY length(s.qualified_name), s.qualified_name
+            LIMIT ?2
+            "#,
+        )?;
+        let suffix_pattern = format!("%::{}", name);
+        let suffix = stmt
+            .query_map(params![suffix_pattern, limit as i64], row_to_search_result)?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !suffix.is_empty() {
+            return Ok(suffix);
         }
 
         let mut stmt = conn.prepare(
@@ -970,6 +1026,12 @@ pub fn find_class_like_pattern(
     } else {
         like_pattern.to_string()
     };
+    let suffix_pattern =
+        if qualified && !like_pattern.starts_with('%') && !like_pattern.starts_with("::") {
+            Some(format!("%::{}", like_pattern))
+        } else {
+            None
+        };
     let name_expr = if qualified {
         "COALESCE(s.qualified_name, s.name)"
     } else {
@@ -981,20 +1043,28 @@ pub fn find_class_like_pattern(
         SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
         FROM symbols s
         JOIN files f ON s.file_id = f.id
-        WHERE {} LIKE ?1 ESCAPE '\' AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package'){}
+        WHERE ({} LIKE ?1 ESCAPE '\'{} ) AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package'){}
         ORDER BY length({}), {}
         LIMIT ?{}
         "#,
         name_expr,
+        if suffix_pattern.is_some() {
+            format!(" OR {} LIKE ?2 ESCAPE '\\'", name_expr)
+        } else {
+            String::new()
+        },
         scope_clause,
         name_expr,
         name_expr,
-        2 + scope_params.len()
+        2 + scope_params.len() + usize::from(suffix_pattern.is_some())
     );
 
     let mut stmt = conn.prepare(&sql)?;
     let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
     all_params.push(Box::new(search_pattern));
+    if let Some(suffix_pattern) = suffix_pattern {
+        all_params.push(Box::new(suffix_pattern));
+    }
     for p in &scope_params {
         all_params.push(Box::new(p.clone()));
     }
@@ -1024,6 +1094,12 @@ pub fn find_symbols_by_pattern(
     } else {
         like_pattern.to_string()
     };
+    let suffix_pattern =
+        if qualified && !like_pattern.starts_with('%') && !like_pattern.starts_with("::") {
+            Some(format!("%::{}", like_pattern))
+        } else {
+            None
+        };
     let name_expr = if qualified {
         "COALESCE(s.qualified_name, s.name)"
     } else {
@@ -1047,21 +1123,29 @@ pub fn find_symbols_by_pattern(
         SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
         FROM symbols s
         JOIN files f ON s.file_id = f.id
-        WHERE {} LIKE ?1 ESCAPE '\'{}{}
+        WHERE ({} LIKE ?1 ESCAPE '\'{} ){}{}
         ORDER BY length({}), {}
         LIMIT ?{}
         "#,
         name_expr,
+        if suffix_pattern.is_some() {
+            format!(" OR {} LIKE ?2 ESCAPE '\\'", name_expr)
+        } else {
+            String::new()
+        },
         scope_clause,
         kind_clause,
         name_expr,
         name_expr,
-        limit_idx
+        limit_idx + usize::from(suffix_pattern.is_some())
     );
 
     let mut stmt = conn.prepare(&sql)?;
     let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
     all_params.push(Box::new(search_pattern));
+    if let Some(suffix_pattern) = suffix_pattern {
+        all_params.push(Box::new(suffix_pattern));
+    }
     for p in &scope_params {
         all_params.push(Box::new(p.clone()));
     }
@@ -1106,7 +1190,12 @@ pub fn find_implementations(
 
     let results = stmt
         .query_map(
-            params![parent_name, suffix_pattern, namespace_suffix_pattern, limit as i64],
+            params![
+                parent_name,
+                suffix_pattern,
+                namespace_suffix_pattern,
+                limit as i64
+            ],
             row_to_search_result,
         )?
         .collect::<Result<Vec<_>, _>>()?;
@@ -1643,6 +1732,37 @@ pub fn find_symbols_by_name_scoped(
 
         let mut stmt = conn.prepare(&sql)?;
         let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        all_params.push(Box::new(format!("%::{}", name)));
+        for p in &scope_params {
+            all_params.push(Box::new(p.clone()));
+        }
+        if let Some(k) = kind {
+            all_params.push(Box::new(k.to_string()));
+        }
+        all_params.push(Box::new(limit as i64));
+
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            all_params.iter().map(|p| p.as_ref()).collect();
+        let suffix = stmt
+            .query_map(param_refs.as_slice(), row_to_search_result)?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !suffix.is_empty() {
+            return Ok(suffix);
+        }
+
+        let mut sql = format!(
+            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path FROM symbols s JOIN files f ON s.file_id = f.id WHERE s.qualified_name LIKE ?1{}",
+            scope_clause
+        );
+        if kind.is_some() {
+            sql.push_str(&format!(" AND s.kind = ?{}", 2 + scope_params.len()));
+            sql.push_str(&format!(" LIMIT ?{}", 3 + scope_params.len()));
+        } else {
+            sql.push_str(&format!(" LIMIT ?{}", 2 + scope_params.len()));
+        }
+
+        let mut stmt = conn.prepare(&sql)?;
+        let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         all_params.push(Box::new(format!("{name}%")));
         for p in &scope_params {
             all_params.push(Box::new(p.clone()));
@@ -1741,6 +1861,32 @@ pub fn find_class_like_scoped(
     let results = stmt
         .query_map(param_refs.as_slice(), row_to_search_result)?
         .collect::<Result<Vec<_>, _>>()?;
+
+    if results.is_empty() && name.contains("::") && !name.starts_with("::") {
+        let sql = format!(
+            r#"
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+            FROM symbols s
+            JOIN files f ON s.file_id = f.id
+            WHERE s.qualified_name LIKE ?1 AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package'){}
+            LIMIT ?{}
+            "#,
+            scope_clause,
+            2 + scope_params.len()
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        all_params.push(Box::new(format!("%::{}", name)));
+        for p in &scope_params {
+            all_params.push(Box::new(p.clone()));
+        }
+        all_params.push(Box::new(limit as i64));
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            all_params.iter().map(|p| p.as_ref()).collect();
+        return Ok(stmt
+            .query_map(param_refs.as_slice(), row_to_search_result)?
+            .collect::<Result<Vec<_>, _>>()?);
+    }
 
     Ok(results)
 }
@@ -2277,6 +2423,40 @@ mod tests {
             find_symbols_by_pattern(&conn, "%::Extra", None, 10, &SearchScope::none()).unwrap();
         assert_eq!(suffix.len(), 1);
         assert_eq!(suffix[0].qualified_name.as_deref(), Some("foo::bar::Extra"));
+    }
+
+    #[test]
+    fn test_find_enum_value_by_bare_and_qualified_name() {
+        let conn = create_test_db();
+        let file_id = upsert_file(&conn, "src/acceptance_operation.cpp", 1000, 100).unwrap();
+        insert_symbol(
+            &conn,
+            file_id,
+            "kAntifraud",
+            SymbolKind::Constant,
+            24,
+            Some("kAntifraud,"),
+        )
+        .unwrap();
+        set_qualified_name(
+            &conn,
+            "kAntifraud",
+            "db::AcceptanceOperationInitiator::kAntifraud",
+        );
+
+        let bare = find_symbols_by_name(&conn, "kAntifraud", None, 10).unwrap();
+        assert_eq!(bare.len(), 1);
+        assert_eq!(bare[0].name, "kAntifraud");
+
+        let qualified =
+            find_symbols_by_name(&conn, "AcceptanceOperationInitiator::kAntifraud", None, 10)
+                .unwrap();
+        assert_eq!(qualified.len(), 1);
+        assert_eq!(qualified[0].name, "kAntifraud");
+
+        let suffix = find_symbols_by_name(&conn, "::kAntifraud", None, 10).unwrap();
+        assert_eq!(suffix.len(), 1);
+        assert_eq!(suffix[0].name, "kAntifraud");
     }
 
     #[test]
