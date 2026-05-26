@@ -586,6 +586,13 @@ exclude:
 
 ## Changelog
 
+### 3.44.0
+- **Add namespace-aware C++ symbol search without breaking bare lookups** — `symbol Client` still finds all matching classes, while `symbol arcanum::Client`, `symbol -p '::Client'`, and `symbol -p 'foo::bar*'` now narrow by fully-qualified names and print qualified results to disambiguate duplicate class names across namespaces
+- **Expand `module-route` diagnostics and graph output** — `module-route` now returns clearer empty/truncated reasons, better timeout handling, self-edge handling, `json`/`mermaid`/`dot` output, and stronger regression coverage for large fanout graphs
+- **Harden rebuild/update management paths** — `query` now blocks mutation SQL while still allowing `SELECT`, `WITH`, and `EXPLAIN`; `update` now preserves extra roots, respects `include` allow-lists, and keeps root-level files intact in sub-project rebuild mode
+- **Improve TypeScript/Vue and general parser coverage** — better extraction for Vue Composition API / Pinia / script-setup patterns, broader parser/test coverage across multiple languages, and more reliable file-oriented commands
+- **Make safe rebuild optimizations the default and add benchmarks** — full rebuilds now always bulk-load into a thin schema before creating indexes/FTS, use a slightly larger SQLite cache during rebuild, and ship baseline Criterion benches for rebuild, update, module graph, and Android XML/resource phases
+
 ### 3.43.2
 - **Preserve root-level files in sub-project rebuilds** — experimental fast rebuild no longer drops files and module markers that live directly under the selected root when it switches large monorepos into sub-project mode
 
