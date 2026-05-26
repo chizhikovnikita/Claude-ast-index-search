@@ -65,7 +65,7 @@ pub fn cmd_search(
     let per_term_limit = if terms.len() > 1 { limit } else { limit };
 
     // Collect results from all terms, deduplicating
-    let mut files: Vec<String> = vec![];
+    let mut files: Vec<db::FileResult> = vec![];
     let mut symbols: Vec<db::SearchResult> = vec![];
     let mut ref_matches: Vec<(String, i64)> = vec![];
     let mut content_matches: Vec<(String, usize, String)> = vec![];
@@ -77,12 +77,16 @@ pub fn cmd_search(
 
     // 1. Search in file paths (index)
     for term in &terms {
-        let mut term_files = db::find_files(&conn, term, per_term_limit)?;
+        let mut term_files = db::find_files_with_roots(&conn, term, per_term_limit)?;
         if let Some(prefix) = scope.dir_prefix {
-            term_files.retain(|f| f.starts_with(prefix));
+            term_files.retain(|f| f.path.starts_with(prefix));
         }
         for f in term_files {
-            if seen_files.insert(f.clone()) {
+            if seen_files.insert(format!(
+                "{}\u{1f}|{}",
+                f.root_path.as_deref().unwrap_or(""),
+                f.path
+            )) {
                 files.push(f);
             }
         }
@@ -98,7 +102,13 @@ pub fn cmd_search(
             db::search_symbols_scoped(&conn, &fts_query, fetch_limit, scope)?
         };
         for s in raw {
-            let key = format!("{}:{}:{}", s.path, s.line, s.name);
+            let key = format!(
+                "{}\u{1f}|{}:{}:{}",
+                s.root_path.as_deref().unwrap_or(""),
+                s.path,
+                s.line,
+                s.name
+            );
             if seen_symbols.insert(key) {
                 if let Some(kf) = kind_filter {
                     if s.kind == kf {
@@ -165,11 +175,12 @@ pub fn cmd_search(
     )?;
 
     let resolver = PathResolver::from_conn(root, &conn);
-    for p in &mut files {
-        *p = resolver.resolve(p);
-    }
+    let files: Vec<String> = files
+        .into_iter()
+        .map(|file| resolver.resolve_with_root(&file.path, file.root_path.as_deref()))
+        .collect();
     for s in &mut symbols {
-        s.path = resolver.resolve(&s.path);
+        s.path = resolver.resolve_with_root(&s.path, s.root_path.as_deref());
     }
     for m in &mut content_matches {
         m.0 = resolver.resolve(&m.0);
@@ -286,7 +297,7 @@ pub fn cmd_symbol(
 
     let resolver = PathResolver::from_conn(root, &conn);
     for s in &mut symbols {
-        s.path = resolver.resolve(&s.path);
+        s.path = resolver.resolve_with_root(&s.path, s.root_path.as_deref());
     }
 
     if format == "json" {
@@ -379,7 +390,7 @@ pub fn cmd_class(
 
     let resolver = PathResolver::from_conn(root, &conn);
     for s in &mut results {
-        s.path = resolver.resolve(&s.path);
+        s.path = resolver.resolve_with_root(&s.path, s.root_path.as_deref());
     }
 
     if format == "json" {
@@ -461,7 +472,7 @@ pub fn cmd_implementations(
 
     let resolver = PathResolver::from_conn(root, &conn);
     for s in &mut impls {
-        s.path = resolver.resolve(&s.path);
+        s.path = resolver.resolve_with_root(&s.path, s.root_path.as_deref());
     }
 
     if format == "json" {
@@ -504,13 +515,13 @@ pub fn cmd_refs(root: &Path, symbol: &str, limit: usize, format: &str) -> Result
 
     let resolver = PathResolver::from_conn(root, &conn);
     for s in &mut definitions {
-        s.path = resolver.resolve(&s.path);
+        s.path = resolver.resolve_with_root(&s.path, s.root_path.as_deref());
     }
     for s in &mut imports {
-        s.path = resolver.resolve(&s.path);
+        s.path = resolver.resolve_with_root(&s.path, s.root_path.as_deref());
     }
     for r in &mut usages {
-        r.path = resolver.resolve(&r.path);
+        r.path = resolver.resolve_with_root(&r.path, r.root_path.as_deref());
     }
 
     if format == "json" {
@@ -645,7 +656,7 @@ pub fn cmd_hierarchy(root: &Path, name: &str, limit: usize, scope: &SearchScope)
     };
     let resolver = PathResolver::from_conn(root, &conn);
     for c in &mut children {
-        c.path = resolver.resolve(&c.path);
+        c.path = resolver.resolve_with_root(&c.path, c.root_path.as_deref());
     }
     if !children.is_empty() {
         let header = if scope.is_empty() && total > children.len() {
@@ -702,7 +713,7 @@ pub fn cmd_usages(
             let mut refs = db::find_references_scoped(&conn, symbol, limit, scope)?;
             let resolver = PathResolver::from_conn(root, &conn);
             for r in &mut refs {
-                r.path = resolver.resolve(&r.path);
+                r.path = resolver.resolve_with_root(&r.path, r.root_path.as_deref());
             }
 
             if format == "json" {

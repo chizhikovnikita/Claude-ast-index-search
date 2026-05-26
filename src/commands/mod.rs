@@ -49,18 +49,24 @@ use crate::db;
 /// root in order and returns the first absolute path that exists on disk.
 pub struct PathResolver {
     primary: PathBuf,
-    extra: Vec<PathBuf>,
+    primary_key: String,
+    extra: Vec<(String, PathBuf)>,
 }
 
 impl PathResolver {
     pub fn from_conn(primary: &Path, conn: &Connection) -> Self {
+        let primary_key = db::normalize_root_for_storage(primary);
         let extra = db::get_extra_roots(conn)
             .unwrap_or_default()
             .into_iter()
-            .map(PathBuf::from)
+            .map(|root| {
+                let path = PathBuf::from(&root);
+                (db::normalize_root_for_storage(&path), path)
+            })
             .collect();
         Self {
             primary: primary.to_path_buf(),
+            primary_key,
             extra,
         }
     }
@@ -74,13 +80,44 @@ impl PathResolver {
         if self.extra.is_empty() {
             return rel.to_string();
         }
-        for root in std::iter::once(&self.primary).chain(self.extra.iter()) {
+        for root in std::iter::once(&self.primary).chain(self.extra.iter().map(|(_, path)| path)) {
             let abs = root.join(rel);
             if abs.exists() {
                 return abs.to_string_lossy().into_owned();
             }
         }
         rel.to_string()
+    }
+
+    /// Absolute path of a stored relative path when the owning root is known.
+    /// Falls back to generic probing when the hint is absent or stale.
+    pub fn resolve_with_root(&self, rel: &str, root_path: Option<&str>) -> String {
+        if self.extra.is_empty() {
+            return rel.to_string();
+        }
+
+        if let Some(root_path) = root_path {
+            if root_path == self.primary_key {
+                let abs = self.primary.join(rel);
+                if abs.exists() {
+                    return abs.to_string_lossy().into_owned();
+                }
+                return self.resolve(rel);
+            }
+            if let Some((_, root)) = self.extra.iter().find(|(key, _)| key == root_path) {
+                let abs = root.join(rel);
+                if abs.exists() {
+                    return abs.to_string_lossy().into_owned();
+                }
+                return self.resolve(rel);
+            }
+            let abs = PathBuf::from(root_path).join(rel);
+            if abs.exists() {
+                return abs.to_string_lossy().into_owned();
+            }
+        }
+
+        self.resolve(rel)
     }
 }
 

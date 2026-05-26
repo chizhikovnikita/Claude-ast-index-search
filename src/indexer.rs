@@ -543,6 +543,7 @@ pub fn detect_project_type(root: &Path) -> ProjectType {
 /// Parsed file data for parallel processing
 struct ParsedFile {
     rel_path: String,
+    root_path: String,
     mtime: i64,
     size: i64,
     symbols: Vec<ParsedSymbol>,
@@ -558,6 +559,7 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
         .duration_since(SystemTime::UNIX_EPOCH)?
         .as_secs() as i64;
     let size = metadata.len() as i64;
+    let root_path = db::normalize_root_for_storage(root);
 
     let rel_path = file_path
         .strip_prefix(root)
@@ -569,6 +571,7 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
     if size > 1_000_000 {
         return Ok(ParsedFile {
             rel_path,
+            root_path,
             mtime,
             size,
             symbols: vec![],
@@ -590,6 +593,7 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
         None => {
             return Ok(ParsedFile {
                 rel_path,
+                root_path,
                 mtime,
                 size,
                 symbols: vec![],
@@ -622,6 +626,7 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
 
     Ok(ParsedFile {
         rel_path,
+        root_path,
         mtime,
         size,
         symbols,
@@ -1342,9 +1347,11 @@ fn write_batch_to_db(
 
     {
         let file_sql = match mode {
-            WriteMode::FreshRebuild => "INSERT INTO files (path, mtime, size) VALUES (?1, ?2, ?3)",
+            WriteMode::FreshRebuild => {
+                "INSERT INTO files (path, root_path, mtime, size) VALUES (?1, ?2, ?3, ?4)"
+            }
             WriteMode::ReplaceExisting => {
-                "INSERT OR REPLACE INTO files (path, mtime, size) VALUES (?1, ?2, ?3)"
+                "INSERT OR REPLACE INTO files (path, root_path, mtime, size) VALUES (?1, ?2, ?3, ?4)"
             }
         };
         let mut file_stmt = tx.prepare_cached(file_sql)?;
@@ -1361,6 +1368,7 @@ fn write_batch_to_db(
         for pf in batch {
             let ParsedFile {
                 rel_path,
+                root_path,
                 mtime,
                 size,
                 symbols,
@@ -1368,15 +1376,18 @@ fn write_batch_to_db(
                 refs,
             } = pf;
 
-            file_stmt.execute(rusqlite::params![rel_path, mtime, size])?;
+            file_stmt.execute(rusqlite::params![rel_path, root_path, mtime, size])?;
             let file_id = tx.last_insert_rowid();
             // `INSERT OR REPLACE` on `files.path` drops the previous file row first, and
             // `ON DELETE CASCADE` clears old symbols/refs automatically. Explicit deletes
             // here only add extra work, especially during full rebuilds on a fresh DB.
 
             for sym in symbols {
-                let qualified_name =
-                    qualified_names.get(&(sym.kind.as_str().to_string(), sym.line, sym.name.clone()));
+                let qualified_name = qualified_names.get(&(
+                    sym.kind.as_str().to_string(),
+                    sym.line,
+                    sym.name.clone(),
+                ));
                 sym_stmt.execute(rusqlite::params![
                     file_id,
                     sym.name,
@@ -1432,19 +1443,20 @@ pub fn update_directory_incremental(
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     // 1. Load existing files from DB with their mtime
-    let mut existing_files: HashMap<String, (i64, i64)> = HashMap::new(); // path -> (file_id, mtime)
+    let mut existing_files: HashMap<(String, String), (i64, i64)> = HashMap::new(); // (root_path, path) -> (file_id, mtime)
     {
-        let mut stmt = conn.prepare("SELECT id, path, mtime FROM files")?;
+        let mut stmt = conn.prepare("SELECT id, root_path, path, mtime FROM files")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
             ))
         })?;
         for row in rows {
-            let (id, path, mtime) = row?;
-            existing_files.insert(path, (id, mtime));
+            let (id, root_path, path, mtime) = row?;
+            existing_files.insert((root_path, path), (id, mtime));
         }
     }
 
@@ -1487,7 +1499,8 @@ pub fn update_directory_incremental(
     // 3. Walk each (walk_dir, anchor) pair and categorize its files. Paths are
     //    stored relative to `anchor`, matching `index_directory_scoped`'s scheme.
     let mut files_to_parse: Vec<(PathBuf, PathBuf)> = Vec::new(); // (anchor, file_path)
-    let mut current_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut current_paths: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
 
     for (walk_dir, anchor) in &walk_specs {
         let is_git = has_git_repo(walk_dir) || has_git_repo(anchor);
@@ -1536,6 +1549,7 @@ pub fn update_directory_incremental(
                 .unwrap_or(&file_path)
                 .to_string_lossy()
                 .to_string();
+            let root_key = db::normalize_root_for_storage(anchor);
 
             let file_mtime = fs::metadata(&file_path)
                 .and_then(|m| m.modified())
@@ -1544,7 +1558,7 @@ pub fn update_directory_incremental(
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
 
-            let need_parse = match existing_files.get(&rel_path) {
+            let need_parse = match existing_files.get(&(root_key.clone(), rel_path.clone())) {
                 Some((_, db_mtime)) => file_mtime > *db_mtime,
                 None => true,
             };
@@ -1552,12 +1566,12 @@ pub fn update_directory_incremental(
             if need_parse {
                 files_to_parse.push((anchor.clone(), file_path));
             }
-            current_paths.insert(rel_path);
+            current_paths.insert((root_key, rel_path));
         }
     }
 
     // 4. Find deleted files
-    let deleted_paths: Vec<String> = existing_files
+    let deleted_paths: Vec<(String, String)> = existing_files
         .keys()
         .filter(|p| !current_paths.contains(*p))
         .cloned()
@@ -1575,9 +1589,10 @@ pub fn update_directory_incremental(
     if !deleted_paths.is_empty() {
         let tx = conn.transaction()?;
         {
-            let mut del_file_stmt = tx.prepare_cached("DELETE FROM files WHERE path = ?1")?;
-            for path in &deleted_paths {
-                del_file_stmt.execute(rusqlite::params![path])?;
+            let mut del_file_stmt =
+                tx.prepare_cached("DELETE FROM files WHERE root_path = ?1 AND path = ?2")?;
+            for (root_path, path) in &deleted_paths {
+                del_file_stmt.execute(rusqlite::params![root_path, path])?;
             }
         }
         tx.commit()?;
@@ -3883,16 +3898,18 @@ pub fn index_node_modules_dts(conn: &mut Connection, root: &Path, progress: bool
         .map_err(|e| anyhow::anyhow!("Failed to build thread pool: {}", e))?;
 
     let mut total_count = 0;
+    let root_path = db::normalize_root_for_storage(root);
 
     for chunk in dts_files.chunks(chunk_size) {
         let counter = parsed_global.clone();
         let total = total_files;
+        let root_path = root_path.clone();
 
         let parsed_files: Vec<ParsedFile> = pool.install(|| {
             chunk
                 .par_iter()
                 .filter_map(|(abs_path, rel_path)| {
-                    let result = parse_dts_file(abs_path, rel_path).ok();
+                    let result = parse_dts_file(abs_path, rel_path, &root_path).ok();
                     let c = counter.fetch_add(1, Ordering::Relaxed) + 1;
                     if progress && c % 1000 == 0 {
                         eprintln!("Parsed {} / {} .d.ts files...", c, total);
@@ -3918,7 +3935,7 @@ pub fn index_node_modules_dts(conn: &mut Connection, root: &Path, progress: bool
 }
 
 /// Parse a .d.ts file with an explicit relative path (for pnpm store paths)
-fn parse_dts_file(file_path: &Path, rel_path: &str) -> Result<ParsedFile> {
+fn parse_dts_file(file_path: &Path, rel_path: &str, root_path: &str) -> Result<ParsedFile> {
     let metadata = fs::metadata(file_path)?;
     let mtime = metadata
         .modified()?
@@ -3930,6 +3947,7 @@ fn parse_dts_file(file_path: &Path, rel_path: &str) -> Result<ParsedFile> {
     if size > 1_000_000 {
         return Ok(ParsedFile {
             rel_path: rel_path.to_string(),
+            root_path: root_path.to_string(),
             mtime,
             size,
             symbols: vec![],
@@ -3943,6 +3961,7 @@ fn parse_dts_file(file_path: &Path, rel_path: &str) -> Result<ParsedFile> {
 
     Ok(ParsedFile {
         rel_path: rel_path.to_string(),
+        root_path: root_path.to_string(),
         mtime,
         size,
         symbols,

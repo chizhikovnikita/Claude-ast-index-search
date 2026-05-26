@@ -586,6 +586,9 @@ exclude:
 
 ## Changelog
 
+### 3.44.2
+- **Allow colliding relative paths across extra roots without crashing rebuild** — files are now keyed by both owning root and relative path, so `rebuild`/`update` no longer fail with `UNIQUE constraint failed: files.path` when the primary root and an extra root both contain files like `Workspace.swift` or `Geko/Config.swift`; path resolution now also preserves the correct absolute file for each root
+
 ### 3.44.1
 - **Index C++ enum values and relax symbol CLI compatibility** — C++ enumerators like `kAntifraud` are now indexed as constants, so `symbol kAntifraud`, `symbol AcceptanceOperationInitiator::kAntifraud`, `symbol ::kAntifraud`, and wildcard forms such as `symbol AcceptanceOperationInitiator::*` work without forcing users to switch to `-p`
 

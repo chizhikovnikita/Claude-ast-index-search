@@ -59,7 +59,12 @@ pub fn cmd_file(root: &Path, pattern: &str, exact: bool, limit: usize) -> Result
     } else {
         pattern.to_string()
     };
-    let files = db::find_files(&conn, &search_pattern, limit)?;
+    let files = db::find_files_with_roots(&conn, &search_pattern, limit)?;
+    let resolver = super::PathResolver::from_conn(root, &conn);
+    let files: Vec<String> = files
+        .into_iter()
+        .map(|file| resolver.resolve_with_root(&file.path, file.root_path.as_deref()))
+        .collect();
 
     println!("{}", format!("Files matching '{}':", pattern).bold());
 

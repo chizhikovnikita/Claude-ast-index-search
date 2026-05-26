@@ -76,6 +76,7 @@ pub fn cmd_unused_symbols(
                 line: row.get(3)?,
                 signature: row.get(4)?,
                 path: row.get(5)?,
+                root_path: None,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?
@@ -88,6 +89,7 @@ pub fn cmd_unused_symbols(
                 line: row.get(3)?,
                 signature: row.get(4)?,
                 path: row.get(5)?,
+                root_path: None,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?

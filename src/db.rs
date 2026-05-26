@@ -16,6 +16,11 @@ fn normalize_root(project_root: &Path) -> String {
         .into_owned()
 }
 
+/// Stable storage key for a root that owns indexed relative paths.
+pub fn normalize_root_for_storage(project_root: &Path) -> String {
+    normalize_root(project_root)
+}
+
 /// Get the database path for the current project
 pub fn get_db_path(project_root: &Path) -> Result<PathBuf> {
     // Check env: new name first, fallback to old
@@ -183,9 +188,11 @@ fn create_base_schema(conn: &Connection) -> Result<()> {
         -- Files table
         CREATE TABLE IF NOT EXISTS files (
             id INTEGER PRIMARY KEY,
-            path TEXT NOT NULL UNIQUE,
+            path TEXT NOT NULL,
+            root_path TEXT NOT NULL DEFAULT '',
             mtime INTEGER NOT NULL,
-            size INTEGER NOT NULL
+            size INTEGER NOT NULL,
+            UNIQUE(root_path, path)
         );
 
         -- Symbols table (classes, interfaces, functions, etc.)
@@ -328,6 +335,7 @@ fn create_secondary_indexes(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
         CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);
+        CREATE INDEX IF NOT EXISTS idx_files_root_path_path ON files(root_path, path);
         CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
         CREATE INDEX IF NOT EXISTS idx_symbols_qualified_name ON symbols(qualified_name);
         CREATE INDEX IF NOT EXISTS idx_symbols_kind ON symbols(kind);
@@ -448,6 +456,12 @@ pub fn open_db(project_root: &Path) -> Result<Connection> {
     conn.execute(
         "INSERT OR REPLACE INTO metadata (key, value) VALUES ('project_root', ?1)",
         params![&normalized],
+    )
+    .ok();
+
+    conn.execute(
+        "ALTER TABLE files ADD COLUMN root_path TEXT NOT NULL DEFAULT ''",
+        [],
     )
     .ok();
 
@@ -593,7 +607,7 @@ pub fn search_symbols(conn: &Connection, query: &str, limit: usize) -> Result<Ve
         let (sql, value) = if query.starts_with("::") {
             (
                 r#"
-                SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+                SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
                 FROM symbols s
                 JOIN files f ON s.file_id = f.id
                 WHERE s.qualified_name LIKE ?1
@@ -605,7 +619,7 @@ pub fn search_symbols(conn: &Connection, query: &str, limit: usize) -> Result<Ve
         } else if query.ends_with('*') {
             (
                 r#"
-                SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+                SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
                 FROM symbols s
                 JOIN files f ON s.file_id = f.id
                 WHERE s.qualified_name LIKE ?1
@@ -617,7 +631,7 @@ pub fn search_symbols(conn: &Connection, query: &str, limit: usize) -> Result<Ve
         } else {
             (
                 r#"
-                SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+                SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
                 FROM symbols s
                 JOIN files f ON s.file_id = f.id
                 WHERE s.qualified_name = ?1
@@ -637,7 +651,7 @@ pub fn search_symbols(conn: &Connection, query: &str, limit: usize) -> Result<Ve
 
     let mut stmt = conn.prepare(
         r#"
-        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
         FROM symbols_fts fts
         JOIN symbols s ON fts.rowid = s.id
         JOIN files f ON s.file_id = f.id
@@ -663,6 +677,8 @@ pub struct SearchResult {
     pub line: i64,
     pub signature: Option<String>,
     pub path: String,
+    #[serde(skip_serializing)]
+    pub root_path: Option<String>,
 }
 
 impl SearchResult {
@@ -672,6 +688,11 @@ impl SearchResult {
 }
 
 fn row_to_search_result(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchResult> {
+    let root_path = if row.as_ref().column_count() > 6 {
+        row.get::<_, Option<String>>(6)?.filter(|s| !s.is_empty())
+    } else {
+        None
+    };
     Ok(SearchResult {
         name: row.get(0)?,
         qualified_name: row.get(1)?,
@@ -679,7 +700,15 @@ fn row_to_search_result(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchResul
         line: row.get(3)?,
         signature: row.get(4)?,
         path: row.get(5)?,
+        root_path,
     })
+}
+
+#[derive(Debug, Serialize)]
+pub struct FileResult {
+    pub path: String,
+    #[serde(skip_serializing)]
+    pub root_path: Option<String>,
 }
 
 /// Find files by name pattern
@@ -689,6 +718,26 @@ pub fn find_files(conn: &Connection, pattern: &str, limit: usize) -> Result<Vec<
     let pattern = format!("%{}%", pattern);
     let results = stmt
         .query_map(params![pattern, limit as i64], |row| row.get(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(results)
+}
+
+pub fn find_files_with_roots(
+    conn: &Connection,
+    pattern: &str,
+    limit: usize,
+) -> Result<Vec<FileResult>> {
+    let mut stmt = conn.prepare("SELECT path, root_path FROM files WHERE path LIKE ?1 LIMIT ?2")?;
+
+    let pattern = format!("%{}%", pattern);
+    let results = stmt
+        .query_map(params![pattern, limit as i64], |row| {
+            Ok(FileResult {
+                path: row.get(0)?,
+                root_path: row.get::<_, Option<String>>(1)?.filter(|s| !s.is_empty()),
+            })
+        })?
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(results)
@@ -704,7 +753,7 @@ pub fn find_symbols_by_name(
     if name.starts_with("::") {
         let exact_query = if kind.is_some() {
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE s.qualified_name LIKE ?1 AND s.kind = ?2
@@ -713,7 +762,7 @@ pub fn find_symbols_by_name(
             "#
         } else {
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE s.qualified_name LIKE ?1
@@ -737,7 +786,7 @@ pub fn find_symbols_by_name(
     if name.contains("::") {
         let exact_query = if kind.is_some() {
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE s.qualified_name = ?1 AND s.kind = ?2
@@ -745,7 +794,7 @@ pub fn find_symbols_by_name(
             "#
         } else {
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE s.qualified_name = ?1
@@ -768,7 +817,7 @@ pub fn find_symbols_by_name(
 
         let suffix_query = if kind.is_some() {
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE s.qualified_name LIKE ?1 AND s.kind = ?2
@@ -777,7 +826,7 @@ pub fn find_symbols_by_name(
             "#
         } else {
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE s.qualified_name LIKE ?1
@@ -805,7 +854,7 @@ pub fn find_symbols_by_name(
 
         let prefix_query = if kind.is_some() {
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE s.qualified_name LIKE ?1 AND s.kind = ?2
@@ -814,7 +863,7 @@ pub fn find_symbols_by_name(
             "#
         } else {
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE s.qualified_name LIKE ?1
@@ -838,7 +887,7 @@ pub fn find_symbols_by_name(
     // Try exact match first
     let exact_query = if kind.is_some() {
         r#"
-        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
         FROM symbols s
         JOIN files f ON s.file_id = f.id
         WHERE s.name = ?1 AND s.kind = ?2
@@ -846,7 +895,7 @@ pub fn find_symbols_by_name(
         "#
     } else {
         r#"
-        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
         FROM symbols s
         JOIN files f ON s.file_id = f.id
         WHERE s.name = ?1
@@ -869,7 +918,7 @@ pub fn find_symbols_by_name(
         let pattern = format!("{}%", name);
         let prefix_query = if kind.is_some() {
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE s.name LIKE ?1 AND s.kind = ?2
@@ -878,7 +927,7 @@ pub fn find_symbols_by_name(
             "#
         } else {
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE s.name LIKE ?1
@@ -906,7 +955,7 @@ pub fn find_class_like(conn: &Connection, name: &str, limit: usize) -> Result<Ve
     if name.starts_with("::") {
         let mut stmt = conn.prepare(
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE s.qualified_name LIKE ?1
@@ -924,7 +973,7 @@ pub fn find_class_like(conn: &Connection, name: &str, limit: usize) -> Result<Ve
     if name.contains("::") {
         let mut stmt = conn.prepare(
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE s.qualified_name = ?1
@@ -942,7 +991,7 @@ pub fn find_class_like(conn: &Connection, name: &str, limit: usize) -> Result<Ve
 
         let mut stmt = conn.prepare(
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE s.qualified_name LIKE ?1
@@ -961,7 +1010,7 @@ pub fn find_class_like(conn: &Connection, name: &str, limit: usize) -> Result<Ve
 
         let mut stmt = conn.prepare(
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE s.qualified_name LIKE ?1
@@ -978,7 +1027,7 @@ pub fn find_class_like(conn: &Connection, name: &str, limit: usize) -> Result<Ve
 
     let mut stmt = conn.prepare(
         r#"
-        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
         FROM symbols s
         JOIN files f ON s.file_id = f.id
         WHERE s.name = ?1 AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')
@@ -1040,7 +1089,7 @@ pub fn find_class_like_pattern(
 
     let sql = format!(
         r#"
-        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
         FROM symbols s
         JOIN files f ON s.file_id = f.id
         WHERE ({} LIKE ?1 ESCAPE '\'{} ) AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package'){}
@@ -1120,7 +1169,7 @@ pub fn find_symbols_by_pattern(
 
     let sql = format!(
         r#"
-        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
         FROM symbols s
         JOIN files f ON s.file_id = f.id
         WHERE ({} LIKE ?1 ESCAPE '\'{} ){}{}
@@ -1174,7 +1223,7 @@ pub fn find_implementations(
     let namespace_suffix_pattern = format!("%::{}", parent_name);
     let mut stmt = conn.prepare(
         r#"
-        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
         FROM inheritance i
         JOIN symbols s ON i.child_id = s.id
         JOIN files f ON s.file_id = f.id
@@ -1235,7 +1284,7 @@ pub fn find_implementations_scoped(
 
     let sql = format!(
         r#"
-        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
         FROM inheritance i
         JOIN symbols s ON i.child_id = s.id
         JOIN files f ON s.file_id = f.id
@@ -1346,6 +1395,23 @@ pub struct RefResult {
     pub line: i64,
     pub context: Option<String>,
     pub path: String,
+    #[serde(skip_serializing)]
+    pub root_path: Option<String>,
+}
+
+fn row_to_ref_result(row: &rusqlite::Row<'_>) -> rusqlite::Result<RefResult> {
+    let root_path = if row.as_ref().column_count() > 4 {
+        row.get::<_, Option<String>>(4)?.filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+    Ok(RefResult {
+        name: row.get(0)?,
+        line: row.get(1)?,
+        context: row.get(2)?,
+        path: row.get(3)?,
+        root_path,
+    })
 }
 
 /// Find references (usages) of a symbol
@@ -1359,7 +1425,7 @@ pub fn find_references(conn: &Connection, name: &str, limit: usize) -> Result<Ve
     // result set (bounded by LIMIT) so output is stable for users.
     let mut stmt = conn.prepare(
         r#"
-        SELECT r.name, r.line, r.context, f.path
+        SELECT r.name, r.line, r.context, f.path, f.root_path
         FROM (
             SELECT name, file_id, line, context
             FROM refs
@@ -1373,14 +1439,7 @@ pub fn find_references(conn: &Connection, name: &str, limit: usize) -> Result<Ve
     )?;
 
     let results = stmt
-        .query_map(params![name, limit as i64], |row| {
-            Ok(RefResult {
-                name: row.get(0)?,
-                line: row.get(1)?,
-                context: row.get(2)?,
-                path: row.get(3)?,
-            })
-        })?
+        .query_map(params![name, limit as i64], row_to_ref_result)?
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(results)
@@ -1421,7 +1480,7 @@ pub fn count_refs(conn: &Connection) -> Result<i64> {
 pub fn find_imports(conn: &Connection, name: &str, limit: usize) -> Result<Vec<SearchResult>> {
     let mut stmt = conn.prepare(
         r#"
-        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
         FROM symbols s
         JOIN files f ON s.file_id = f.id
         WHERE s.kind = 'import' AND s.name = ?1
@@ -1466,7 +1525,7 @@ pub fn search_symbols_fuzzy(
     if query.contains("::") {
         let mut stmt = conn.prepare(
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE s.qualified_name LIKE ?1
@@ -1506,7 +1565,7 @@ pub fn search_symbols_fuzzy(
     let contains_pattern = format!("%{}%", query);
     let mut stmt = conn.prepare(
         r#"
-        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
         FROM symbols s
         JOIN files f ON s.file_id = f.id
         WHERE s.name LIKE ?1
@@ -1602,7 +1661,7 @@ pub fn search_symbols_scoped(
 
         let sql = format!(
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE {}{}
@@ -1634,7 +1693,7 @@ pub fn search_symbols_scoped(
 
     let sql = format!(
         r#"
-        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
         FROM symbols_fts fts
         JOIN symbols s ON fts.rowid = s.id
         JOIN files f ON s.file_id = f.id
@@ -1688,7 +1747,7 @@ pub fn find_symbols_by_name_scoped(
             name.to_string()
         };
         let mut sql = format!(
-            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path FROM symbols s JOIN files f ON s.file_id = f.id WHERE {}{}",
+            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path FROM symbols s JOIN files f ON s.file_id = f.id WHERE {}{}",
             predicate, scope_clause
         );
         if kind.is_some() {
@@ -1720,7 +1779,7 @@ pub fn find_symbols_by_name_scoped(
         }
 
         let mut sql = format!(
-            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path FROM symbols s JOIN files f ON s.file_id = f.id WHERE s.qualified_name LIKE ?1{}",
+            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path FROM symbols s JOIN files f ON s.file_id = f.id WHERE s.qualified_name LIKE ?1{}",
             scope_clause
         );
         if kind.is_some() {
@@ -1751,7 +1810,7 @@ pub fn find_symbols_by_name_scoped(
         }
 
         let mut sql = format!(
-            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path FROM symbols s JOIN files f ON s.file_id = f.id WHERE s.qualified_name LIKE ?1{}",
+            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path FROM symbols s JOIN files f ON s.file_id = f.id WHERE s.qualified_name LIKE ?1{}",
             scope_clause
         );
         if kind.is_some() {
@@ -1780,7 +1839,7 @@ pub fn find_symbols_by_name_scoped(
     }
 
     let mut sql = format!(
-        "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path FROM symbols s JOIN files f ON s.file_id = f.id WHERE s.name = ?1{}",
+        "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path FROM symbols s JOIN files f ON s.file_id = f.id WHERE s.name = ?1{}",
         scope_clause
     );
     if kind.is_some() {
@@ -1837,7 +1896,7 @@ pub fn find_class_like_scoped(
 
     let sql = format!(
         r#"
-        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
         FROM symbols s
         JOIN files f ON s.file_id = f.id
         WHERE {} AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package'){}
@@ -1865,7 +1924,7 @@ pub fn find_class_like_scoped(
     if results.is_empty() && name.contains("::") && !name.starts_with("::") {
         let sql = format!(
             r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE s.qualified_name LIKE ?1 AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package'){}
@@ -1923,7 +1982,7 @@ pub fn find_references_scoped(
 
     let sql = format!(
         r#"
-        SELECT r.name, r.line, r.context, f.path
+        SELECT r.name, r.line, r.context, f.path, f.root_path
         FROM (
             SELECT name, file_id, line, context
             FROM refs
@@ -1949,14 +2008,7 @@ pub fn find_references_scoped(
     let param_refs: Vec<&dyn rusqlite::types::ToSql> =
         all_params.iter().map(|p| p.as_ref()).collect();
     let results = stmt
-        .query_map(param_refs.as_slice(), |row| {
-            Ok(RefResult {
-                name: row.get(0)?,
-                line: row.get(1)?,
-                context: row.get(2)?,
-                path: row.get(3)?,
-            })
-        })?
+        .query_map(param_refs.as_slice(), row_to_ref_result)?
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(results)
