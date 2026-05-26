@@ -7,8 +7,7 @@
 use std::fs;
 
 use ast_index::commands::management::{
-    cmd_add_root, cmd_clear, cmd_db_path, cmd_list_roots, cmd_query, cmd_rebuild,
-    cmd_remove_root,
+    cmd_add_root, cmd_clear, cmd_db_path, cmd_list_roots, cmd_query, cmd_rebuild, cmd_remove_root,
 };
 use ast_index::db;
 use tempfile::TempDir;
@@ -60,12 +59,8 @@ fn cmd_query_allows_with_cte() {
     let dir = TempDir::new().unwrap();
     let _ = open_fresh_db(dir.path());
 
-    cmd_query(
-        dir.path(),
-        "WITH x AS (SELECT 1 AS n) SELECT n FROM x",
-        10,
-    )
-    .expect("WITH/CTE queries must be allowed");
+    cmd_query(dir.path(), "WITH x AS (SELECT 1 AS n) SELECT n FROM x", 10)
+        .expect("WITH/CTE queries must be allowed");
 }
 
 #[test]
@@ -89,8 +84,7 @@ fn cmd_query_rejects_insert() {
     )
     .expect_err("INSERT must be rejected by the safety guard");
     assert!(
-        err.to_string().contains("SELECT")
-            || err.to_string().to_uppercase().contains("ALLOWED"),
+        err.to_string().contains("SELECT") || err.to_string().to_uppercase().contains("ALLOWED"),
         "rejection message must mention SELECT or 'allowed': {}",
         err
     );
@@ -109,8 +103,7 @@ fn cmd_query_rejects_update() {
 fn cmd_query_rejects_delete() {
     let dir = TempDir::new().unwrap();
     let _ = open_fresh_db(dir.path());
-    let err = cmd_query(dir.path(), "DELETE FROM files", 10)
-        .expect_err("DELETE must be rejected");
+    let err = cmd_query(dir.path(), "DELETE FROM files", 10).expect_err("DELETE must be rejected");
     assert!(err.to_string().to_uppercase().contains("ALLOWED"));
 }
 
@@ -118,8 +111,7 @@ fn cmd_query_rejects_delete() {
 fn cmd_query_rejects_drop_table() {
     let dir = TempDir::new().unwrap();
     let _ = open_fresh_db(dir.path());
-    let err = cmd_query(dir.path(), "DROP TABLE files", 10)
-        .expect_err("DROP must be rejected");
+    let err = cmd_query(dir.path(), "DROP TABLE files", 10).expect_err("DROP must be rejected");
     assert!(err.to_string().to_uppercase().contains("ALLOWED"));
 }
 
@@ -148,7 +140,9 @@ fn add_root_persists_to_db() {
     let conn = db::open_db(primary.path()).unwrap();
     let roots = db::get_extra_roots(&conn).unwrap();
     assert!(
-        roots.iter().any(|r| r.contains(extra.path().to_string_lossy().as_ref())),
+        roots
+            .iter()
+            .any(|r| r.contains(extra.path().to_string_lossy().as_ref())),
         "extra root must be persisted: {:?}",
         roots
     );
@@ -278,20 +272,8 @@ fn rebuild_sub_projects_keeps_root_direct_entries() {
     )
     .unwrap();
 
-    cmd_rebuild(
-        &root,
-        "all",
-        false,
-        false,
-        true,
-        None,
-        false,
-        true,
-        &[],
-        &[],
-        &[],
-    )
-    .expect("sub-project rebuild must succeed");
+    cmd_rebuild(&root, "all", false, false, true, false, true, &[], &[], &[])
+        .expect("sub-project rebuild must succeed");
 
     let conn = db::open_db(&root).unwrap();
     assert!(db_has_file(&conn, "root.sh"));

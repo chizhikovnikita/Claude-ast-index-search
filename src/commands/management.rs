@@ -14,7 +14,6 @@ use colored::Colorize;
 use crate::db;
 use crate::indexer;
 
-
 /// File count threshold for auto-switching to sub-projects mode
 const AUTO_SUB_PROJECTS_THRESHOLD: usize = 65_000;
 /// In experimental fast rebuild mode, a root with this many sub-projects is
@@ -88,22 +87,45 @@ fn restore_rebuild_pragmas(
 }
 
 /// Build a gitignore-style exclude matcher anchored to `root` from config patterns.
-fn build_exclude_matcher(root: &std::path::Path, patterns: Option<&[String]>) -> Option<ignore::gitignore::Gitignore> {
+fn build_exclude_matcher(
+    root: &std::path::Path,
+    patterns: Option<&[String]>,
+) -> Option<ignore::gitignore::Gitignore> {
     let patterns = patterns?;
-    if patterns.is_empty() { return None; }
+    if patterns.is_empty() {
+        return None;
+    }
     let mut gb = ignore::gitignore::GitignoreBuilder::new(root);
-    for p in patterns { gb.add_line(None, p).ok(); }
+    for p in patterns {
+        gb.add_line(None, p).ok();
+    }
     gb.build().ok()
 }
 
 /// Rebuild the index (full or partial)
-pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: bool, sub_projects: bool, verbose: bool, experimental_fast_rebuild: bool, cli_include: &[String], cli_exclude: &[String], extra_paths: &[String]) -> Result<()> {
-    let _experimental_fast_rebuild_env =
-        ScopedEnvVar::set_bool("AST_INDEX_EXPERIMENTAL_FAST_REBUILD", experimental_fast_rebuild);
+pub fn cmd_rebuild(
+    root: &Path,
+    index_type: &str,
+    index_deps: bool,
+    no_ignore: bool,
+    sub_projects: bool,
+    verbose: bool,
+    experimental_fast_rebuild: bool,
+    cli_include: &[String],
+    cli_exclude: &[String],
+    extra_paths: &[String],
+) -> Result<()> {
+    let _experimental_fast_rebuild_env = ScopedEnvVar::set_bool(
+        "AST_INDEX_EXPERIMENTAL_FAST_REBUILD",
+        experimental_fast_rebuild,
+    );
     if verbose {
         std::env::set_var("AST_INDEX_VERBOSE", "1");
         eprintln!("[verbose] rebuild started for: {}", root.display());
-        eprintln!("[verbose] index_type={}, index_deps={}, no_ignore={}, sub_projects={}", index_type, index_deps, no_ignore, sub_projects);
+        eprintln!(
+            "[verbose] index_type={}, index_deps={}, no_ignore={}, sub_projects={}",
+            index_type, index_deps, no_ignore, sub_projects
+        );
         eprintln!("[verbose] db path: {:?}", db::get_db_path(root).ok());
     }
 
@@ -114,19 +136,35 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
     }
 
     // Apply config fallbacks: CLI flags > config > defaults
-    let no_ignore = if no_ignore { true } else { config.no_ignore.unwrap_or(false) };
+    let no_ignore = if no_ignore {
+        true
+    } else {
+        config.no_ignore.unwrap_or(false)
+    };
     // Merge CLI flags with config: CLI overrides config
     let mut merged_exclude: Vec<String> = config.exclude.unwrap_or_default();
     for e in cli_exclude {
-        if !merged_exclude.contains(e) { merged_exclude.push(e.clone()); }
+        if !merged_exclude.contains(e) {
+            merged_exclude.push(e.clone());
+        }
     }
-    let config_exclude: Option<Vec<String>> = if merged_exclude.is_empty() { None } else { Some(merged_exclude) };
+    let config_exclude: Option<Vec<String>> = if merged_exclude.is_empty() {
+        None
+    } else {
+        Some(merged_exclude)
+    };
 
     let mut merged_include: Vec<String> = config.include.unwrap_or_default();
     for i in cli_include {
-        if !merged_include.contains(i) { merged_include.push(i.clone()); }
+        if !merged_include.contains(i) {
+            merged_include.push(i.clone());
+        }
     }
-    let config_include: Option<Vec<String>> = if merged_include.is_empty() { None } else { Some(merged_include) };
+    let config_include: Option<Vec<String>> = if merged_include.is_empty() {
+        None
+    } else {
+        Some(merged_include)
+    };
 
     let config_roots = config.roots.clone();
 
@@ -134,22 +172,40 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
     let exclude_matcher = build_exclude_matcher(root, config_exclude.as_deref());
 
     if verbose {
-        if let Some(ref inc) = config_include { eprintln!("[verbose] include (allow-list): {:?}", inc); }
-        if let Some(ref exc) = config_exclude { eprintln!("[verbose] exclude: {} patterns", exc.len()); }
+        if let Some(ref inc) = config_include {
+            eprintln!("[verbose] include (allow-list): {:?}", inc);
+        }
+        if let Some(ref exc) = config_exclude {
+            eprintln!("[verbose] exclude: {} patterns", exc.len());
+        }
     }
 
     // Explicit sub-projects mode (--sub-projects flag)
     if sub_projects {
-        return cmd_rebuild_sub_projects(root, index_type, index_deps, no_ignore, verbose, experimental_fast_rebuild,
-                                        config_exclude.as_deref(), config_include.as_deref(), exclude_matcher.as_ref());
+        return cmd_rebuild_sub_projects(
+            root,
+            index_type,
+            index_deps,
+            no_ignore,
+            verbose,
+            experimental_fast_rebuild,
+            config_exclude.as_deref(),
+            config_include.as_deref(),
+            exclude_matcher.as_ref(),
+        );
     }
 
     // Auto-detect: scan immediate subdirs (with exclude+include filter) and check file count
     if index_type == "all" {
         let t = Instant::now();
-        let subs = indexer::find_sub_projects(root, exclude_matcher.as_ref(), config_include.as_deref());
+        let subs =
+            indexer::find_sub_projects(root, exclude_matcher.as_ref(), config_include.as_deref());
         if verbose {
-            eprintln!("[verbose] find_sub_projects: {} found in {:?}", subs.len(), t.elapsed());
+            eprintln!(
+                "[verbose] find_sub_projects: {} found in {:?}",
+                subs.len(),
+                t.elapsed()
+            );
         }
 
         // When `include` is set explicitly, always honor it — route through the scoped
@@ -162,11 +218,20 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
                 format!(
                     "Honoring include config ({} paths) — walking only listed directories",
                     subs.len()
-                ).yellow()
+                )
+                .yellow()
             );
-            return cmd_rebuild_sub_projects(root, index_type, index_deps, no_ignore, verbose,
-                                            experimental_fast_rebuild,
-                                            config_exclude.as_deref(), config_include.as_deref(), exclude_matcher.as_ref());
+            return cmd_rebuild_sub_projects(
+                root,
+                index_type,
+                index_deps,
+                no_ignore,
+                verbose,
+                experimental_fast_rebuild,
+                config_exclude.as_deref(),
+                config_include.as_deref(),
+                exclude_matcher.as_ref(),
+            );
         }
 
         if subs.len() >= 2 {
@@ -192,11 +257,21 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
                     exclude_matcher.as_ref(),
                 );
             }
-            if verbose { eprintln!("[verbose] counting files (quick_file_count, limit={})...", AUTO_SUB_PROJECTS_THRESHOLD); }
-            let t = Instant::now();
-            let file_count = indexer::quick_file_count(root, no_ignore, AUTO_SUB_PROJECTS_THRESHOLD);
             if verbose {
-                eprintln!("[verbose] quick_file_count: {} in {:?}", file_count, t.elapsed());
+                eprintln!(
+                    "[verbose] counting files (quick_file_count, limit={})...",
+                    AUTO_SUB_PROJECTS_THRESHOLD
+                );
+            }
+            let t = Instant::now();
+            let file_count =
+                indexer::quick_file_count(root, no_ignore, AUTO_SUB_PROJECTS_THRESHOLD);
+            if verbose {
+                eprintln!(
+                    "[verbose] quick_file_count: {} in {:?}",
+                    file_count,
+                    t.elapsed()
+                );
             }
             if file_count >= AUTO_SUB_PROJECTS_THRESHOLD {
                 eprintln!(
@@ -206,9 +281,17 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
                         AUTO_SUB_PROJECTS_THRESHOLD, subs.len()
                     ).yellow()
                 );
-                return cmd_rebuild_sub_projects(root, index_type, index_deps, no_ignore, verbose,
-                                                experimental_fast_rebuild,
-                                                config_exclude.as_deref(), config_include.as_deref(), exclude_matcher.as_ref());
+                return cmd_rebuild_sub_projects(
+                    root,
+                    index_type,
+                    index_deps,
+                    no_ignore,
+                    verbose,
+                    experimental_fast_rebuild,
+                    config_exclude.as_deref(),
+                    config_include.as_deref(),
+                    exclude_matcher.as_ref(),
+                );
             }
         }
     }
@@ -227,7 +310,9 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
 
     // Save extra roots before deleting DB
     let saved_extra_roots = if db::db_exists(root) {
-        if verbose { eprintln!("[verbose] reading extra roots from existing DB..."); }
+        if verbose {
+            eprintln!("[verbose] reading extra roots from existing DB...");
+        }
         let old_conn = db::open_db(root)?;
         db::get_extra_roots(&old_conn).unwrap_or_default()
     } else {
@@ -235,26 +320,40 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
     };
 
     // Delete DB file entirely to avoid WAL hangs
-    if verbose { eprintln!("[verbose] deleting old DB..."); }
+    if verbose {
+        eprintln!("[verbose] deleting old DB...");
+    }
     let t = Instant::now();
     if let Err(e) = db::delete_db(root) {
-        eprintln!("{}", format!("Warning: could not delete old index: {}", e).yellow());
+        eprintln!(
+            "{}",
+            format!("Warning: could not delete old index: {}", e).yellow()
+        );
         if let Ok(db_path) = db::get_db_path(root) {
-            eprintln!("Cache path: {}", db_path.parent().unwrap_or(db_path.as_path()).display());
+            eprintln!(
+                "Cache path: {}",
+                db_path.parent().unwrap_or(db_path.as_path()).display()
+            );
             eprintln!("Try manually removing the cache directory and re-running rebuild.");
         }
         return Err(e);
     }
-    if verbose { eprintln!("[verbose] DB deleted in {:?}", t.elapsed()); }
+    if verbose {
+        eprintln!("[verbose] DB deleted in {:?}", t.elapsed());
+    }
 
     // Remove old kotlin-index cache dir entirely
     db::cleanup_legacy_cache();
 
-    if verbose { eprintln!("[verbose] opening new DB..."); }
+    if verbose {
+        eprintln!("[verbose] opening new DB...");
+    }
     let t = Instant::now();
     let mut conn = db::open_db(root)?;
     init_rebuild_schema(&conn, experimental_fast_rebuild)?;
-    if verbose { eprintln!("[verbose] DB opened + schema created in {:?}", t.elapsed()); }
+    if verbose {
+        eprintln!("[verbose] DB opened + schema created in {:?}", t.elapsed());
+    }
 
     // Merge config roots + saved extra roots + CLI --path args
     let mut all_extra_roots = saved_extra_roots;
@@ -263,7 +362,8 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
             let resolved = if std::path::Path::new(cr).is_absolute() {
                 cr.clone()
             } else {
-                root.join(cr).canonicalize()
+                root.join(cr)
+                    .canonicalize()
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|_| root.join(cr).to_string_lossy().to_string())
             };
@@ -276,12 +376,15 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
         let resolved = if std::path::Path::new(p).is_absolute() {
             p.clone()
         } else {
-            root.join(p).canonicalize()
+            root.join(p)
+                .canonicalize()
                 .map(|pp| pp.to_string_lossy().to_string())
                 .unwrap_or_else(|_| root.join(p).to_string_lossy().to_string())
         };
         if !all_extra_roots.contains(&resolved) {
-            if verbose { eprintln!("[verbose] adding --path: {}", resolved); }
+            if verbose {
+                eprintln!("[verbose] adding --path: {}", resolved);
+            }
             all_extra_roots.push(resolved);
         }
     }
@@ -300,8 +403,12 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
         conn.execute(
             "INSERT OR REPLACE INTO metadata (key, value) VALUES ('no_ignore', '1')",
             [],
-        ).ok();
-        println!("{}", "Including gitignored files (build/, etc.)...".yellow());
+        )
+        .ok();
+        println!(
+            "{}",
+            "Including gitignored files (build/, etc.)...".yellow()
+        );
     }
     db::set_experimental_fast_rebuild_enabled(&conn, experimental_fast_rebuild).ok();
 
@@ -312,11 +419,25 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
     match index_type {
         "all" => {
             println!("{}", "Rebuilding full index...".cyan());
-            if verbose { eprintln!("[verbose] starting file walk + parse..."); }
+            if verbose {
+                eprintln!("[verbose] starting file walk + parse...");
+            }
             let t = Instant::now();
-            let walk = indexer::index_directory_with_config(&mut conn, root, true, no_ignore, config_exclude.as_deref())?;
+            let walk = indexer::index_directory_with_config(
+                &mut conn,
+                root,
+                true,
+                no_ignore,
+                config_exclude.as_deref(),
+            )?;
             let mut file_count = walk.file_count;
-            if verbose { eprintln!("[verbose] index_directory: {} files in {:?}", file_count, t.elapsed()); }
+            if verbose {
+                eprintln!(
+                    "[verbose] index_directory: {} files in {:?}",
+                    file_count,
+                    t.elapsed()
+                );
+            }
 
             // Collect module_files from primary root
             let mut all_module_files = walk.module_files;
@@ -326,28 +447,66 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
             for extra_root in &extra_roots {
                 let extra_path = std::path::Path::new(extra_root);
                 if extra_path.exists() {
-                    if verbose { eprintln!("[verbose] indexing extra root: {}", extra_root); }
+                    if verbose {
+                        eprintln!("[verbose] indexing extra root: {}", extra_root);
+                    }
                     let t = Instant::now();
-                    let extra_walk = indexer::index_directory_with_config(&mut conn, extra_path, true, no_ignore, config_exclude.as_deref())?;
+                    let extra_walk = indexer::index_directory_with_config(
+                        &mut conn,
+                        extra_path,
+                        true,
+                        no_ignore,
+                        config_exclude.as_deref(),
+                    )?;
                     file_count += extra_walk.file_count;
                     all_module_files.extend(extra_walk.module_files);
-                    if verbose { eprintln!("[verbose] extra root: {} files in {:?}", extra_walk.file_count, t.elapsed()); }
-                    println!("{}", format!("Indexed {} files from extra root: {}", extra_walk.file_count, extra_root).dimmed());
+                    if verbose {
+                        eprintln!(
+                            "[verbose] extra root: {} files in {:?}",
+                            extra_walk.file_count,
+                            t.elapsed()
+                        );
+                    }
+                    println!(
+                        "{}",
+                        format!(
+                            "Indexed {} files from extra root: {}",
+                            extra_walk.file_count, extra_root
+                        )
+                        .dimmed()
+                    );
                 }
             }
 
             let t = Instant::now();
             let module_count = indexer::index_modules_from_files(&conn, root, &all_module_files)?;
-            if verbose { eprintln!("[verbose] index_modules: {} modules in {:?}", module_count, t.elapsed()); }
+            if verbose {
+                eprintln!(
+                    "[verbose] index_modules: {} modules in {:?}",
+                    module_count,
+                    t.elapsed()
+                );
+            }
 
             // Index CocoaPods/Carthage for iOS
             if is_ios {
-                if verbose { eprintln!("[verbose] indexing CocoaPods/Carthage..."); }
+                if verbose {
+                    eprintln!("[verbose] indexing CocoaPods/Carthage...");
+                }
                 let t = Instant::now();
                 let pkg_count = indexer::index_ios_package_managers(&conn, root, true)?;
-                if verbose { eprintln!("[verbose] ios_package_managers: {} in {:?}", pkg_count, t.elapsed()); }
+                if verbose {
+                    eprintln!(
+                        "[verbose] ios_package_managers: {} in {:?}",
+                        pkg_count,
+                        t.elapsed()
+                    );
+                }
                 if pkg_count > 0 {
-                    println!("{}", format!("Indexed {} CocoaPods/Carthage deps", pkg_count).dimmed());
+                    println!(
+                        "{}",
+                        format!("Indexed {} CocoaPods/Carthage deps", pkg_count).dimmed()
+                    );
                 }
             }
 
@@ -358,24 +517,50 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
             // step was gated on Android detection, silently skipping other build systems.
             if index_deps && module_count > 0 {
                 println!("{}", "Indexing module dependencies...".cyan());
-                if verbose { eprintln!("[verbose] indexing module deps..."); }
+                if verbose {
+                    eprintln!("[verbose] indexing module deps...");
+                }
                 let t = Instant::now();
-                dep_count = indexer::index_module_dependencies(&mut conn, root, &all_module_files, true)?;
-                if verbose { eprintln!("[verbose] module_deps: {} in {:?}", dep_count, t.elapsed()); }
+                dep_count =
+                    indexer::index_module_dependencies(&mut conn, root, &all_module_files, true)?;
+                if verbose {
+                    eprintln!("[verbose] module_deps: {} in {:?}", dep_count, t.elapsed());
+                }
                 let t = Instant::now();
                 trans_count = indexer::build_transitive_deps(&mut conn, true)?;
-                if verbose { eprintln!("[verbose] transitive_deps: {} in {:?}", trans_count, t.elapsed()); }
+                if verbose {
+                    eprintln!(
+                        "[verbose] transitive_deps: {} in {:?}",
+                        trans_count,
+                        t.elapsed()
+                    );
+                }
             }
 
             // Frontend-specific: .d.ts from node_modules
             let mut dts_count = 0;
             if root.join("node_modules").exists() {
-                if verbose { eprintln!("[verbose] indexing .d.ts from node_modules..."); }
+                if verbose {
+                    eprintln!("[verbose] indexing .d.ts from node_modules...");
+                }
                 let t = Instant::now();
                 dts_count = indexer::index_node_modules_dts(&mut conn, root, true)?;
-                if verbose { eprintln!("[verbose] node_modules .d.ts: {} files in {:?}", dts_count, t.elapsed()); }
+                if verbose {
+                    eprintln!(
+                        "[verbose] node_modules .d.ts: {} files in {:?}",
+                        dts_count,
+                        t.elapsed()
+                    );
+                }
                 if dts_count > 0 {
-                    println!("{}", format!("Indexed {} .d.ts type declarations from node_modules", dts_count).dimmed());
+                    println!(
+                        "{}",
+                        format!(
+                            "Indexed {} .d.ts type declarations from node_modules",
+                            dts_count
+                        )
+                        .dimmed()
+                    );
                 }
             }
 
@@ -386,15 +571,25 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
             if is_android {
                 println!("{}", "Indexing XML layouts...".cyan());
                 let t = Instant::now();
-                xml_count = indexer::index_xml_usages(&mut conn, root, &walk.xml_layout_files, true)?;
-                if verbose { eprintln!("[verbose] xml_usages: {} in {:?}", xml_count, t.elapsed()); }
+                xml_count =
+                    indexer::index_xml_usages(&mut conn, root, &walk.xml_layout_files, true)?;
+                if verbose {
+                    eprintln!("[verbose] xml_usages: {} in {:?}", xml_count, t.elapsed());
+                }
 
                 println!("{}", "Indexing resources...".cyan());
                 let t = Instant::now();
                 let (rc, ruc) = indexer::index_resources(&mut conn, root, &walk.res_files, true)?;
                 res_count = rc;
                 res_usage_count = ruc;
-                if verbose { eprintln!("[verbose] resources: {} defs, {} usages in {:?}", res_count, res_usage_count, t.elapsed()); }
+                if verbose {
+                    eprintln!(
+                        "[verbose] resources: {} defs, {} usages in {:?}",
+                        res_count,
+                        res_usage_count,
+                        t.elapsed()
+                    );
+                }
             }
 
             // iOS-specific: storyboards and assets
@@ -404,18 +599,37 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
             if is_ios {
                 println!("{}", "Indexing storyboards/xibs...".cyan());
                 let t = Instant::now();
-                sb_count = indexer::index_storyboard_usages(&mut conn, root, &walk.storyboard_files, true)?;
-                if verbose { eprintln!("[verbose] storyboard_usages: {} in {:?}", sb_count, t.elapsed()); }
+                sb_count = indexer::index_storyboard_usages(
+                    &mut conn,
+                    root,
+                    &walk.storyboard_files,
+                    true,
+                )?;
+                if verbose {
+                    eprintln!(
+                        "[verbose] storyboard_usages: {} in {:?}",
+                        sb_count,
+                        t.elapsed()
+                    );
+                }
 
                 println!("{}", "Indexing iOS assets...".cyan());
                 let t = Instant::now();
-                let (ac, auc) = indexer::index_ios_assets(&mut conn, root, &walk.xcassets_dirs, true)?;
+                let (ac, auc) =
+                    indexer::index_ios_assets(&mut conn, root, &walk.xcassets_dirs, true)?;
                 asset_count = ac;
                 asset_usage_count = auc;
-                if verbose { eprintln!("[verbose] ios_assets: {} defs, {} usages in {:?}", asset_count, asset_usage_count, t.elapsed()); }
+                if verbose {
+                    eprintln!(
+                        "[verbose] ios_assets: {} defs, {} usages in {:?}",
+                        asset_count,
+                        asset_usage_count,
+                        t.elapsed()
+                    );
+                }
             }
 
-            // Print summary based on project type
+            // Print summary based on which platform-specific indexes ran.
             finalize_rebuild_schema(&conn, experimental_fast_rebuild, verbose)?;
 
             if is_android && is_ios {
@@ -432,7 +646,8 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
                     format!(
                         "Indexed {} files, {} modules, {} storyboard usages, {} assets ({} usages)",
                         file_count, module_count, sb_count, asset_count, asset_usage_count
-                    ).green()
+                    )
+                    .green()
                 );
             } else if dts_count > 0 {
                 println!(
@@ -440,7 +655,8 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
                     format!(
                         "Indexed {} files (+{} .d.ts), {} modules, {} deps",
                         file_count, dts_count, module_count, dep_count
-                    ).green()
+                    )
+                    .green()
                 );
             } else {
                 println!(
@@ -456,7 +672,13 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
             println!("{}", "Rebuilding symbols index...".cyan());
             conn.execute("DELETE FROM symbols", [])?;
             conn.execute("DELETE FROM files", [])?;
-            let walk = indexer::index_directory_with_config(&mut conn, root, true, no_ignore, config_exclude.as_deref())?;
+            let walk = indexer::index_directory_with_config(
+                &mut conn,
+                root,
+                true,
+                no_ignore,
+                config_exclude.as_deref(),
+            )?;
             finalize_rebuild_schema(&conn, experimental_fast_rebuild, verbose)?;
             println!("{}", format!("Indexed {} files", walk.file_count).green());
         }
@@ -469,11 +691,16 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
             if index_deps {
                 println!("{}", "Indexing module dependencies...".cyan());
                 let gradle_files = indexer::collect_build_files_from_db(&conn, root)?;
-                let dep_count = indexer::index_module_dependencies(&mut conn, root, &gradle_files, true)?;
+                let dep_count =
+                    indexer::index_module_dependencies(&mut conn, root, &gradle_files, true)?;
                 finalize_rebuild_schema(&conn, experimental_fast_rebuild, verbose)?;
                 println!(
                     "{}",
-                    format!("Indexed {} modules, {} dependencies", module_count, dep_count).green()
+                    format!(
+                        "Indexed {} modules, {} dependencies",
+                        module_count, dep_count
+                    )
+                    .green()
                 );
             } else {
                 finalize_rebuild_schema(&conn, experimental_fast_rebuild, verbose)?;
@@ -483,7 +710,8 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
         "deps" => {
             println!("{}", "Indexing module dependencies...".cyan());
             let gradle_files = indexer::collect_build_files_from_db(&conn, root)?;
-            let dep_count = indexer::index_module_dependencies(&mut conn, root, &gradle_files, true)?;
+            let dep_count =
+                indexer::index_module_dependencies(&mut conn, root, &gradle_files, true)?;
             finalize_rebuild_schema(&conn, experimental_fast_rebuild, verbose)?;
             println!("{}", format!("Indexed {} dependencies", dep_count).green());
         }
@@ -516,16 +744,29 @@ fn cmd_rebuild_sub_projects(
     let start = Instant::now();
 
     // Acquire exclusive lock to prevent concurrent rebuilds
-    if verbose { eprintln!("[verbose] sub-projects: acquiring lock..."); }
+    if verbose {
+        eprintln!("[verbose] sub-projects: acquiring lock...");
+    }
     let t = Instant::now();
     let _lock = db::acquire_rebuild_lock(root)?;
-    if verbose { eprintln!("[verbose] lock acquired in {:?}", t.elapsed()); }
+    if verbose {
+        eprintln!("[verbose] lock acquired in {:?}", t.elapsed());
+    }
 
     let t = Instant::now();
     let sub_projects = indexer::find_sub_projects(root, exclude_matcher, config_include);
-    if verbose { eprintln!("[verbose] find_sub_projects: {} in {:?}", sub_projects.len(), t.elapsed()); }
+    if verbose {
+        eprintln!(
+            "[verbose] find_sub_projects: {} in {:?}",
+            sub_projects.len(),
+            t.elapsed()
+        );
+    }
     if sub_projects.is_empty() {
-        println!("{}", "No sub-projects found. Use 'rebuild' without --sub-projects.".yellow());
+        println!(
+            "{}",
+            "No sub-projects found. Use 'rebuild' without --sub-projects.".yellow()
+        );
         return Ok(());
     }
 
@@ -534,28 +775,36 @@ fn cmd_rebuild_sub_projects(
         "{}",
         format!("Found {} sub-projects in {}:", total, root.display()).cyan()
     );
-    for (path, pt) in &sub_projects {
+    for (path, _) in &sub_projects {
         let name = path.strip_prefix(root).unwrap_or(path).to_string_lossy();
-        println!("  {} [{}]", name, pt.as_str());
+        println!("  {}", name);
     }
     println!();
 
     // Single DB for the whole root
-    if verbose { eprintln!("[verbose] deleting old DB..."); }
+    if verbose {
+        eprintln!("[verbose] deleting old DB...");
+    }
     let t = Instant::now();
     if let Err(e) = db::delete_db(root) {
-        eprintln!("{}", format!("Warning: could not delete old index: {}", e).yellow());
+        eprintln!(
+            "{}",
+            format!("Warning: could not delete old index: {}", e).yellow()
+        );
         return Err(e);
     }
     let mut conn = db::open_db(root)?;
     init_rebuild_schema(&conn, experimental_fast_rebuild)?;
-    if verbose { eprintln!("[verbose] DB created in {:?}", t.elapsed()); }
+    if verbose {
+        eprintln!("[verbose] DB created in {:?}", t.elapsed());
+    }
 
     if no_ignore {
         conn.execute(
             "INSERT OR REPLACE INTO metadata (key, value) VALUES ('no_ignore', '1')",
             [],
-        ).ok();
+        )
+        .ok();
     }
     db::set_experimental_fast_rebuild_enabled(&conn, experimental_fast_rebuild).ok();
 
@@ -572,7 +821,13 @@ fn cmd_rebuild_sub_projects(
 
     if config_include.is_none() {
         let t = Instant::now();
-        match indexer::index_directory_direct_entries(&mut conn, root, false, no_ignore, None, extra_exclude) {
+        match indexer::index_directory_direct_entries(
+            &mut conn,
+            root,
+            false,
+            no_ignore,
+            extra_exclude,
+        ) {
             Ok(walk) => {
                 total_files += walk.file_count;
                 all_module_files.extend(walk.module_files);
@@ -581,12 +836,20 @@ fn cmd_rebuild_sub_projects(
                 all_storyboard_files.extend(walk.storyboard_files);
                 all_xcassets_dirs.extend(walk.xcassets_dirs);
                 if verbose {
-                    eprintln!("[verbose] root direct entries: {} files in {:?}", walk.file_count, t.elapsed());
+                    eprintln!(
+                        "[verbose] root direct entries: {} files in {:?}",
+                        walk.file_count,
+                        t.elapsed()
+                    );
                 }
             }
             Err(e) => {
                 if verbose {
-                    eprintln!("[verbose] root direct entries: FAILED in {:?}: {}", t.elapsed(), e);
+                    eprintln!(
+                        "[verbose] root direct entries: FAILED in {:?}: {}",
+                        t.elapsed(),
+                        e
+                    );
                 }
                 println!("{}", format!("  Root direct entries failed: {}", e).red());
                 fail_count += 1;
@@ -594,18 +857,23 @@ fn cmd_rebuild_sub_projects(
         }
     }
 
-    for (i, (path, pt)) in sub_projects.iter().enumerate() {
+    for (i, (path, _)) in sub_projects.iter().enumerate() {
         let name = path.strip_prefix(root).unwrap_or(path).to_string_lossy();
         println!(
             "{}",
-            format!("[{}/{}] Indexing {} [{}]...", i + 1, total, name, pt.as_str()).cyan()
+            format!("[{}/{}] Indexing {}...", i + 1, total, name).cyan()
         );
 
-        if indexer::has_android_markers(path) { any_android = true; }
-        if indexer::has_ios_markers(path) { any_ios = true; }
+        if indexer::has_android_markers(path) {
+            any_android = true;
+        }
+        if indexer::has_ios_markers(path) {
+            any_ios = true;
+        }
 
         let t = Instant::now();
-        match indexer::index_directory_scoped(&mut conn, root, path, true, no_ignore, None, extra_exclude) {
+        match indexer::index_directory_scoped(&mut conn, root, path, true, no_ignore, extra_exclude)
+        {
             Ok(walk) => {
                 total_files += walk.file_count;
                 all_module_files.extend(walk.module_files);
@@ -614,7 +882,12 @@ fn cmd_rebuild_sub_projects(
                 all_storyboard_files.extend(walk.storyboard_files);
                 all_xcassets_dirs.extend(walk.xcassets_dirs);
                 if verbose {
-                    eprintln!("[verbose] {} — {} files in {:?}", name, walk.file_count, t.elapsed());
+                    eprintln!(
+                        "[verbose] {} — {} files in {:?}",
+                        name,
+                        walk.file_count,
+                        t.elapsed()
+                    );
                 }
                 println!(
                     "{}",
@@ -623,7 +896,9 @@ fn cmd_rebuild_sub_projects(
                 success_count += 1;
             }
             Err(e) => {
-                if verbose { eprintln!("[verbose] {} — FAILED in {:?}: {}", name, t.elapsed(), e); }
+                if verbose {
+                    eprintln!("[verbose] {} — FAILED in {:?}: {}", name, t.elapsed(), e);
+                }
                 println!("{}", format!("  Failed: {}", e).red());
                 fail_count += 1;
             }
@@ -633,40 +908,69 @@ fn cmd_rebuild_sub_projects(
     // Index modules and dependencies from collected build files
     let t = Instant::now();
     let module_count = indexer::index_modules_from_files(&conn, root, &all_module_files)?;
-    if verbose { eprintln!("[verbose] index_modules: {} modules in {:?}", module_count, t.elapsed()); }
+    if verbose {
+        eprintln!(
+            "[verbose] index_modules: {} modules in {:?}",
+            module_count,
+            t.elapsed()
+        );
+    }
 
     let mut dep_count = 0;
     let mut trans_count = 0;
     if module_count > 0 {
         let t = Instant::now();
-        dep_count = indexer::index_module_dependencies(&mut conn, root, &all_module_files, verbose)?;
-        if verbose { eprintln!("[verbose] module_deps: {} in {:?}", dep_count, t.elapsed()); }
+        dep_count =
+            indexer::index_module_dependencies(&mut conn, root, &all_module_files, verbose)?;
+        if verbose {
+            eprintln!("[verbose] module_deps: {} in {:?}", dep_count, t.elapsed());
+        }
         let t = Instant::now();
         trans_count = indexer::build_transitive_deps(&mut conn, verbose)?;
-        if verbose { eprintln!("[verbose] transitive_deps: {} in {:?}", trans_count, t.elapsed()); }
+        if verbose {
+            eprintln!(
+                "[verbose] transitive_deps: {} in {:?}",
+                trans_count,
+                t.elapsed()
+            );
+        }
     }
 
     // Android-specific: XML layouts and resources
     if any_android && !all_xml_files.is_empty() {
         let t = Instant::now();
         let xml_count = indexer::index_xml_usages(&mut conn, root, &all_xml_files, verbose)?;
-        if verbose { eprintln!("[verbose] xml_usages: {} in {:?}", xml_count, t.elapsed()); }
+        if verbose {
+            eprintln!("[verbose] xml_usages: {} in {:?}", xml_count, t.elapsed());
+        }
         let t = Instant::now();
         let (res_count, _) = indexer::index_resources(&mut conn, root, &all_res_files, verbose)?;
-        if verbose { eprintln!("[verbose] resources: {} in {:?}", res_count, t.elapsed()); }
+        if verbose {
+            eprintln!("[verbose] resources: {} in {:?}", res_count, t.elapsed());
+        }
     }
 
     // iOS-specific: storyboards and assets
     if any_ios {
         if !all_storyboard_files.is_empty() {
             let t = Instant::now();
-            let sb_count = indexer::index_storyboard_usages(&mut conn, root, &all_storyboard_files, verbose)?;
-            if verbose { eprintln!("[verbose] storyboard_usages: {} in {:?}", sb_count, t.elapsed()); }
+            let sb_count =
+                indexer::index_storyboard_usages(&mut conn, root, &all_storyboard_files, verbose)?;
+            if verbose {
+                eprintln!(
+                    "[verbose] storyboard_usages: {} in {:?}",
+                    sb_count,
+                    t.elapsed()
+                );
+            }
         }
         if !all_xcassets_dirs.is_empty() {
             let t = Instant::now();
-            let (asset_count, _) = indexer::index_ios_assets(&mut conn, root, &all_xcassets_dirs, verbose)?;
-            if verbose { eprintln!("[verbose] ios_assets: {} in {:?}", asset_count, t.elapsed()); }
+            let (asset_count, _) =
+                indexer::index_ios_assets(&mut conn, root, &all_xcassets_dirs, verbose)?;
+            if verbose {
+                eprintln!("[verbose] ios_assets: {} in {:?}", asset_count, t.elapsed());
+            }
         }
     }
 
@@ -690,7 +994,6 @@ fn cmd_rebuild_sub_projects(
 /// Incrementally update the index
 pub fn cmd_update(root: &Path, verbose: bool) -> Result<()> {
     let start = Instant::now();
-
 
     if !db::db_exists(root) {
         println!(
@@ -802,7 +1105,8 @@ pub fn cmd_restore(root: &Path, db_file: &str) -> Result<()> {
         format!(
             "Contains: {} files, {} symbols, {} refs",
             stats.file_count, stats.symbol_count, stats.refs_count
-        ).dimmed()
+        )
+        .dimmed()
     );
 
     Ok(())
@@ -828,9 +1132,7 @@ pub fn cmd_stats(root: &Path, format: &str) -> Result<()> {
     let conn = db::open_db(root)?;
     let stats = db::get_stats(&conn)?;
     let db_path = db::get_db_path(root)?;
-    let db_size = std::fs::metadata(&db_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
 
     if format == "json" {
         let result = serde_json::json!({
@@ -900,10 +1202,15 @@ pub fn cmd_add_root(root: &Path, path: &str, force: bool) -> Result<()> {
 
     if !force {
         if canonical_new.starts_with(&canonical_root) {
-            println!("{}", format!(
-                "Warning: '{}' is inside the project root '{}'. Files will be indexed twice.",
-                abs_path, root.display()
-            ).yellow());
+            println!(
+                "{}",
+                format!(
+                    "Warning: '{}' is inside the project root '{}'. Files will be indexed twice.",
+                    abs_path,
+                    root.display()
+                )
+                .yellow()
+            );
             println!("Use --force to add anyway, or use directory scoping instead.");
             return Ok(());
         }
@@ -980,9 +1287,12 @@ pub fn cmd_query(root: &Path, sql: &str, limit: usize) -> Result<()> {
         anyhow::bail!("Only SELECT, WITH, and EXPLAIN queries are allowed");
     }
     // Block dangerous patterns
-    for keyword in &["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "ATTACH", "DETACH", "PRAGMA"] {
+    for keyword in &[
+        "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "ATTACH", "DETACH", "PRAGMA",
+    ] {
         // Check that these keywords appear as statements, not inside strings
-        if upper.contains(&format!(" {} ", keyword)) || upper.starts_with(&format!("{} ", keyword)) {
+        if upper.contains(&format!(" {} ", keyword)) || upper.starts_with(&format!("{} ", keyword))
+        {
             anyhow::bail!("Mutation queries are not allowed (found {})", keyword);
         }
     }
@@ -1049,7 +1359,8 @@ pub fn cmd_schema(root: &Path) -> Result<()> {
         "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '%_fts%' ORDER BY name"
     )?;
 
-    let tables: Vec<String> = stmt.query_map([], |row| row.get(0))?
+    let tables: Vec<String> = stmt
+        .query_map([], |row| row.get(0))?
         .filter_map(|r| r.ok())
         .collect();
 
@@ -1057,32 +1368,41 @@ pub fn cmd_schema(root: &Path) -> Result<()> {
 
     for table in &tables {
         let mut cols_stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
-        let columns: Vec<serde_json::Value> = cols_stmt.query_map([], |row| {
-            let name: String = row.get(1)?;
-            let col_type: String = row.get(2)?;
-            let not_null: bool = row.get(3)?;
-            let pk: bool = row.get(5)?;
-            Ok(serde_json::json!({
-                "name": name,
-                "type": col_type,
-                "not_null": not_null,
-                "primary_key": pk,
-            }))
-        })?.filter_map(|r| r.ok()).collect();
+        let columns: Vec<serde_json::Value> = cols_stmt
+            .query_map([], |row| {
+                let name: String = row.get(1)?;
+                let col_type: String = row.get(2)?;
+                let not_null: bool = row.get(3)?;
+                let pk: bool = row.get(5)?;
+                Ok(serde_json::json!({
+                    "name": name,
+                    "type": col_type,
+                    "not_null": not_null,
+                    "primary_key": pk,
+                }))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
 
         // Get row count
-        let count: i64 = conn.query_row(
-            &format!("SELECT COUNT(*) FROM {}", table),
-            [],
-            |row| row.get(0),
-        ).unwrap_or(0);
+        let count: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |row| {
+                row.get(0)
+            })
+            .unwrap_or(0);
 
-        schema.insert(table.clone(), serde_json::json!({
-            "columns": columns,
-            "row_count": count,
-        }));
+        schema.insert(
+            table.clone(),
+            serde_json::json!({
+                "columns": columns,
+                "row_count": count,
+            }),
+        );
     }
 
-    println!("{}", serde_json::to_string_pretty(&serde_json::Value::Object(schema))?);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::Value::Object(schema))?
+    );
     Ok(())
 }
