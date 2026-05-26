@@ -1,12 +1,12 @@
 //! Tree-sitter based Bash parser
 
 use anyhow::Result;
-use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 use std::sync::LazyLock;
+use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
+use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
-use super::{LanguageParser, parse_tree, node_text, node_line, line_text};
 
 static BASH_LANGUAGE: LazyLock<Language> = LazyLock::new(|| tree_sitter_bash::LANGUAGE.into());
 
@@ -28,7 +28,10 @@ impl LanguageParser for BashParser {
 
         let capture_names = query.capture_names();
         let idx = |name: &str| -> Option<u32> {
-            capture_names.iter().position(|n| *n == name).map(|i| i as u32)
+            capture_names
+                .iter()
+                .position(|n| *n == name)
+                .map(|i| i as u32)
         };
 
         let idx_func_name = idx("func_name");
@@ -87,31 +90,43 @@ mod tests {
     fn test_function_keyword() {
         let content = "function greet {\n    echo \"Hello\"\n}\n";
         let symbols = BASH_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "greet" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "greet" && s.kind == SymbolKind::Function));
     }
 
     #[test]
     fn test_function_parens() {
         let content = "greet() {\n    echo \"Hello\"\n}\n";
         let symbols = BASH_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "greet" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "greet" && s.kind == SymbolKind::Function));
     }
 
     #[test]
     fn test_variable() {
         let content = "MY_VAR=\"hello world\"\nCOUNT=42\n";
         let symbols = BASH_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "MY_VAR" && s.kind == SymbolKind::Property));
-        assert!(symbols.iter().any(|s| s.name == "COUNT" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "MY_VAR" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "COUNT" && s.kind == SymbolKind::Property));
     }
 
     #[test]
     fn test_comments_ignored() {
         let content = "# function fake {\n# }\nfunction real {\n    echo ok\n}\n# MY_VAR=nope\nREAL_VAR=yes\n";
         let symbols = BASH_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "real" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "real" && s.kind == SymbolKind::Function));
         assert!(!symbols.iter().any(|s| s.name == "fake"));
-        assert!(symbols.iter().any(|s| s.name == "REAL_VAR" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "REAL_VAR" && s.kind == SymbolKind::Property));
         assert!(!symbols.iter().any(|s| s.name == "MY_VAR"));
     }
 
@@ -119,7 +134,9 @@ mod tests {
     fn test_function_with_keyword_and_parens() {
         let content = "function deploy() {\n    echo \"deploying\"\n}\n";
         let symbols = BASH_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "deploy" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "deploy" && s.kind == SymbolKind::Function));
     }
 
     #[test]
@@ -138,9 +155,17 @@ stop() {
 }
 "#;
         let symbols = BASH_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "MY_APP" && s.kind == SymbolKind::Property));
-        assert!(symbols.iter().any(|s| s.name == "VERSION" && s.kind == SymbolKind::Property));
-        assert!(symbols.iter().any(|s| s.name == "start" && s.kind == SymbolKind::Function));
-        assert!(symbols.iter().any(|s| s.name == "stop" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "MY_APP" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "VERSION" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "start" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "stop" && s.kind == SymbolKind::Function));
     }
 }

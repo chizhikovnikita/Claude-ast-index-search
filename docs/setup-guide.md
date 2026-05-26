@@ -265,12 +265,6 @@ ast-index --format json refs "UserRepository"
 | Schema | Protocol Buffers, WSDL/XSD | `.proto`, `.wsdl`, `.xsd` |
 | Enterprise | BSL (1C:Enterprise) | `.bsl`, `.os` |
 
-Project type is auto-detected. Override with `--project-type`:
-
-```bash
-ast-index rebuild --project-type dart
-```
-
 ## Programmatic Access
 
 ```bash

@@ -4,7 +4,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use ast_index::{db, commands, indexer};
+use ast_index::{commands, db};
 
 #[derive(Parser)]
 #[command(name = "ast-index")]
@@ -718,13 +718,13 @@ fn main() -> Result<()> {
     // Compute directory scope: if cwd is inside project root, limit search to cwd subtree
     let cwd = std::env::current_dir().unwrap_or_default();
     let dir_prefix = if cwd != root {
-        cwd.strip_prefix(&root)
-            .ok()
-            .map(|rel| {
-                let mut s = rel.to_string_lossy().to_string();
-                if !s.ends_with('/') { s.push('/'); }
-                s
-            })
+        cwd.strip_prefix(&root).ok().map(|rel| {
+            let mut s = rel.to_string_lossy().to_string();
+            if !s.ends_with('/') {
+                s.push('/');
+            }
+            s
+        })
     } else {
         None
     };
@@ -733,75 +733,243 @@ fn main() -> Result<()> {
     match cli.command {
         // Grep commands
         Commands::Todo { pattern, limit } => commands::grep::cmd_todo(&root, &pattern, limit),
-        Commands::Callers { function_name, limit } => commands::grep::cmd_callers(&root, &function_name, limit),
-        Commands::CallTree { function_name, depth, limit } => commands::grep::cmd_call_tree(&root, &function_name, depth, limit),
-        Commands::Provides { type_name, limit } => commands::grep::cmd_provides(&root, &type_name, limit),
-        Commands::Suspend { query, limit } => commands::grep::cmd_suspend(&root, query.as_deref(), limit),
-        Commands::Composables { query, limit } => commands::grep::cmd_composables(&root, query.as_deref(), limit),
-        Commands::Deprecated { query, limit } => commands::grep::cmd_deprecated(&root, query.as_deref(), limit),
-        Commands::Suppress { query, limit } => commands::grep::cmd_suppress(&root, query.as_deref(), limit),
-        Commands::Inject { type_name, limit } => commands::grep::cmd_inject(&root, &type_name, limit),
-        Commands::Annotations { annotation, limit } => commands::grep::cmd_annotations(&root, &annotation, limit),
-        Commands::Deeplinks { query, limit } => commands::grep::cmd_deeplinks(&root, query.as_deref(), limit),
-        Commands::Extensions { receiver_type, limit } => commands::grep::cmd_extensions(&root, &receiver_type, limit),
-        Commands::Flows { query, limit } => commands::grep::cmd_flows(&root, query.as_deref(), limit),
-        Commands::Previews { query, limit } => commands::grep::cmd_previews(&root, query.as_deref(), limit),
+        Commands::Callers {
+            function_name,
+            limit,
+        } => commands::grep::cmd_callers(&root, &function_name, limit),
+        Commands::CallTree {
+            function_name,
+            depth,
+            limit,
+        } => commands::grep::cmd_call_tree(&root, &function_name, depth, limit),
+        Commands::Provides { type_name, limit } => {
+            commands::grep::cmd_provides(&root, &type_name, limit)
+        }
+        Commands::Suspend { query, limit } => {
+            commands::grep::cmd_suspend(&root, query.as_deref(), limit)
+        }
+        Commands::Composables { query, limit } => {
+            commands::grep::cmd_composables(&root, query.as_deref(), limit)
+        }
+        Commands::Deprecated { query, limit } => {
+            commands::grep::cmd_deprecated(&root, query.as_deref(), limit)
+        }
+        Commands::Suppress { query, limit } => {
+            commands::grep::cmd_suppress(&root, query.as_deref(), limit)
+        }
+        Commands::Inject { type_name, limit } => {
+            commands::grep::cmd_inject(&root, &type_name, limit)
+        }
+        Commands::Annotations { annotation, limit } => {
+            commands::grep::cmd_annotations(&root, &annotation, limit)
+        }
+        Commands::Deeplinks { query, limit } => {
+            commands::grep::cmd_deeplinks(&root, query.as_deref(), limit)
+        }
+        Commands::Extensions {
+            receiver_type,
+            limit,
+        } => commands::grep::cmd_extensions(&root, &receiver_type, limit),
+        Commands::Flows { query, limit } => {
+            commands::grep::cmd_flows(&root, query.as_deref(), limit)
+        }
+        Commands::Previews { query, limit } => {
+            commands::grep::cmd_previews(&root, query.as_deref(), limit)
+        }
         // Management commands
-        Commands::Rebuild { r#type, no_deps, no_ignore, sub_projects, verbose, experimental_fast_rebuild, threads, include, exclude, paths } => {
+        Commands::Rebuild {
+            r#type,
+            no_deps,
+            no_ignore,
+            sub_projects,
+            verbose,
+            experimental_fast_rebuild,
+            threads,
+            include,
+            exclude,
+            paths,
+        } => {
             if let Some(t) = threads {
                 std::env::set_var("AST_INDEX_THREADS", t.to_string());
             }
-            commands::management::cmd_rebuild(&root, &r#type, !no_deps, no_ignore, sub_projects, verbose, experimental_fast_rebuild, &include, &exclude, &paths)
+            commands::management::cmd_rebuild(
+                &root,
+                &r#type,
+                !no_deps,
+                no_ignore,
+                sub_projects,
+                verbose,
+                experimental_fast_rebuild,
+                &include,
+                &exclude,
+                &paths,
+            )
         }
         Commands::Update { verbose } => commands::management::cmd_update(&root, verbose),
         Commands::Restore { path } => commands::management::cmd_restore(&root, &path),
         Commands::Stats => commands::management::cmd_stats(&root, format),
         // Index commands
-        Commands::Search { query, r#type, limit, in_file, module, fuzzy } => {
-            let scope = db::SearchScope { in_file: in_file.as_deref(), module: module.as_deref(), dir_prefix: dir_prefix_ref };
-            commands::index::cmd_search(&root, &query, r#type.as_deref(), limit, format, &scope, fuzzy)
+        Commands::Search {
+            query,
+            r#type,
+            limit,
+            in_file,
+            module,
+            fuzzy,
+        } => {
+            let scope = db::SearchScope {
+                in_file: in_file.as_deref(),
+                module: module.as_deref(),
+                dir_prefix: dir_prefix_ref,
+            };
+            commands::index::cmd_search(
+                &root,
+                &query,
+                r#type.as_deref(),
+                limit,
+                format,
+                &scope,
+                fuzzy,
+            )
         }
-        Commands::Symbol { name, pattern, r#type, limit, in_file, module, fuzzy } => {
-            let scope = db::SearchScope { in_file: in_file.as_deref(), module: module.as_deref(), dir_prefix: dir_prefix_ref };
-            commands::index::cmd_symbol(&root, name.as_deref(), pattern.as_deref(), r#type.as_deref(), limit, format, &scope, fuzzy)
+        Commands::Symbol {
+            name,
+            pattern,
+            r#type,
+            limit,
+            in_file,
+            module,
+            fuzzy,
+        } => {
+            let scope = db::SearchScope {
+                in_file: in_file.as_deref(),
+                module: module.as_deref(),
+                dir_prefix: dir_prefix_ref,
+            };
+            commands::index::cmd_symbol(
+                &root,
+                name.as_deref(),
+                pattern.as_deref(),
+                r#type.as_deref(),
+                limit,
+                format,
+                &scope,
+                fuzzy,
+            )
         }
-        Commands::Class { name, pattern, limit, in_file, module, fuzzy } => {
-            let scope = db::SearchScope { in_file: in_file.as_deref(), module: module.as_deref(), dir_prefix: dir_prefix_ref };
-            commands::index::cmd_class(&root, name.as_deref(), pattern.as_deref(), limit, format, &scope, fuzzy)
+        Commands::Class {
+            name,
+            pattern,
+            limit,
+            in_file,
+            module,
+            fuzzy,
+        } => {
+            let scope = db::SearchScope {
+                in_file: in_file.as_deref(),
+                module: module.as_deref(),
+                dir_prefix: dir_prefix_ref,
+            };
+            commands::index::cmd_class(
+                &root,
+                name.as_deref(),
+                pattern.as_deref(),
+                limit,
+                format,
+                &scope,
+                fuzzy,
+            )
         }
-        Commands::Implementations { parent, limit, in_file, module } => {
-            let scope = db::SearchScope { in_file: in_file.as_deref(), module: module.as_deref(), dir_prefix: dir_prefix_ref };
+        Commands::Implementations {
+            parent,
+            limit,
+            in_file,
+            module,
+        } => {
+            let scope = db::SearchScope {
+                in_file: in_file.as_deref(),
+                module: module.as_deref(),
+                dir_prefix: dir_prefix_ref,
+            };
             commands::index::cmd_implementations(&root, &parent, limit, format, &scope)
         }
-        Commands::Refs { symbol, limit } => commands::index::cmd_refs(&root, &symbol, limit, format),
-        Commands::Hierarchy { name, in_file, module, limit } => {
-            let scope = db::SearchScope { in_file: in_file.as_deref(), module: module.as_deref(), dir_prefix: dir_prefix_ref };
+        Commands::Refs { symbol, limit } => {
+            commands::index::cmd_refs(&root, &symbol, limit, format)
+        }
+        Commands::Hierarchy {
+            name,
+            in_file,
+            module,
+            limit,
+        } => {
+            let scope = db::SearchScope {
+                in_file: in_file.as_deref(),
+                module: module.as_deref(),
+                dir_prefix: dir_prefix_ref,
+            };
             commands::index::cmd_hierarchy(&root, &name, limit, &scope)
         }
-        Commands::Usages { symbol, limit, in_file, module } => {
-            let scope = db::SearchScope { in_file: in_file.as_deref(), module: module.as_deref(), dir_prefix: dir_prefix_ref };
+        Commands::Usages {
+            symbol,
+            limit,
+            in_file,
+            module,
+        } => {
+            let scope = db::SearchScope {
+                in_file: in_file.as_deref(),
+                module: module.as_deref(),
+                dir_prefix: dir_prefix_ref,
+            };
             commands::index::cmd_usages(&root, &symbol, limit, format, &scope)
         }
         // Module commands
-        Commands::Module { pattern, limit } => commands::modules::cmd_module(&root, &pattern, limit),
+        Commands::Module { pattern, limit } => {
+            commands::modules::cmd_module(&root, &pattern, limit)
+        }
         Commands::Deps { module } => commands::modules::cmd_deps(&root, &module),
         Commands::Dependents { module } => commands::modules::cmd_dependents(&root, &module),
-        Commands::ModuleRoute { from, to, all, max_paths, max_depth, timeout_ms, via_kind } => {
-            commands::modules::cmd_module_route(
-                &root, &from, &to, all, max_paths, max_depth, timeout_ms, &via_kind, format,
-            )
-        }
-        Commands::UnusedDeps { module, verbose, no_transitive, no_xml, no_resources, strict } => {
+        Commands::ModuleRoute {
+            from,
+            to,
+            all,
+            max_paths,
+            max_depth,
+            timeout_ms,
+            via_kind,
+        } => commands::modules::cmd_module_route(
+            &root, &from, &to, all, max_paths, max_depth, timeout_ms, &via_kind, format,
+        ),
+        Commands::UnusedDeps {
+            module,
+            verbose,
+            no_transitive,
+            no_xml,
+            no_resources,
+            strict,
+        } => {
             let check_transitive = !no_transitive && !strict;
             let check_xml = !no_xml && !strict;
             let check_resources = !no_resources && !strict;
-            commands::modules::cmd_unused_deps(&root, &module, verbose, check_transitive, check_xml, check_resources)
+            commands::modules::cmd_unused_deps(
+                &root,
+                &module,
+                verbose,
+                check_transitive,
+                check_xml,
+                check_resources,
+            )
         }
         // File commands
-        Commands::File { pattern, exact, limit } => commands::files::cmd_file(&root, &pattern, exact, limit),
+        Commands::File {
+            pattern,
+            exact,
+            limit,
+        } => commands::files::cmd_file(&root, &pattern, exact, limit),
         Commands::Outline { file } => commands::files::cmd_outline(&root, &file),
         Commands::Imports { file } => commands::files::cmd_imports(&root, &file),
-        Commands::Api { module_path, limit } => commands::files::cmd_api(&root, &module_path, limit),
+        Commands::Api { module_path, limit } => {
+            commands::files::cmd_api(&root, &module_path, limit)
+        }
         Commands::Changed { base } => {
             let vcs = commands::files::detect_vcs(&root);
             let default_base = if vcs == "arc" {
@@ -813,30 +981,86 @@ fn main() -> Result<()> {
             commands::files::cmd_changed(&root, base)
         }
         // Android commands
-        Commands::XmlUsages { class_name, module } => commands::android::cmd_xml_usages(&root, &class_name, module.as_deref()),
-        Commands::ResourceUsages { resource, module, r#type, unused } => {
-            commands::android::cmd_resource_usages(&root, &resource, module.as_deref(), r#type.as_deref(), unused)
+        Commands::XmlUsages { class_name, module } => {
+            commands::android::cmd_xml_usages(&root, &class_name, module.as_deref())
         }
+        Commands::ResourceUsages {
+            resource,
+            module,
+            r#type,
+            unused,
+        } => commands::android::cmd_resource_usages(
+            &root,
+            &resource,
+            module.as_deref(),
+            r#type.as_deref(),
+            unused,
+        ),
         // iOS commands
-        Commands::StoryboardUsages { class_name, module } => commands::ios::cmd_storyboard_usages(&root, &class_name, module.as_deref()),
-        Commands::AssetUsages { asset, module, r#type, unused } => commands::ios::cmd_asset_usages(&root, &asset, module.as_deref(), r#type.as_deref(), unused),
-        Commands::Swiftui { query, limit } => commands::ios::cmd_swiftui(&root, query.as_deref(), limit),
-        Commands::AsyncFuncs { query, limit } => commands::ios::cmd_async_funcs(&root, query.as_deref(), limit),
-        Commands::Publishers { query, limit } => commands::ios::cmd_publishers(&root, query.as_deref(), limit),
-        Commands::MainActor { query, limit } => commands::ios::cmd_main_actor(&root, query.as_deref(), limit),
-        // Perl commands
-        Commands::PerlExports { query, limit } => commands::perl::cmd_perl_exports(&root, query.as_deref(), limit),
-        Commands::PerlSubs { query, limit } => commands::perl::cmd_perl_subs(&root, query.as_deref(), limit),
-        Commands::PerlPod { query, limit } => commands::perl::cmd_perl_pod(&root, query.as_deref(), limit),
-        Commands::PerlTests { query, limit } => commands::perl::cmd_perl_tests(&root, query.as_deref(), limit),
-        Commands::PerlImports { query, limit } => commands::perl::cmd_perl_imports(&root, query.as_deref(), limit),
-        // Project insights
-        Commands::Map { module, per_dir, limit } => commands::project_info::cmd_map(&root, module.as_deref(), per_dir, limit, format),
-        Commands::Conventions => commands::project_info::cmd_conventions(&root, format),
-        Commands::UnusedSymbols { module, export_only, limit } => {
-            commands::analysis::cmd_unused_symbols(&root, module.as_deref(), export_only, limit, format)
+        Commands::StoryboardUsages { class_name, module } => {
+            commands::ios::cmd_storyboard_usages(&root, &class_name, module.as_deref())
         }
-        Commands::AddRoot { path, force } => commands::management::cmd_add_root(&root, &path, force),
+        Commands::AssetUsages {
+            asset,
+            module,
+            r#type,
+            unused,
+        } => commands::ios::cmd_asset_usages(
+            &root,
+            &asset,
+            module.as_deref(),
+            r#type.as_deref(),
+            unused,
+        ),
+        Commands::Swiftui { query, limit } => {
+            commands::ios::cmd_swiftui(&root, query.as_deref(), limit)
+        }
+        Commands::AsyncFuncs { query, limit } => {
+            commands::ios::cmd_async_funcs(&root, query.as_deref(), limit)
+        }
+        Commands::Publishers { query, limit } => {
+            commands::ios::cmd_publishers(&root, query.as_deref(), limit)
+        }
+        Commands::MainActor { query, limit } => {
+            commands::ios::cmd_main_actor(&root, query.as_deref(), limit)
+        }
+        // Perl commands
+        Commands::PerlExports { query, limit } => {
+            commands::perl::cmd_perl_exports(&root, query.as_deref(), limit)
+        }
+        Commands::PerlSubs { query, limit } => {
+            commands::perl::cmd_perl_subs(&root, query.as_deref(), limit)
+        }
+        Commands::PerlPod { query, limit } => {
+            commands::perl::cmd_perl_pod(&root, query.as_deref(), limit)
+        }
+        Commands::PerlTests { query, limit } => {
+            commands::perl::cmd_perl_tests(&root, query.as_deref(), limit)
+        }
+        Commands::PerlImports { query, limit } => {
+            commands::perl::cmd_perl_imports(&root, query.as_deref(), limit)
+        }
+        // Project insights
+        Commands::Map {
+            module,
+            per_dir,
+            limit,
+        } => commands::project_info::cmd_map(&root, module.as_deref(), per_dir, limit, format),
+        Commands::Conventions => commands::project_info::cmd_conventions(&root, format),
+        Commands::UnusedSymbols {
+            module,
+            export_only,
+            limit,
+        } => commands::analysis::cmd_unused_symbols(
+            &root,
+            module.as_deref(),
+            export_only,
+            limit,
+            format,
+        ),
+        Commands::AddRoot { path, force } => {
+            commands::management::cmd_add_root(&root, &path, force)
+        }
         Commands::RemoveRoot { path } => commands::management::cmd_remove_root(&root, &path),
         Commands::ListRoots => commands::management::cmd_list_roots(&root),
         Commands::Watch => commands::watch::cmd_watch(&root),
@@ -848,7 +1072,11 @@ fn main() -> Result<()> {
         Commands::InstallClaudePlugin => cmd_install_claude_plugin(),
         Commands::InstallCodexMcp { dry_run } => cmd_install_codex_mcp(&root, dry_run),
         // Programmatic access
-        Commands::Agrep { pattern, lang, json } => commands::grep::cmd_ast_grep(&root, &pattern, lang.as_deref(), json),
+        Commands::Agrep {
+            pattern,
+            lang,
+            json,
+        } => commands::grep::cmd_ast_grep(&root, &pattern, lang.as_deref(), json),
         Commands::Query { sql, limit } => commands::management::cmd_query(&root, &sql, limit),
         Commands::DbPath => commands::management::cmd_db_path(&root),
         Commands::Schema => commands::management::cmd_schema(&root),
@@ -860,7 +1088,12 @@ fn cmd_install_claude_plugin() -> Result<()> {
 
     println!("Adding ast-index marketplace...");
     let status = Command::new("claude")
-        .args(["plugin", "marketplace", "add", "defendend/Claude-ast-index-search"])
+        .args([
+            "plugin",
+            "marketplace",
+            "add",
+            "defendend/Claude-ast-index-search",
+        ])
         .status();
 
     match status {
@@ -891,7 +1124,10 @@ fn cmd_install_claude_plugin() -> Result<()> {
             eprintln!("Plugin install exited with {}", s);
         }
         Err(e) => {
-            return Err(anyhow::anyhow!("Failed to run claude plugin install: {}", e));
+            return Err(anyhow::anyhow!(
+                "Failed to run claude plugin install: {}",
+                e
+            ));
         }
     }
 
@@ -912,17 +1148,16 @@ impl CodexMcpInstall {
             .context("could not determine current ast-index executable path")?;
         let cwd = std::env::current_dir().context("could not determine current directory")?;
         let argv0 = std::env::args_os().next();
-        let ast_index_bin =
-            resolve_ast_index_bin_from(argv0.as_deref(), &cwd, path_env.as_ref())
-                .unwrap_or_else(|| current_exe.clone());
-        let ast_index_mcp_bin =
-            resolve_ast_index_mcp_bin_from(&ast_index_bin, path_env.as_ref()).or_else(|err| {
-                if current_exe == ast_index_bin {
-                    Err(err)
-                } else {
-                    resolve_ast_index_mcp_bin_from(&current_exe, path_env.as_ref()).map_err(|_| err)
-                }
-            })?;
+        let ast_index_bin = resolve_ast_index_bin_from(argv0.as_deref(), &cwd, path_env.as_ref())
+            .unwrap_or_else(|| current_exe.clone());
+        let ast_index_mcp_bin = resolve_ast_index_mcp_bin_from(&ast_index_bin, path_env.as_ref())
+            .or_else(|err| {
+            if current_exe == ast_index_bin {
+                Err(err)
+            } else {
+                resolve_ast_index_mcp_bin_from(&current_exe, path_env.as_ref()).map_err(|_| err)
+            }
+        })?;
         let project_root = project_root
             .canonicalize()
             .unwrap_or_else(|_| project_root.to_path_buf());
@@ -988,7 +1223,9 @@ fn cmd_install_codex_mcp(root: &Path, dry_run: bool) -> Result<()> {
         Ok(s) => {
             eprintln!("codex mcp add exited with {s}.");
             print_codex_fallback(&install);
-            Err(anyhow::anyhow!("failed to register ast-index MCP server in Codex"))
+            Err(anyhow::anyhow!(
+                "failed to register ast-index MCP server in Codex"
+            ))
         }
         Err(e) => {
             eprintln!("could not run `codex`: {e}");
@@ -1022,8 +1259,7 @@ fn resolve_ast_index_bin_from(
     }
 
     let invoked_name = invoked_as.to_string_lossy();
-    find_on_path(&invoked_name, path_env)
-        .or_else(|| find_on_path(ast_index_exe_name(), path_env))
+    find_on_path(&invoked_name, path_env).or_else(|| find_on_path(ast_index_exe_name(), path_env))
 }
 
 fn normalize_dot_components(path: &Path) -> PathBuf {
@@ -1211,7 +1447,12 @@ fn find_project_root_for_read_at_with_db(
         // Check for .xcodeproj
         if let Ok(entries) = std::fs::read_dir(ancestor) {
             for entry in entries.flatten() {
-                if entry.path().extension().map(|e| e == "xcodeproj").unwrap_or(false) {
+                if entry
+                    .path()
+                    .extension()
+                    .map(|e| e == "xcodeproj")
+                    .unwrap_or(false)
+                {
                     return Ok(ancestor.to_path_buf());
                 }
             }
@@ -1233,16 +1474,17 @@ fn find_project_root_for_read_at_with_db(
             return Ok(ancestor.to_path_buf());
         }
         // Python markers
-        if ancestor.join("pyproject.toml").exists()
-            || ancestor.join("setup.py").exists()
-        {
+        if ancestor.join("pyproject.toml").exists() || ancestor.join("setup.py").exists() {
             return Ok(ancestor.to_path_buf());
         }
         // C#/.NET markers
         if let Ok(entries) = std::fs::read_dir(ancestor) {
-            let has_sln = entries
-                .flatten()
-                .any(|e| e.path().extension().map(|ext| ext == "sln").unwrap_or(false));
+            let has_sln = entries.flatten().any(|e| {
+                e.path()
+                    .extension()
+                    .map(|ext| ext == "sln")
+                    .unwrap_or(false)
+            });
             if has_sln {
                 return Ok(ancestor.to_path_buf());
             }
@@ -1358,8 +1600,7 @@ mod root_lookup_tests {
         fs::create_dir_all(root.join("app/src")).unwrap();
 
         let home = tmp.path().parent().unwrap();
-        let got =
-            find_project_root_for_read_at(&root.join("app/src"), Some(home)).unwrap();
+        let got = find_project_root_for_read_at(&root.join("app/src"), Some(home)).unwrap();
         assert_eq!(got, root);
     }
 
@@ -1402,7 +1643,10 @@ mod root_lookup_tests {
 
         let got = find_project_root_for_read_at(&proj, Some(&fake_home)).unwrap();
         // No marker at or below $HOME → falls back to cwd
-        assert_eq!(got, proj, "walk must stop at $HOME, marker above is ignored");
+        assert_eq!(
+            got, proj,
+            "walk must stop at $HOME, marker above is ignored"
+        );
     }
 
     #[test]
@@ -1419,8 +1663,7 @@ mod root_lookup_tests {
         fs::create_dir_all(kid.join("src")).unwrap();
 
         let home = tmp.path().parent().unwrap();
-        let got =
-            find_project_root_for_read_at(&kid.join("src"), Some(home)).unwrap();
+        let got = find_project_root_for_read_at(&kid.join("src"), Some(home)).unwrap();
         assert_eq!(got, kid, "closer Cargo.toml wins over further .git");
     }
 
@@ -1488,13 +1731,9 @@ mod root_lookup_tests {
         fs::create_dir_all(&proj).unwrap();
 
         // DB is ABOVE $HOME — should be ignored.
-        let got = find_project_root_for_read_at_with_db(
-            &proj,
-            Some(&fake_home),
-            true,
-            db_at(above_home),
-        )
-        .unwrap();
+        let got =
+            find_project_root_for_read_at_with_db(&proj, Some(&fake_home), true, db_at(above_home))
+                .unwrap();
         assert_eq!(
             got, proj,
             "walk_up must not escape $HOME even to find an existing DB"
@@ -1672,8 +1911,8 @@ mod codex_mcp_install_tests {
         fs::create_dir_all(&path_dir).unwrap();
         fake_exe(&path_dir, "ast-index-mcp");
 
-        let got = resolve_ast_index_mcp_bin_from(&current_exe, Some(&OsString::from(&path_dir)))
-            .unwrap();
+        let got =
+            resolve_ast_index_mcp_bin_from(&current_exe, Some(&OsString::from(&path_dir))).unwrap();
 
         assert_eq!(got, sibling_mcp);
     }
@@ -1686,8 +1925,8 @@ mod codex_mcp_install_tests {
         fs::create_dir_all(&path_dir).unwrap();
         let path_mcp = fake_exe(&path_dir, "ast-index-mcp");
 
-        let got = resolve_ast_index_mcp_bin_from(&current_exe, Some(&OsString::from(&path_dir)))
-            .unwrap();
+        let got =
+            resolve_ast_index_mcp_bin_from(&current_exe, Some(&OsString::from(&path_dir))).unwrap();
 
         assert_eq!(got, path_mcp);
     }

@@ -1,12 +1,12 @@
 //! Tree-sitter based Go parser
 
 use anyhow::Result;
-use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 use std::sync::LazyLock;
+use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
+use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
-use super::{LanguageParser, parse_tree, node_text, node_line, line_text};
 
 static GO_LANGUAGE: LazyLock<Language> = LazyLock::new(|| tree_sitter_go::LANGUAGE.into());
 
@@ -29,7 +29,10 @@ impl LanguageParser for GoParser {
         // Build capture name → index map
         let capture_names = query.capture_names();
         let idx = |name: &str| -> Option<u32> {
-            capture_names.iter().position(|n| *n == name).map(|i| i as u32)
+            capture_names
+                .iter()
+                .position(|n| *n == name)
+                .map(|i| i as u32)
         };
 
         let idx_package = idx("package");
@@ -69,13 +72,10 @@ impl LanguageParser for GoParser {
                 let raw_path = node_text(content, &path_cap.node);
                 // Strip quotes
                 let path = raw_path.trim_matches('"');
-                let alias = find_capture(m, idx_import_alias)
-                    .map(|c| node_text(content, &c.node));
+                let alias = find_capture(m, idx_import_alias).map(|c| node_text(content, &c.node));
                 let line = node_line(&path_cap.node);
 
-                let name = alias.unwrap_or_else(|| {
-                    path.rsplit('/').next().unwrap_or(path)
-                });
+                let name = alias.unwrap_or_else(|| path.rsplit('/').next().unwrap_or(path));
 
                 symbols.push(ParsedSymbol {
                     name: name.to_string(),
@@ -235,95 +235,122 @@ mod tests {
     fn test_parse_package() {
         let content = "package main\n";
         let symbols = GO_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "main" && s.kind == SymbolKind::Package));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "main" && s.kind == SymbolKind::Package));
     }
 
     #[test]
     fn test_parse_struct() {
         let content = "package main\n\ntype DeleteAction struct {\n    avaSrv AvatarsMDS\n}\n";
         let symbols = GO_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "DeleteAction" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "DeleteAction" && s.kind == SymbolKind::Class));
     }
 
     #[test]
     fn test_parse_interface() {
         let content = "package main\n\ntype AvatarsMDS interface {\n    Delete(ctx context.Context) error\n}\n";
         let symbols = GO_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "AvatarsMDS" && s.kind == SymbolKind::Interface));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "AvatarsMDS" && s.kind == SymbolKind::Interface));
     }
 
     #[test]
     fn test_parse_method_pointer_receiver() {
         let content = "package main\n\nfunc (a *DeleteAction) Do(ctx context.Context) error {\n    return nil\n}\n";
         let symbols = GO_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s|
-            s.name == "Do"
+        assert!(symbols.iter().any(|s| s.name == "Do"
             && s.kind == SymbolKind::Function
-            && s.parents.iter().any(|(p, k)| p == "DeleteAction" && k == "receiver")
-        ));
+            && s.parents
+                .iter()
+                .any(|(p, k)| p == "DeleteAction" && k == "receiver")));
     }
 
     #[test]
     fn test_parse_method_value_receiver() {
-        let content = "package main\n\nfunc (a DeleteAction) String() string {\n    return \"\"\n}\n";
+        let content =
+            "package main\n\nfunc (a DeleteAction) String() string {\n    return \"\"\n}\n";
         let symbols = GO_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s|
-            s.name == "String"
+        assert!(symbols.iter().any(|s| s.name == "String"
             && s.kind == SymbolKind::Function
-            && s.parents.iter().any(|(p, k)| p == "DeleteAction" && k == "receiver")
-        ));
+            && s.parents
+                .iter()
+                .any(|(p, k)| p == "DeleteAction" && k == "receiver")));
     }
 
     #[test]
     fn test_parse_function() {
         let content = "package main\n\nfunc NewDeleteAction() *DeleteAction {\n    return &DeleteAction{}\n}\n";
         let symbols = GO_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "NewDeleteAction" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "NewDeleteAction" && s.kind == SymbolKind::Function));
     }
 
     #[test]
     fn test_parse_import_block() {
         let content = "package main\n\nimport (\n    \"fmt\"\n    \"net/http\"\n    log \"github.com/sirupsen/logrus\"\n)\n";
         let symbols = GO_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "fmt" && s.kind == SymbolKind::Import));
-        assert!(symbols.iter().any(|s| s.name == "http" && s.kind == SymbolKind::Import));
-        assert!(symbols.iter().any(|s| s.name == "log" && s.kind == SymbolKind::Import));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "fmt" && s.kind == SymbolKind::Import));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "http" && s.kind == SymbolKind::Import));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "log" && s.kind == SymbolKind::Import));
     }
 
     #[test]
     fn test_parse_single_import() {
         let content = "package main\n\nimport \"fmt\"\n";
         let symbols = GO_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "fmt" && s.kind == SymbolKind::Import));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "fmt" && s.kind == SymbolKind::Import));
     }
 
     #[test]
     fn test_parse_const_block() {
         let content = "package main\n\nconst (\n    StatusActive = iota\n    StatusDeleted\n    MaxRetries int = 5\n)\n";
         let symbols = GO_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "StatusActive" && s.kind == SymbolKind::Constant));
-        assert!(symbols.iter().any(|s| s.name == "MaxRetries" && s.kind == SymbolKind::Constant));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "StatusActive" && s.kind == SymbolKind::Constant));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "MaxRetries" && s.kind == SymbolKind::Constant));
     }
 
     #[test]
     fn test_parse_single_const() {
         let content = "package main\n\nconst SingleConst = \"hello\"\n";
         let symbols = GO_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "SingleConst" && s.kind == SymbolKind::Constant));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "SingleConst" && s.kind == SymbolKind::Constant));
     }
 
     #[test]
     fn test_parse_var() {
         let content = "package main\n\nvar PublicVar string\n";
         let symbols = GO_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "PublicVar" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "PublicVar" && s.kind == SymbolKind::Property));
     }
 
     #[test]
     fn test_parse_type_alias() {
         let content = "package main\n\ntype UserID int64\n";
         let symbols = GO_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "UserID" && s.kind == SymbolKind::TypeAlias));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "UserID" && s.kind == SymbolKind::TypeAlias));
     }
 
     #[test]
@@ -333,7 +360,9 @@ mod tests {
         assert!(symbols.iter().any(|s| s.name == "PublicStruct"));
         assert!(symbols.iter().any(|s| s.name == "PublicFunc"));
         assert!(symbols.iter().any(|s| s.name == "privateFunc"));
-        assert!(symbols.iter().any(|s| s.name == "PublicVar" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "PublicVar" && s.kind == SymbolKind::Property));
     }
 
     #[test]
@@ -359,7 +388,9 @@ func VeryLongFunction(
 }
 "#;
         let symbols = GO_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "VeryLongFunction" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "VeryLongFunction" && s.kind == SymbolKind::Function));
     }
 
     #[test]
@@ -376,7 +407,11 @@ type ReadWriter interface {
 }
 "#;
         let symbols = GO_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "Reader" && s.kind == SymbolKind::Interface));
-        assert!(symbols.iter().any(|s| s.name == "ReadWriter" && s.kind == SymbolKind::Interface));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Reader" && s.kind == SymbolKind::Interface));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "ReadWriter" && s.kind == SymbolKind::Interface));
     }
 }

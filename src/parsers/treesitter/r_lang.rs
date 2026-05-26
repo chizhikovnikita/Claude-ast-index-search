@@ -1,12 +1,12 @@
 //! Tree-sitter based R parser
 
 use anyhow::Result;
-use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 use std::sync::LazyLock;
+use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
+use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
-use super::{LanguageParser, parse_tree, node_text, node_line, line_text};
 
 static R_LANGUAGE: LazyLock<Language> = LazyLock::new(|| tree_sitter_r::LANGUAGE.into());
 
@@ -29,7 +29,10 @@ impl LanguageParser for RParser {
         // Build capture name → index map
         let capture_names = query.capture_names();
         let idx = |name: &str| -> Option<u32> {
-            capture_names.iter().position(|n| *n == name).map(|i| i as u32)
+            capture_names
+                .iter()
+                .position(|n| *n == name)
+                .map(|i| i as u32)
         };
 
         let idx_func_name_arrow = idx("func_name_arrow");
@@ -243,29 +246,39 @@ mod tests {
     fn test_function_assignment() {
         let content = "my_func <- function(x, y) {\n  x + y\n}\n";
         let symbols = R_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "my_func" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "my_func" && s.kind == SymbolKind::Function));
     }
 
     #[test]
     fn test_function_arrow() {
         let content = "add = function(a, b) a + b\n";
         let symbols = R_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "add" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "add" && s.kind == SymbolKind::Function));
     }
 
     #[test]
     fn test_library_call() {
         let content = "library(dplyr)\nrequire(ggplot2)\n";
         let symbols = R_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "dplyr" && s.kind == SymbolKind::Import));
-        assert!(symbols.iter().any(|s| s.name == "ggplot2" && s.kind == SymbolKind::Import));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "dplyr" && s.kind == SymbolKind::Import));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "ggplot2" && s.kind == SymbolKind::Import));
     }
 
     #[test]
     fn test_comments_ignored() {
         let content = "# fake <- function() {}\nreal <- function() { 1 }\n";
         let symbols = R_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "real" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "real" && s.kind == SymbolKind::Function));
         assert!(!symbols.iter().any(|s| s.name == "fake"));
     }
 
@@ -308,52 +321,80 @@ setGeneric("fit", function(object, ...) standardGeneric("fit"))
         let symbols = R_PARSER.parse_symbols(content).unwrap();
 
         // Imports
-        assert!(symbols.iter().any(|s| s.name == "dplyr" && s.kind == SymbolKind::Import));
-        assert!(symbols.iter().any(|s| s.name == "ggplot2" && s.kind == SymbolKind::Import));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "dplyr" && s.kind == SymbolKind::Import));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "ggplot2" && s.kind == SymbolKind::Import));
 
         // Functions
-        assert!(symbols.iter().any(|s| s.name == "process_data" && s.kind == SymbolKind::Function));
-        assert!(symbols.iter().any(|s| s.name == "compute_mean" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "process_data" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "compute_mean" && s.kind == SymbolKind::Function));
 
         // S4 class
-        assert!(symbols.iter().any(|s| s.name == "MyModel" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "MyModel" && s.kind == SymbolKind::Class));
 
         // S4 method
-        assert!(symbols.iter().any(|s| s.name == "show" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "show" && s.kind == SymbolKind::Function));
 
         // R6 class
-        assert!(symbols.iter().any(|s| s.name == "MyService" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "MyService" && s.kind == SymbolKind::Class));
 
         // S4 generic
-        assert!(symbols.iter().any(|s| s.name == "fit" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "fit" && s.kind == SymbolKind::Function));
     }
 
     #[test]
     fn test_s4_class() {
-        let content = "setClass(\"Person\", representation(name = \"character\", age = \"numeric\"))\n";
+        let content =
+            "setClass(\"Person\", representation(name = \"character\", age = \"numeric\"))\n";
         let symbols = R_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "Person" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Person" && s.kind == SymbolKind::Class));
     }
 
     #[test]
     fn test_r6_class() {
-        let content = "Animal <- R6Class(\"Animal\", public = list(speak = function() cat(\"...\")))\n";
+        let content =
+            "Animal <- R6Class(\"Animal\", public = list(speak = function() cat(\"...\")))\n";
         let symbols = R_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "Animal" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Animal" && s.kind == SymbolKind::Class));
     }
 
     #[test]
     fn test_global_assignment_function() {
         let content = "global_fn <<- function(x) x * 2\n";
         let symbols = R_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "global_fn" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "global_fn" && s.kind == SymbolKind::Function));
     }
 
     #[test]
     fn test_library_string_argument() {
         let content = "library(\"tidyverse\")\nrequire(\"data.table\")\n";
         let symbols = R_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "tidyverse" && s.kind == SymbolKind::Import));
-        assert!(symbols.iter().any(|s| s.name == "data.table" && s.kind == SymbolKind::Import));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "tidyverse" && s.kind == SymbolKind::Import));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "data.table" && s.kind == SymbolKind::Import));
     }
 }

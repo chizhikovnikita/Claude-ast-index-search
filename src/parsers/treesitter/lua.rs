@@ -1,12 +1,12 @@
 //! Tree-sitter based Lua parser
 
 use anyhow::Result;
-use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 use std::sync::LazyLock;
+use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
+use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
-use super::{LanguageParser, parse_tree, node_text, node_line, line_text};
 
 static LUA_LANGUAGE: LazyLock<Language> = LazyLock::new(|| tree_sitter_lua::LANGUAGE.into());
 
@@ -28,7 +28,10 @@ impl LanguageParser for LuaParser {
 
         let capture_names = query.capture_names();
         let idx = |name: &str| -> Option<u32> {
-            capture_names.iter().position(|n| *n == name).map(|i| i as u32)
+            capture_names
+                .iter()
+                .position(|n| *n == name)
+                .map(|i| i as u32)
         };
 
         let idx_func_name = idx("func_name");
@@ -183,32 +186,38 @@ mod tests {
     fn test_parse_function() {
         let content = "function greet(name)\n    print(name)\nend\n";
         let symbols = LUA_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "greet" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "greet" && s.kind == SymbolKind::Function));
     }
 
     #[test]
     fn test_parse_local_function() {
         let content = "local function helper(x)\n    return x + 1\nend\n";
         let symbols = LUA_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "helper" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "helper" && s.kind == SymbolKind::Function));
     }
 
     #[test]
     fn test_parse_method() {
         let content = "function MyClass:init(name)\n    self.name = name\nend\n";
         let symbols = LUA_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s|
-            s.name == "init"
+        assert!(symbols.iter().any(|s| s.name == "init"
             && s.kind == SymbolKind::Function
-            && s.parents.iter().any(|(p, k)| p == "MyClass" && k == "receiver")
-        ));
+            && s.parents
+                .iter()
+                .any(|(p, k)| p == "MyClass" && k == "receiver")));
     }
 
     #[test]
     fn test_parse_variable() {
         let content = "local max_retries = 5\n";
         let symbols = LUA_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "max_retries" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "max_retries" && s.kind == SymbolKind::Property));
     }
 
     #[test]
@@ -247,37 +256,66 @@ return M
         let symbols = LUA_PARSER.parse_symbols(content).unwrap();
 
         // Table constructor as class
-        assert!(symbols.iter().any(|s| s.name == "M" && s.kind == SymbolKind::Class),
-            "Expected M as Class, got: {:?}", symbols);
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "M" && s.kind == SymbolKind::Class),
+            "Expected M as Class, got: {:?}",
+            symbols
+        );
 
         // Require import
-        assert!(symbols.iter().any(|s| s.name == "json" && s.kind == SymbolKind::Import),
-            "Expected json import, got: {:?}", symbols);
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "json" && s.kind == SymbolKind::Import),
+            "Expected json import, got: {:?}",
+            symbols
+        );
 
         // Local variable
-        assert!(symbols.iter().any(|s| s.name == "max_size" && s.kind == SymbolKind::Property),
-            "Expected max_size as Property, got: {:?}", symbols);
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "max_size" && s.kind == SymbolKind::Property),
+            "Expected max_size as Property, got: {:?}",
+            symbols
+        );
 
         // Colon method
-        assert!(symbols.iter().any(|s|
-            s.name == "new"
-            && s.kind == SymbolKind::Function
-            && s.parents.iter().any(|(p, _)| p == "M")
-        ), "Expected M:new method, got: {:?}", symbols);
+        assert!(
+            symbols.iter().any(|s| s.name == "new"
+                && s.kind == SymbolKind::Function
+                && s.parents.iter().any(|(p, _)| p == "M")),
+            "Expected M:new method, got: {:?}",
+            symbols
+        );
 
         // Dot method
-        assert!(symbols.iter().any(|s|
-            s.name == "create"
-            && s.kind == SymbolKind::Function
-            && s.parents.iter().any(|(p, _)| p == "M")
-        ), "Expected M.create method, got: {:?}", symbols);
+        assert!(
+            symbols.iter().any(|s| s.name == "create"
+                && s.kind == SymbolKind::Function
+                && s.parents.iter().any(|(p, _)| p == "M")),
+            "Expected M.create method, got: {:?}",
+            symbols
+        );
 
         // Local function
-        assert!(symbols.iter().any(|s| s.name == "validate" && s.kind == SymbolKind::Function),
-            "Expected validate function, got: {:?}", symbols);
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "validate" && s.kind == SymbolKind::Function),
+            "Expected validate function, got: {:?}",
+            symbols
+        );
 
         // Module return
-        assert!(symbols.iter().any(|s| s.name == "M" && s.kind == SymbolKind::Package),
-            "Expected M as module return, got: {:?}", symbols);
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "M" && s.kind == SymbolKind::Package),
+            "Expected M as module return, got: {:?}",
+            symbols
+        );
     }
 }

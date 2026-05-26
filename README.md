@@ -548,9 +548,6 @@ ios_asset_usages (id, asset_id, usage_file, usage_line, usage_type)
 Create `.ast-index.yaml` in your project root to configure ast-index:
 
 ```yaml
-# Force project type (useful when auto-detection fails)
-project_type: bsl
-
 # Additional directories to index
 roots:
   - "../shared-lib"
@@ -568,16 +565,13 @@ no_ignore: false
 
 All fields are optional. CLI flags override config file values.
 
-### Examples
+Legacy `project_type:` keys are ignored for backward compatibility, so old
+configs keep working unchanged.
 
-**1C:Enterprise (BSL) project:**
-```yaml
-project_type: bsl
-```
+### Examples
 
 **Monorepo with shared libraries:**
 ```yaml
-project_type: android
 roots:
   - "../core"
   - "../network"

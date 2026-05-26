@@ -16,7 +16,10 @@ use crate::db;
 /// Find XML usages of a class (layouts, views)
 pub fn cmd_xml_usages(root: &Path, class_name: &str, module_filter: Option<&str>) -> Result<()> {
     if !db::db_exists(root) {
-        println!("{}", "Index not found. Run 'ast-index rebuild' first.".red());
+        println!(
+            "{}",
+            "Index not found. Run 'ast-index rebuild' first.".red()
+        );
         return Ok(());
     }
 
@@ -25,52 +28,75 @@ pub fn cmd_xml_usages(root: &Path, class_name: &str, module_filter: Option<&str>
     // Check if XML usages are indexed
     let xml_count: i64 = conn.query_row("SELECT COUNT(*) FROM xml_usages", [], |row| row.get(0))?;
     if xml_count == 0 {
-        println!("{}", "XML usages not indexed. Run 'ast-index rebuild' first.".yellow());
+        println!(
+            "{}",
+            "XML usages not indexed. Run 'ast-index rebuild' first.".yellow()
+        );
         return Ok(());
     }
 
     // Search for class in XML usages
     let pattern = format!("%{}%", class_name);
 
-    let results: Vec<(String, String, i64, String, Option<String>)> = if let Some(module) = module_filter {
-        let mut stmt = conn.prepare(
-            "SELECT m.name, x.file_path, x.line, x.class_name, x.element_id
+    let results: Vec<(String, String, i64, String, Option<String>)> =
+        if let Some(module) = module_filter {
+            let mut stmt = conn.prepare(
+                "SELECT m.name, x.file_path, x.line, x.class_name, x.element_id
              FROM xml_usages x
              JOIN modules m ON x.module_id = m.id
              WHERE x.class_name LIKE ?1 AND m.name = ?2
-             ORDER BY m.name, x.file_path, x.line"
-        )?;
-        let rows = stmt.query_map(params![pattern, module], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
-        })?;
-        rows.filter_map(|r| r.ok()).collect()
-    } else {
-        let mut stmt = conn.prepare(
-            "SELECT m.name, x.file_path, x.line, x.class_name, x.element_id
+             ORDER BY m.name, x.file_path, x.line",
+            )?;
+            let rows = stmt.query_map(params![pattern, module], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })?;
+            rows.filter_map(|r| r.ok()).collect()
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT m.name, x.file_path, x.line, x.class_name, x.element_id
              FROM xml_usages x
              JOIN modules m ON x.module_id = m.id
              WHERE x.class_name LIKE ?1
              ORDER BY m.name, x.file_path, x.line
-             LIMIT 100"
-        )?;
-        let rows = stmt.query_map(params![pattern], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
-        })?;
-        rows.filter_map(|r| r.ok()).collect()
-    };
+             LIMIT 100",
+            )?;
+            let rows = stmt.query_map(params![pattern], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
 
-    println!("{}", format!("XML usages of '{}' ({}):", class_name, results.len()).bold());
+    println!(
+        "{}",
+        format!("XML usages of '{}' ({}):", class_name, results.len()).bold()
+    );
 
     // Group by module
     let mut by_module: HashMap<String, Vec<(String, i64, String, Option<String>)>> = HashMap::new();
     for (module, file, line, class, element_id) in results {
-        by_module.entry(module).or_default().push((file, line, class, element_id));
+        by_module
+            .entry(module)
+            .or_default()
+            .push((file, line, class, element_id));
     }
 
     for (module, usages) in &by_module {
         println!("\n{}:", module.cyan());
         for (file, line, class, element_id) in usages {
-            let id_str = element_id.as_ref()
+            let id_str = element_id
+                .as_ref()
                 .map(|id| format!(" ({})", id))
                 .unwrap_or_default();
             println!("  {}:{}", file, line);
@@ -94,7 +120,10 @@ pub fn cmd_resource_usages(
     show_unused: bool,
 ) -> Result<()> {
     if !db::db_exists(root) {
-        println!("{}", "Index not found. Run 'ast-index rebuild' first.".red());
+        println!(
+            "{}",
+            "Index not found. Run 'ast-index rebuild' first.".red()
+        );
         return Ok(());
     }
 
@@ -103,7 +132,10 @@ pub fn cmd_resource_usages(
     // Check if resources are indexed
     let res_count: i64 = conn.query_row("SELECT COUNT(*) FROM resources", [], |row| row.get(0))?;
     if res_count == 0 {
-        println!("{}", "Resources not indexed. Run 'ast-index rebuild' first.".yellow());
+        println!(
+            "{}",
+            "Resources not indexed. Run 'ast-index rebuild' first.".yellow()
+        );
         return Ok(());
     }
 
@@ -111,11 +143,17 @@ pub fn cmd_resource_usages(
         // Show unused resources in the module
         let module = module_filter.unwrap_or("");
         if module.is_empty() {
-            println!("{}", "Please specify --module to find unused resources.".yellow());
+            println!(
+                "{}",
+                "Please specify --module to find unused resources.".yellow()
+            );
             return Ok(());
         }
     } else if resource.is_empty() {
-        println!("{}", "Please specify a resource name (e.g., @drawable/ic_payment or use --unused).".yellow());
+        println!(
+            "{}",
+            "Please specify a resource name (e.g., @drawable/ic_payment or use --unused).".yellow()
+        );
         return Ok(());
     }
 
@@ -130,11 +168,13 @@ pub fn cmd_resource_usages(
              JOIN modules m ON r.module_id = m.id
              LEFT JOIN resource_usages ru ON r.id = ru.resource_id
              WHERE m.name = ?1 AND ru.id IS NULL
-             ORDER BY r.type, r.name"
+             ORDER BY r.type, r.name",
         )?;
 
         let unused: Vec<(String, String, String)> = stmt
-            .query_map(params![module], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .query_map(params![module], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
             .filter_map(|r| r.ok())
             .collect();
 
@@ -160,14 +200,16 @@ pub fn cmd_resource_usages(
         }
 
         println!("\n{}", format!("Total unused: {} resources", total).bold());
-
     } else {
         // Parse resource reference (e.g., @drawable/ic_payment or R.string.app_name)
         let (res_type, res_name) = parse_resource_reference(resource);
 
         let res_type = type_filter.unwrap_or(&res_type);
 
-        println!("{}", format!("Usages of '@{}/{}':", res_type, res_name).bold());
+        println!(
+            "{}",
+            format!("Usages of '@{}/{}':", res_type, res_name).bold()
+        );
 
         // Find resource usages
         let results: Vec<(String, i64, String)> = if let Some(module) = module_filter {
@@ -177,7 +219,7 @@ pub fn cmd_resource_usages(
                  JOIN resources r ON ru.resource_id = r.id
                  WHERE r.type = ?1 AND r.name = ?2 AND ru.usage_file LIKE ?3
                  ORDER BY ru.usage_file, ru.usage_line
-                 LIMIT 100"
+                 LIMIT 100",
             )?;
             let module_pattern = format!("%{}%", module);
             let rows = stmt.query_map(params![res_type, res_name, module_pattern], |row| {
@@ -191,7 +233,7 @@ pub fn cmd_resource_usages(
                  JOIN resources r ON ru.resource_id = r.id
                  WHERE r.type = ?1 AND r.name = ?2
                  ORDER BY ru.usage_file, ru.usage_line
-                 LIMIT 100"
+                 LIMIT 100",
             )?;
             let rows = stmt.query_map(params![res_type, res_name], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))

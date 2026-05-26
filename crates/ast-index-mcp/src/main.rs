@@ -447,11 +447,7 @@ fn tool_descriptors() -> Vec<Value> {
     ]
 }
 
-fn call_tool(
-    params: Value,
-    ast_index_bin: &str,
-    default_root: &PathBuf,
-) -> Result<String> {
+fn call_tool(params: Value, ast_index_bin: &str, default_root: &PathBuf) -> Result<String> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
@@ -484,14 +480,10 @@ fn call_tool(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!(
-            "ast-index exited with {}: {stderr}",
-            output.status
-        ));
+        return Err(anyhow!("ast-index exited with {}: {stderr}", output.status));
     }
 
-    let stdout = String::from_utf8(output.stdout)
-        .context("ast-index produced non-UTF8 output")?;
+    let stdout = String::from_utf8(output.stdout).context("ast-index produced non-UTF8 output")?;
 
     let rendered = match output_format {
         "json" => stdout, // caller asked for raw JSON — pass through
@@ -506,8 +498,7 @@ fn call_tool(
 fn supports_json_format(tool: &str) -> bool {
     matches!(
         tool,
-        "search" | "usages" | "implementations" | "refs" | "stats"
-            | "symbol" | "class"
+        "search" | "usages" | "implementations" | "refs" | "stats" | "symbol" | "class"
     )
 }
 
@@ -524,7 +515,11 @@ pub fn build_argv(name: &str, arguments: &Value) -> Result<Vec<String>> {
             push_if_str(&mut argv, &arguments, "kind", "--type");
             push_if_str(&mut argv, &arguments, "in_file", "--in-file");
             push_if_str(&mut argv, &arguments, "module", "--module");
-            if arguments.get("fuzzy").and_then(Value::as_bool).unwrap_or(false) {
+            if arguments
+                .get("fuzzy")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
                 argv.push("--fuzzy".into());
             }
         }
@@ -562,7 +557,11 @@ pub fn build_argv(name: &str, arguments: &Value) -> Result<Vec<String>> {
         "find_file" => {
             argv.push("file".into());
             argv.push(require_string(&arguments, "pattern")?);
-            if arguments.get("exact").and_then(Value::as_bool).unwrap_or(false) {
+            if arguments
+                .get("exact")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
                 argv.push("--exact".into());
             }
             push_if_num(&mut argv, &arguments, "limit", "--limit");
@@ -583,7 +582,11 @@ pub fn build_argv(name: &str, arguments: &Value) -> Result<Vec<String>> {
             push_if_num(&mut argv, &arguments, "limit", "--limit");
             push_if_str(&mut argv, &arguments, "in_file", "--in-file");
             push_if_str(&mut argv, &arguments, "module", "--module");
-            if arguments.get("fuzzy").and_then(Value::as_bool).unwrap_or(false) {
+            if arguments
+                .get("fuzzy")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
                 argv.push("--fuzzy".into());
             }
         }
@@ -596,7 +599,11 @@ pub fn build_argv(name: &str, arguments: &Value) -> Result<Vec<String>> {
             push_if_num(&mut argv, &arguments, "limit", "--limit");
             push_if_str(&mut argv, &arguments, "in_file", "--in-file");
             push_if_str(&mut argv, &arguments, "module", "--module");
-            if arguments.get("fuzzy").and_then(Value::as_bool).unwrap_or(false) {
+            if arguments
+                .get("fuzzy")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
                 argv.push("--fuzzy".into());
             }
         }
@@ -663,7 +670,10 @@ fn push_if_str(argv: &mut Vec<String>, args: &Value, key: &str, flag: &str) {
 }
 
 fn push_if_num(argv: &mut Vec<String>, args: &Value, key: &str, flag: &str) {
-    if let Some(n) = args.get(key).and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64))) {
+    if let Some(n) = args
+        .get(key)
+        .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)))
+    {
         argv.push(flag.into());
         argv.push(n.to_string());
     }
@@ -703,9 +713,10 @@ mod tests {
                 tool.get("description").and_then(Value::as_str).is_some(),
                 "tool {name} missing description"
             );
-            let schema = tool.get("inputSchema").and_then(Value::as_object).unwrap_or_else(|| {
-                panic!("tool {name} missing inputSchema object")
-            });
+            let schema = tool
+                .get("inputSchema")
+                .and_then(Value::as_object)
+                .unwrap_or_else(|| panic!("tool {name} missing inputSchema object"));
             assert_eq!(
                 schema.get("type").and_then(Value::as_str),
                 Some("object"),
@@ -754,13 +765,19 @@ mod tests {
         assert_eq!(
             argv,
             vec![
-                "search", "Foo",
-                "--limit", "100",
-                "--type", "class",
-                "--in-file", "src/",
-                "--module", "core",
+                "search",
+                "Foo",
+                "--limit",
+                "100",
+                "--type",
+                "class",
+                "--in-file",
+                "src/",
+                "--module",
+                "core",
                 "--fuzzy",
-                "--format", "json",
+                "--format",
+                "json",
             ]
         );
     }
@@ -790,25 +807,31 @@ mod tests {
             argv,
             vec![
                 "class",
-                "--pattern", "*Service",
-                "--limit", "10",
+                "--pattern",
+                "*Service",
+                "--limit",
+                "10",
                 "--fuzzy",
-                "--format", "json",
+                "--format",
+                "json",
             ]
         );
     }
 
     #[test]
     fn symbol_with_name_first_then_flags() {
-        let argv = build_argv(
-            "symbol",
-            &json!({"name": "PathResolver", "kind": "class"}),
-        )
-        .unwrap();
+        let argv = build_argv("symbol", &json!({"name": "PathResolver", "kind": "class"})).unwrap();
         // name is positional, kind is --type, format=json appended
         assert_eq!(
             argv,
-            vec!["symbol", "PathResolver", "--type", "class", "--format", "json"]
+            vec![
+                "symbol",
+                "PathResolver",
+                "--type",
+                "class",
+                "--format",
+                "json"
+            ]
         );
     }
 
@@ -866,10 +889,7 @@ mod tests {
     fn deps_dependents_module_required() {
         for tool in &["deps", "dependents"] {
             let err = build_argv(tool, &json!({})).unwrap_err();
-            assert!(
-                err.to_string().contains("'module'"),
-                "{tool}: {err}"
-            );
+            assert!(err.to_string().contains("'module'"), "{tool}: {err}");
         }
     }
 
@@ -883,15 +903,38 @@ mod tests {
 
     #[test]
     fn supports_json_format_correct_set() {
-        let yes = ["search", "usages", "implementations", "refs", "stats", "symbol", "class"];
-        let no  = ["outline", "callers", "rebuild", "find_file", "update",
-                   "hierarchy", "imports", "api", "changed", "module",
-                   "deps", "dependents", "call_tree"];
+        let yes = [
+            "search",
+            "usages",
+            "implementations",
+            "refs",
+            "stats",
+            "symbol",
+            "class",
+        ];
+        let no = [
+            "outline",
+            "callers",
+            "rebuild",
+            "find_file",
+            "update",
+            "hierarchy",
+            "imports",
+            "api",
+            "changed",
+            "module",
+            "deps",
+            "dependents",
+            "call_tree",
+        ];
         for t in yes {
             assert!(supports_json_format(t), "{t} should support --format json");
         }
         for t in no {
-            assert!(!supports_json_format(t), "{t} should NOT support --format json");
+            assert!(
+                !supports_json_format(t),
+                "{t} should NOT support --format json"
+            );
         }
     }
 

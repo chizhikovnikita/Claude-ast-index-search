@@ -1,12 +1,12 @@
 //! Tree-sitter based Groovy parser
 
 use anyhow::Result;
-use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 use std::sync::LazyLock;
+use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
+use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
-use super::{LanguageParser, parse_tree, node_text, node_line, line_text};
 
 static GROOVY_LANGUAGE: LazyLock<Language> = LazyLock::new(|| tree_sitter_groovy::LANGUAGE.into());
 
@@ -28,7 +28,10 @@ impl LanguageParser for GroovyParser {
 
         let capture_names = query.capture_names();
         let idx = |name: &str| -> Option<u32> {
-            capture_names.iter().position(|n| *n == name).map(|i| i as u32)
+            capture_names
+                .iter()
+                .position(|n| *n == name)
+                .map(|i| i as u32)
         };
 
         let idx_package_name = idx("package_name");
@@ -179,7 +182,9 @@ mod tests {
     fn test_parse_class() {
         let content = "class MyService {\n}\n";
         let symbols = GROOVY_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "MyService" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "MyService" && s.kind == SymbolKind::Class));
     }
 
     #[test]
@@ -190,7 +195,9 @@ mod tests {
 }
 "#;
         let symbols = GROOVY_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "processData" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "processData" && s.kind == SymbolKind::Function));
     }
 
     #[test]
@@ -202,7 +209,9 @@ mod tests {
 }
 "#;
         let symbols = GROOVY_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "formatName" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "formatName" && s.kind == SymbolKind::Function));
     }
 
     #[test]
@@ -213,15 +222,21 @@ mod tests {
 }
 "#;
         let symbols = GROOVY_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "apiUrl" && s.kind == SymbolKind::Property));
-        assert!(symbols.iter().any(|s| s.name == "maxRetries" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "apiUrl" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "maxRetries" && s.kind == SymbolKind::Property));
     }
 
     #[test]
     fn test_parse_interface() {
         let content = "interface Repository {\n    List getAll();\n}\n";
         let symbols = GROOVY_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "Repository" && s.kind == SymbolKind::Interface));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Repository" && s.kind == SymbolKind::Interface));
     }
 
     #[test]
@@ -237,14 +252,18 @@ mod tests {
     fn test_parse_enum() {
         let content = "enum Status {\n    ACTIVE,\n    INACTIVE\n}\n";
         let symbols = GROOVY_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "Status" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Status" && s.kind == SymbolKind::Class));
     }
 
     #[test]
     fn test_parse_import() {
         let content = "import java.util.List;\n";
         let symbols = GROOVY_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "List" && s.kind == SymbolKind::Import));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "List" && s.kind == SymbolKind::Import));
     }
 
     #[test]

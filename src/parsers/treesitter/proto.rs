@@ -1,12 +1,12 @@
 //! Tree-sitter based Protocol Buffers parser
 
 use anyhow::Result;
-use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 use std::sync::LazyLock;
+use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
+use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
-use super::{LanguageParser, parse_tree, node_text, node_line, line_text};
 
 static PROTO_LANGUAGE: LazyLock<Language> = LazyLock::new(|| tree_sitter_proto::LANGUAGE.into());
 
@@ -28,7 +28,10 @@ impl LanguageParser for ProtoParser {
 
         let capture_names = query.capture_names();
         let idx = |name: &str| -> Option<u32> {
-            capture_names.iter().position(|n| *n == name).map(|i| i as u32)
+            capture_names
+                .iter()
+                .position(|n| *n == name)
+                .map(|i| i as u32)
         };
 
         let idx_package_name = idx("package_name");
@@ -101,10 +104,8 @@ impl LanguageParser for ProtoParser {
                     .map(|c| node_text(content, &c.node))
                     .unwrap_or("");
 
-                let signature = format!(
-                    "rpc {}({}) returns ({})",
-                    name, request_type, response_type
-                );
+                let signature =
+                    format!("rpc {}({}) returns ({})", name, request_type, response_type);
 
                 symbols.push(ParsedSymbol {
                     name: name.to_string(),
@@ -198,7 +199,11 @@ fn collect_messages_and_enums(
 }
 
 /// Extract text from a named child node type (e.g., "message_name" -> identifier text)
-fn extract_named_child_text(content: &str, node: &tree_sitter::Node, child_kind: &str) -> Option<String> {
+fn extract_named_child_text(
+    content: &str,
+    node: &tree_sitter::Node,
+    child_kind: &str,
+) -> Option<String> {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == child_kind {
@@ -237,7 +242,9 @@ package direct.api.v6;
 "#;
         let symbols = PROTO_PARSER.parse_symbols(content).unwrap();
         assert!(
-            symbols.iter().any(|s| s.name == "direct.api.v6" && s.kind == SymbolKind::Package),
+            symbols
+                .iter()
+                .any(|s| s.name == "direct.api.v6" && s.kind == SymbolKind::Package),
             "expected package 'direct.api.v6', got: {:?}",
             symbols
         );
@@ -254,7 +261,9 @@ message GetCampaignRequest {
 "#;
         let symbols = PROTO_PARSER.parse_symbols(content).unwrap();
         assert!(
-            symbols.iter().any(|s| s.name == "GetCampaignRequest" && s.kind == SymbolKind::Class),
+            symbols
+                .iter()
+                .any(|s| s.name == "GetCampaignRequest" && s.kind == SymbolKind::Class),
             "expected message 'GetCampaignRequest', got: {:?}",
             symbols
         );
@@ -274,19 +283,26 @@ message Outer {
 "#;
         let symbols = PROTO_PARSER.parse_symbols(content).unwrap();
         assert!(
-            symbols.iter().any(|s| s.name == "Outer" && s.kind == SymbolKind::Class),
+            symbols
+                .iter()
+                .any(|s| s.name == "Outer" && s.kind == SymbolKind::Class),
             "expected message 'Outer', got: {:?}",
             symbols
         );
         assert!(
-            symbols.iter().any(|s| s.name == "Outer.Inner" && s.kind == SymbolKind::Class),
+            symbols
+                .iter()
+                .any(|s| s.name == "Outer.Inner" && s.kind == SymbolKind::Class),
             "expected nested message 'Outer.Inner', got: {:?}",
             symbols
         );
         // Check parent relationship
         let inner = symbols.iter().find(|s| s.name == "Outer.Inner").unwrap();
         assert!(
-            inner.parents.iter().any(|(p, k)| p == "Outer" && k == "nested_in"),
+            inner
+                .parents
+                .iter()
+                .any(|(p, k)| p == "Outer" && k == "nested_in"),
             "expected parent 'Outer' with 'nested_in', got: {:?}",
             inner.parents
         );
@@ -314,9 +330,15 @@ message Level1 {
             symbols
         );
         // Check parent of Level3
-        let level3 = symbols.iter().find(|s| s.name == "Level1.Level2.Level3").unwrap();
+        let level3 = symbols
+            .iter()
+            .find(|s| s.name == "Level1.Level2.Level3")
+            .unwrap();
         assert!(
-            level3.parents.iter().any(|(p, k)| p == "Level1.Level2" && k == "nested_in"),
+            level3
+                .parents
+                .iter()
+                .any(|(p, k)| p == "Level1.Level2" && k == "nested_in"),
             "expected parent 'Level1.Level2', got: {:?}",
             level3.parents
         );
@@ -333,7 +355,9 @@ service CampaignService {
 "#;
         let symbols = PROTO_PARSER.parse_symbols(content).unwrap();
         assert!(
-            symbols.iter().any(|s| s.name == "CampaignService" && s.kind == SymbolKind::Interface),
+            symbols
+                .iter()
+                .any(|s| s.name == "CampaignService" && s.kind == SymbolKind::Interface),
             "expected service 'CampaignService', got: {:?}",
             symbols
         );
@@ -406,7 +430,9 @@ enum Status {
 "#;
         let symbols = PROTO_PARSER.parse_symbols(content).unwrap();
         assert!(
-            symbols.iter().any(|s| s.name == "Status" && s.kind == SymbolKind::Enum),
+            symbols
+                .iter()
+                .any(|s| s.name == "Status" && s.kind == SymbolKind::Enum),
             "expected enum 'Status', got: {:?}",
             symbols
         );
@@ -427,7 +453,9 @@ message Response {
 "#;
         let symbols = PROTO_PARSER.parse_symbols(content).unwrap();
         assert!(
-            symbols.iter().any(|s| s.kind == SymbolKind::Enum && s.name == "Response.Status"),
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Enum && s.name == "Response.Status"),
             "expected nested enum 'Response.Status', got: {:?}",
             symbols
         );
@@ -444,12 +472,17 @@ message Request {}
 "#;
         let symbols = PROTO_PARSER.parse_symbols(content).unwrap();
         assert!(
-            symbols.iter().any(|s| s.name == "java_package:com.example.api.v1" && s.kind == SymbolKind::Property),
+            symbols
+                .iter()
+                .any(|s| s.name == "java_package:com.example.api.v1"
+                    && s.kind == SymbolKind::Property),
             "expected option 'java_package:com.example.api.v1', got: {:?}",
             symbols
         );
         assert!(
-            symbols.iter().any(|s| s.name == "api.v1" && s.kind == SymbolKind::Package),
+            symbols
+                .iter()
+                .any(|s| s.name == "api.v1" && s.kind == SymbolKind::Package),
             "expected package 'api.v1', got: {:?}",
             symbols
         );
@@ -471,12 +504,16 @@ message TChangeAgencyRequest {
         let symbols = PROTO_PARSER.parse_symbols(content).unwrap();
 
         assert!(
-            symbols.iter().any(|s| s.kind == SymbolKind::Package && s.name == "NDirect.ChangeAgency"),
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Package && s.name == "NDirect.ChangeAgency"),
             "expected package, got: {:?}",
             symbols
         );
         assert!(
-            symbols.iter().any(|s| s.kind == SymbolKind::Class && s.name == "TChangeAgencyRequest"),
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Class && s.name == "TChangeAgencyRequest"),
             "expected outer message, got: {:?}",
             symbols
         );
@@ -518,27 +555,45 @@ enum GlobalEnum {
         let symbols = PROTO_PARSER.parse_symbols(content).unwrap();
 
         // Package
-        assert!(symbols.iter().any(|s| s.name == "direct.api.v6" && s.kind == SymbolKind::Package));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "direct.api.v6" && s.kind == SymbolKind::Package));
 
         // Option
-        assert!(symbols.iter().any(|s| s.name == "java_package:com.example.api" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "java_package:com.example.api" && s.kind == SymbolKind::Property));
 
         // Messages
-        assert!(symbols.iter().any(|s| s.name == "GetCampaignRequest" && s.kind == SymbolKind::Class));
-        assert!(symbols.iter().any(|s| s.name == "GetCampaignRequest.Nested" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "GetCampaignRequest" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "GetCampaignRequest.Nested" && s.kind == SymbolKind::Class));
 
         // Nested enum
-        assert!(symbols.iter().any(|s| s.name == "GetCampaignRequest.Status" && s.kind == SymbolKind::Enum));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "GetCampaignRequest.Status" && s.kind == SymbolKind::Enum));
 
         // Service
-        assert!(symbols.iter().any(|s| s.name == "CampaignService" && s.kind == SymbolKind::Interface));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "CampaignService" && s.kind == SymbolKind::Interface));
 
         // RPCs
-        assert!(symbols.iter().any(|s| s.name == "GetCampaign" && s.kind == SymbolKind::Function));
-        assert!(symbols.iter().any(|s| s.name == "StreamEvents" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "GetCampaign" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "StreamEvents" && s.kind == SymbolKind::Function));
 
         // Global enum
-        assert!(symbols.iter().any(|s| s.name == "GlobalEnum" && s.kind == SymbolKind::Enum));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "GlobalEnum" && s.kind == SymbolKind::Enum));
     }
 
     #[test]
@@ -573,11 +628,21 @@ service AdminService {
 }
 "#;
         let symbols = PROTO_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "UserService" && s.kind == SymbolKind::Interface));
-        assert!(symbols.iter().any(|s| s.name == "AdminService" && s.kind == SymbolKind::Interface));
-        assert!(symbols.iter().any(|s| s.name == "CreateUser" && s.kind == SymbolKind::Function));
-        assert!(symbols.iter().any(|s| s.name == "GetUser" && s.kind == SymbolKind::Function));
-        assert!(symbols.iter().any(|s| s.name == "DeleteUser" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "UserService" && s.kind == SymbolKind::Interface));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "AdminService" && s.kind == SymbolKind::Interface));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "CreateUser" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "GetUser" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "DeleteUser" && s.kind == SymbolKind::Function));
     }
 
     #[test]
@@ -607,7 +672,9 @@ syntax = "proto3";
 message Empty {}
 "#;
         let symbols = PROTO_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "Empty" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Empty" && s.kind == SymbolKind::Class));
     }
 
     #[test]
@@ -624,18 +691,30 @@ message Outer {
         let symbols = PROTO_PARSER.parse_symbols(content).unwrap();
 
         let outer = symbols.iter().find(|s| s.name == "Outer").unwrap();
-        assert!(outer.parents.is_empty(), "top-level message should have no parents");
+        assert!(
+            outer.parents.is_empty(),
+            "top-level message should have no parents"
+        );
 
         let middle = symbols.iter().find(|s| s.name == "Outer.Middle").unwrap();
         assert!(
-            middle.parents.iter().any(|(p, k)| p == "Outer" && k == "nested_in"),
+            middle
+                .parents
+                .iter()
+                .any(|(p, k)| p == "Outer" && k == "nested_in"),
             "Middle should be nested_in Outer: {:?}",
             middle.parents
         );
 
-        let inner = symbols.iter().find(|s| s.name == "Outer.Middle.Inner").unwrap();
+        let inner = symbols
+            .iter()
+            .find(|s| s.name == "Outer.Middle.Inner")
+            .unwrap();
         assert!(
-            inner.parents.iter().any(|(p, k)| p == "Outer.Middle" && k == "nested_in"),
+            inner
+                .parents
+                .iter()
+                .any(|(p, k)| p == "Outer.Middle" && k == "nested_in"),
             "Inner should be nested_in Outer.Middle: {:?}",
             inner.parents
         );
@@ -660,9 +739,15 @@ message Error {
 }
 "#;
         let symbols = PROTO_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "Request" && s.kind == SymbolKind::Class));
-        assert!(symbols.iter().any(|s| s.name == "Response" && s.kind == SymbolKind::Class));
-        assert!(symbols.iter().any(|s| s.name == "Error" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Request" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Response" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Error" && s.kind == SymbolKind::Class));
     }
 
     #[test]
@@ -679,7 +764,9 @@ message Outer {
 "#;
         let symbols = PROTO_PARSER.parse_symbols(content).unwrap();
         assert!(
-            symbols.iter().any(|s| s.name == "Outer.Inner.Priority" && s.kind == SymbolKind::Enum),
+            symbols
+                .iter()
+                .any(|s| s.name == "Outer.Inner.Priority" && s.kind == SymbolKind::Enum),
             "expected deeply nested enum 'Outer.Inner.Priority', got: {:?}",
             symbols
         );
@@ -687,11 +774,18 @@ message Outer {
 
     #[test]
     fn test_line_numbers() {
-        let content = "syntax = \"proto3\";\npackage test;\n\nmessage Foo {\n    string bar = 1;\n}\n";
+        let content =
+            "syntax = \"proto3\";\npackage test;\n\nmessage Foo {\n    string bar = 1;\n}\n";
         let symbols = PROTO_PARSER.parse_symbols(content).unwrap();
-        let pkg = symbols.iter().find(|s| s.name == "test" && s.kind == SymbolKind::Package).unwrap();
+        let pkg = symbols
+            .iter()
+            .find(|s| s.name == "test" && s.kind == SymbolKind::Package)
+            .unwrap();
         assert_eq!(pkg.line, 2, "package should be on line 2");
-        let msg = symbols.iter().find(|s| s.name == "Foo" && s.kind == SymbolKind::Class).unwrap();
+        let msg = symbols
+            .iter()
+            .find(|s| s.name == "Foo" && s.kind == SymbolKind::Class)
+            .unwrap();
         assert_eq!(msg.line, 4, "message should be on line 4");
     }
 }
