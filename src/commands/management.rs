@@ -47,41 +47,25 @@ impl Drop for ScopedEnvVar {
     }
 }
 
-fn init_rebuild_schema(conn: &rusqlite::Connection, experimental_fast_rebuild: bool) -> Result<()> {
-    if experimental_fast_rebuild {
-        db::enable_experimental_fast_rebuild_pragmas(conn)?;
-        db::init_db_for_rebuild(conn)
-    } else {
-        db::init_db(conn)
-    }
+fn init_rebuild_schema(conn: &rusqlite::Connection) -> Result<()> {
+    db::enable_rebuild_pragmas(conn)?;
+    db::init_db_for_rebuild(conn)
 }
 
-fn finalize_rebuild_schema(
-    conn: &rusqlite::Connection,
-    experimental_fast_rebuild: bool,
-    verbose: bool,
-) -> Result<()> {
-    if experimental_fast_rebuild {
-        let t = Instant::now();
-        db::finalize_db_after_rebuild(conn)?;
-        if verbose {
-            eprintln!("[verbose] finalize_db_after_rebuild in {:?}", t.elapsed());
-        }
+fn finalize_rebuild_schema(conn: &rusqlite::Connection, verbose: bool) -> Result<()> {
+    let t = Instant::now();
+    db::finalize_db_after_rebuild(conn)?;
+    if verbose {
+        eprintln!("[verbose] finalize_db_after_rebuild in {:?}", t.elapsed());
     }
     Ok(())
 }
 
-fn restore_rebuild_pragmas(
-    conn: &rusqlite::Connection,
-    experimental_fast_rebuild: bool,
-    verbose: bool,
-) -> Result<()> {
-    if experimental_fast_rebuild {
-        let t = Instant::now();
-        db::restore_default_pragmas(conn)?;
-        if verbose {
-            eprintln!("[verbose] restore_default_pragmas in {:?}", t.elapsed());
-        }
+fn restore_rebuild_pragmas(conn: &rusqlite::Connection, verbose: bool) -> Result<()> {
+    let t = Instant::now();
+    db::restore_rebuild_pragmas(conn)?;
+    if verbose {
+        eprintln!("[verbose] restore_rebuild_pragmas in {:?}", t.elapsed());
     }
     Ok(())
 }
@@ -350,7 +334,7 @@ pub fn cmd_rebuild(
     }
     let t = Instant::now();
     let mut conn = db::open_db(root)?;
-    init_rebuild_schema(&conn, experimental_fast_rebuild)?;
+    init_rebuild_schema(&conn)?;
     if verbose {
         eprintln!("[verbose] DB opened + schema created in {:?}", t.elapsed());
     }
@@ -630,7 +614,7 @@ pub fn cmd_rebuild(
             }
 
             // Print summary based on which platform-specific indexes ran.
-            finalize_rebuild_schema(&conn, experimental_fast_rebuild, verbose)?;
+            finalize_rebuild_schema(&conn, verbose)?;
 
             if is_android && is_ios {
                 println!(
@@ -679,7 +663,7 @@ pub fn cmd_rebuild(
                 no_ignore,
                 config_exclude.as_deref(),
             )?;
-            finalize_rebuild_schema(&conn, experimental_fast_rebuild, verbose)?;
+            finalize_rebuild_schema(&conn, verbose)?;
             println!("{}", format!("Indexed {} files", walk.file_count).green());
         }
         "modules" => {
@@ -693,7 +677,7 @@ pub fn cmd_rebuild(
                 let gradle_files = indexer::collect_build_files_from_db(&conn, root)?;
                 let dep_count =
                     indexer::index_module_dependencies(&mut conn, root, &gradle_files, true)?;
-                finalize_rebuild_schema(&conn, experimental_fast_rebuild, verbose)?;
+                finalize_rebuild_schema(&conn, verbose)?;
                 println!(
                     "{}",
                     format!(
@@ -703,7 +687,7 @@ pub fn cmd_rebuild(
                     .green()
                 );
             } else {
-                finalize_rebuild_schema(&conn, experimental_fast_rebuild, verbose)?;
+                finalize_rebuild_schema(&conn, verbose)?;
                 println!("{}", format!("Indexed {} modules", module_count).green());
             }
         }
@@ -712,7 +696,7 @@ pub fn cmd_rebuild(
             let gradle_files = indexer::collect_build_files_from_db(&conn, root)?;
             let dep_count =
                 indexer::index_module_dependencies(&mut conn, root, &gradle_files, true)?;
-            finalize_rebuild_schema(&conn, experimental_fast_rebuild, verbose)?;
+            finalize_rebuild_schema(&conn, verbose)?;
             println!("{}", format!("Indexed {} dependencies", dep_count).green());
         }
         _ => {
@@ -723,7 +707,7 @@ pub fn cmd_rebuild(
     if verbose {
         eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
     }
-    restore_rebuild_pragmas(&conn, experimental_fast_rebuild, verbose)?;
+    restore_rebuild_pragmas(&conn, verbose)?;
     Ok(())
 }
 
@@ -794,7 +778,7 @@ fn cmd_rebuild_sub_projects(
         return Err(e);
     }
     let mut conn = db::open_db(root)?;
-    init_rebuild_schema(&conn, experimental_fast_rebuild)?;
+    init_rebuild_schema(&conn)?;
     if verbose {
         eprintln!("[verbose] DB created in {:?}", t.elapsed());
     }
@@ -974,7 +958,7 @@ fn cmd_rebuild_sub_projects(
         }
     }
 
-    finalize_rebuild_schema(&conn, experimental_fast_rebuild, verbose)?;
+    finalize_rebuild_schema(&conn, verbose)?;
 
     println!();
     println!(
@@ -987,7 +971,7 @@ fn cmd_rebuild_sub_projects(
     if verbose {
         eprintln!("{}", format!("Total time: {:?}", start.elapsed()).dimmed());
     }
-    restore_rebuild_pragmas(&conn, experimental_fast_rebuild, verbose)?;
+    restore_rebuild_pragmas(&conn, verbose)?;
     Ok(())
 }
 

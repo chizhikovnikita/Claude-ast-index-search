@@ -410,17 +410,17 @@ pub fn finalize_db_after_rebuild(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Apply aggressive SQLite settings for experimental fast rebuilds.
+/// Apply conservative SQLite settings tuned for rebuild throughput.
 ///
-/// Keep this intentionally conservative: the experimental fast rebuild flag
-/// should not sacrifice durability or explode memory usage by default.
-pub fn enable_experimental_fast_rebuild_pragmas(conn: &Connection) -> Result<()> {
+/// This is safe to use for every rebuild: it does not relax durability or
+/// journaling, it only increases the cache from the normal 8 MB to 16 MB.
+pub fn enable_rebuild_pragmas(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "cache_size", "-16000")?; // 16 MB cache
     Ok(())
 }
 
-/// Restore the regular connection settings after an experimental fast rebuild.
-pub fn restore_default_pragmas(conn: &Connection) -> Result<()> {
+/// Restore the regular connection settings after a rebuild.
+pub fn restore_rebuild_pragmas(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "cache_size", "-8000")?;
     Ok(())
 }

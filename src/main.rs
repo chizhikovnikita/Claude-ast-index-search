@@ -253,7 +253,7 @@ enum Commands {
         /// Verbose logging with timing for each step
         #[arg(long, short)]
         verbose: bool,
-        /// Experimental: use faster rebuild settings (defer indexes/FTS and relax SQLite durability during rebuild)
+        /// Experimental: use more aggressive rebuild heuristics (parallel side-index phases, higher update parallelism, and large-monorepo shortcuts)
         #[arg(long)]
         experimental_fast_rebuild: bool,
         /// Number of parallel threads (default: CPU cores, max 8; increase for network filesystems)
