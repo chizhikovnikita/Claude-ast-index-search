@@ -586,6 +586,9 @@ exclude:
 
 ## Changelog
 
+### 3.44.1
+- **Index C++ enum values and relax symbol CLI compatibility** — C++ enumerators like `kAntifraud` are now indexed as constants, so `symbol kAntifraud`, `symbol AcceptanceOperationInitiator::kAntifraud`, `symbol ::kAntifraud`, and wildcard forms such as `symbol AcceptanceOperationInitiator::*` work without forcing users to switch to `-p`
+
 ### 3.44.0
 - **Add namespace-aware C++ symbol search without breaking bare lookups** — `symbol Client` still finds all matching classes, while `symbol arcanum::Client`, `symbol -p '::Client'`, and `symbol -p 'foo::bar*'` now narrow by fully-qualified names and print qualified results to disambiguate duplicate class names across namespaces
 - **Expand `module-route` diagnostics and graph output** — `module-route` now returns clearer empty/truncated reasons, better timeout handling, self-edge handling, `json`/`mermaid`/`dot` output, and stronger regression coverage for large fanout graphs
