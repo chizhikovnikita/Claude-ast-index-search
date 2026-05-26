@@ -32,7 +32,7 @@ pub fn cmd_unused_symbols(
     let (sql, filter_param) = if let Some(mod_path) = module {
         (
             r#"
-            SELECT s.name, s.kind, s.line, s.signature, f.path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE f.path LIKE ?1
@@ -44,7 +44,7 @@ pub fn cmd_unused_symbols(
     } else if export_only {
         (
             r#"
-            SELECT s.name, s.kind, s.line, s.signature, f.path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE s.kind IN ('class', 'interface', 'function', 'object', 'enum', 'protocol', 'struct')
@@ -56,7 +56,7 @@ pub fn cmd_unused_symbols(
     } else {
         (
             r#"
-            SELECT s.name, s.kind, s.line, s.signature, f.path
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE s.kind IN ('class', 'interface', 'function', 'object', 'enum', 'protocol', 'struct')
@@ -71,10 +71,11 @@ pub fn cmd_unused_symbols(
         stmt.query_map(params![pattern], |row| {
             Ok(db::SearchResult {
                 name: row.get(0)?,
-                kind: row.get(1)?,
-                line: row.get(2)?,
-                signature: row.get(3)?,
-                path: row.get(4)?,
+                qualified_name: row.get(1)?,
+                kind: row.get(2)?,
+                line: row.get(3)?,
+                signature: row.get(4)?,
+                path: row.get(5)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?
@@ -82,10 +83,11 @@ pub fn cmd_unused_symbols(
         stmt.query_map([], |row| {
             Ok(db::SearchResult {
                 name: row.get(0)?,
-                kind: row.get(1)?,
-                line: row.get(2)?,
-                signature: row.get(3)?,
-                path: row.get(4)?,
+                qualified_name: row.get(1)?,
+                kind: row.get(2)?,
+                line: row.get(3)?,
+                signature: row.get(4)?,
+                path: row.get(5)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?

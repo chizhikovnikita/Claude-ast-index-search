@@ -2,6 +2,7 @@ use anyhow::Result;
 use rayon::prelude::*;
 use regex::Regex;
 use rusqlite::Connection;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -545,6 +546,7 @@ struct ParsedFile {
     mtime: i64,
     size: i64,
     symbols: Vec<ParsedSymbol>,
+    qualified_names: HashMap<(String, usize, String), String>,
     refs: Vec<ParsedRef>,
 }
 
@@ -570,6 +572,7 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
             mtime,
             size,
             symbols: vec![],
+            qualified_names: HashMap::new(),
             refs: vec![],
         });
     }
@@ -590,12 +593,18 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
                 mtime,
                 size,
                 symbols: vec![],
+                qualified_names: HashMap::new(),
                 refs: vec![],
             });
         }
     };
 
     let (mut symbols, refs) = parsers::parse_file_symbols(&content, file_type)?;
+    let mut qualified_names = HashMap::new();
+
+    if file_type == parsers::FileType::Cpp {
+        qualified_names = parsers::treesitter::cpp::collect_qualified_names(&content)?;
+    }
 
     // BSL (1C:Enterprise) — module names are encoded in directory structure,
     // not in file content. Extract module name from path and emit synthetic symbol.
@@ -616,6 +625,7 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
         mtime,
         size,
         symbols,
+        qualified_names,
         refs,
     })
 }
@@ -1339,7 +1349,7 @@ fn write_batch_to_db(
         };
         let mut file_stmt = tx.prepare_cached(file_sql)?;
         let mut sym_stmt = tx.prepare_cached(
-            "INSERT INTO symbols (file_id, name, kind, line, signature) VALUES (?1, ?2, ?3, ?4, ?5)"
+            "INSERT INTO symbols (file_id, name, qualified_name, kind, line, signature) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
         )?;
         let mut inh_stmt = tx.prepare_cached(
             "INSERT INTO inheritance (child_id, parent_name, kind) VALUES (?1, ?2, ?3)",
@@ -1349,16 +1359,28 @@ fn write_batch_to_db(
         )?;
 
         for pf in batch {
-            file_stmt.execute(rusqlite::params![pf.rel_path, pf.mtime, pf.size])?;
+            let ParsedFile {
+                rel_path,
+                mtime,
+                size,
+                symbols,
+                qualified_names,
+                refs,
+            } = pf;
+
+            file_stmt.execute(rusqlite::params![rel_path, mtime, size])?;
             let file_id = tx.last_insert_rowid();
             // `INSERT OR REPLACE` on `files.path` drops the previous file row first, and
             // `ON DELETE CASCADE` clears old symbols/refs automatically. Explicit deletes
             // here only add extra work, especially during full rebuilds on a fresh DB.
 
-            for sym in pf.symbols {
+            for sym in symbols {
+                let qualified_name =
+                    qualified_names.get(&(sym.kind.as_str().to_string(), sym.line, sym.name.clone()));
                 sym_stmt.execute(rusqlite::params![
                     file_id,
                     sym.name,
+                    qualified_name,
                     sym.kind.as_str(),
                     sym.line as i64,
                     sym.signature
@@ -1370,7 +1392,7 @@ fn write_batch_to_db(
                 }
             }
 
-            for r in pf.refs {
+            for r in refs {
                 ref_stmt.execute(rusqlite::params![file_id, r.name, r.line as i64, r.context])?;
             }
 
@@ -3911,6 +3933,7 @@ fn parse_dts_file(file_path: &Path, rel_path: &str) -> Result<ParsedFile> {
             mtime,
             size,
             symbols: vec![],
+            qualified_names: HashMap::new(),
             refs: vec![],
         });
     }
@@ -3923,6 +3946,7 @@ fn parse_dts_file(file_path: &Path, rel_path: &str) -> Result<ParsedFile> {
         mtime,
         size,
         symbols,
+        qualified_names: HashMap::new(),
         refs,
     })
 }

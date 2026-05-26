@@ -15,11 +15,23 @@ use colored::Colorize;
 use regex::Regex;
 use rusqlite::{params, Connection};
 
+use super::{relative_path, search_files, PathResolver};
 use crate::db::{self, SearchScope};
-use super::{search_files, relative_path, PathResolver};
+
+fn symbol_display_name(symbol: &db::SearchResult) -> &str {
+    symbol.display_name()
+}
 
 /// Full-text search across files, symbols, and file contents
-pub fn cmd_search(root: &Path, query: &str, kind_filter: Option<&str>, limit: usize, format: &str, scope: &SearchScope, fuzzy: bool) -> Result<()> {
+pub fn cmd_search(
+    root: &Path,
+    query: &str,
+    kind_filter: Option<&str>,
+    limit: usize,
+    format: &str,
+    scope: &SearchScope,
+    fuzzy: bool,
+) -> Result<()> {
     if !db::db_exists(root) {
         println!(
             "{}",
@@ -31,7 +43,11 @@ pub fn cmd_search(root: &Path, query: &str, kind_filter: Option<&str>, limit: us
     let conn = db::open_db(root)?;
 
     // Split query by comma for OR semantics: "email,mail" searches both terms
-    let terms: Vec<&str> = query.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()).collect();
+    let terms: Vec<&str> = query
+        .split(',')
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .collect();
     let per_term_limit = if terms.len() > 1 { limit } else { limit };
 
     // Collect results from all terms, deduplicating
@@ -71,7 +87,9 @@ pub fn cmd_search(root: &Path, query: &str, kind_filter: Option<&str>, limit: us
             let key = format!("{}:{}:{}", s.path, s.line, s.name);
             if seen_symbols.insert(key) {
                 if let Some(kf) = kind_filter {
-                    if s.kind == kf { symbols.push(s); }
+                    if s.kind == kf {
+                        symbols.push(s);
+                    }
                 } else {
                     symbols.push(s);
                 }
@@ -92,29 +110,45 @@ pub fn cmd_search(root: &Path, query: &str, kind_filter: Option<&str>, limit: us
 
     // 4. Search in file contents (grep)
     let pattern = if terms.len() > 1 {
-        terms.iter().map(|t| regex::escape(t)).collect::<Vec<_>>().join("|")
+        terms
+            .iter()
+            .map(|t| regex::escape(t))
+            .collect::<Vec<_>>()
+            .join("|")
     } else {
         regex::escape(query)
     };
 
-    super::search_files_limited(root, &pattern, &super::grep::ALL_SOURCE_EXTENSIONS, limit, |path, line_num, line| {
-        let rel_path = super::relative_path(root, path);
-        // Apply scope filter for grep results
-        if let Some(prefix) = scope.dir_prefix {
-            if !rel_path.starts_with(prefix) { return; }
-        }
-        if let Some(in_file) = scope.in_file {
-            if !rel_path.contains(in_file) { return; }
-        }
-        if let Some(module) = scope.module {
-            if !rel_path.starts_with(module) { return; }
-        }
-        let content: String = line.trim().chars().take(100).collect();
-        let key = format!("{}:{}", rel_path, line_num);
-        if seen_content.insert(key) {
-            content_matches.push((rel_path, line_num, content));
-        }
-    })?;
+    super::search_files_limited(
+        root,
+        &pattern,
+        &super::grep::ALL_SOURCE_EXTENSIONS,
+        limit,
+        |path, line_num, line| {
+            let rel_path = super::relative_path(root, path);
+            // Apply scope filter for grep results
+            if let Some(prefix) = scope.dir_prefix {
+                if !rel_path.starts_with(prefix) {
+                    return;
+                }
+            }
+            if let Some(in_file) = scope.in_file {
+                if !rel_path.contains(in_file) {
+                    return;
+                }
+            }
+            if let Some(module) = scope.module {
+                if !rel_path.starts_with(module) {
+                    return;
+                }
+            }
+            let content: String = line.trim().chars().take(100).collect();
+            let key = format!("{}:{}", rel_path, line_num);
+            if seen_content.insert(key) {
+                content_matches.push((rel_path, line_num, content));
+            }
+        },
+    )?;
 
     let resolver = PathResolver::from_conn(root, &conn);
     for p in &mut files {
@@ -158,7 +192,13 @@ pub fn cmd_search(root: &Path, query: &str, kind_filter: Option<&str>, limit: us
     if !symbols.is_empty() {
         println!("\n{}", "Symbols (definitions):".cyan());
         for s in symbols.iter().take(limit) {
-            println!("  {} [{}]: {}:{}", s.name.cyan(), s.kind, s.path, s.line);
+            println!(
+                "  {} [{}]: {}:{}",
+                symbol_display_name(s).cyan(),
+                s.kind,
+                s.path,
+                s.line
+            );
         }
     }
 
@@ -180,7 +220,11 @@ pub fn cmd_search(root: &Path, query: &str, kind_filter: Option<&str>, limit: us
         }
     }
 
-    if files.is_empty() && symbols.is_empty() && ref_matches.is_empty() && content_matches.is_empty() {
+    if files.is_empty()
+        && symbols.is_empty()
+        && ref_matches.is_empty()
+        && content_matches.is_empty()
+    {
         println!("  No results found.");
     }
 
@@ -188,7 +232,16 @@ pub fn cmd_search(root: &Path, query: &str, kind_filter: Option<&str>, limit: us
 }
 
 /// Find symbol by name or glob pattern
-pub fn cmd_symbol(root: &Path, name: Option<&str>, pattern: Option<&str>, kind: Option<&str>, limit: usize, format: &str, scope: &SearchScope, fuzzy: bool) -> Result<()> {
+pub fn cmd_symbol(
+    root: &Path,
+    name: Option<&str>,
+    pattern: Option<&str>,
+    kind: Option<&str>,
+    limit: usize,
+    format: &str,
+    scope: &SearchScope,
+    fuzzy: bool,
+) -> Result<()> {
     if !db::db_exists(root) {
         println!(
             "{}",
@@ -233,7 +286,13 @@ pub fn cmd_symbol(root: &Path, name: Option<&str>, pattern: Option<&str>, kind: 
     );
 
     for s in &symbols {
-        println!("  {} [{}]: {}:{}", s.name.cyan(), s.kind, s.path, s.line);
+        println!(
+            "  {} [{}]: {}:{}",
+            symbol_display_name(s).cyan(),
+            s.kind,
+            s.path,
+            s.line
+        );
         if let Some(sig) = &s.signature {
             let truncated: String = sig.chars().take(70).collect();
             println!("    {}", truncated.dimmed());
@@ -248,7 +307,15 @@ pub fn cmd_symbol(root: &Path, name: Option<&str>, pattern: Option<&str>, kind: 
 }
 
 /// Find class by name or glob pattern (classes, interfaces, objects, enums)
-pub fn cmd_class(root: &Path, name: Option<&str>, pattern: Option<&str>, limit: usize, format: &str, scope: &SearchScope, fuzzy: bool) -> Result<()> {
+pub fn cmd_class(
+    root: &Path,
+    name: Option<&str>,
+    pattern: Option<&str>,
+    limit: usize,
+    format: &str,
+    scope: &SearchScope,
+    fuzzy: bool,
+) -> Result<()> {
     if !db::db_exists(root) {
         println!(
             "{}",
@@ -272,7 +339,19 @@ pub fn cmd_class(root: &Path, name: Option<&str>, pattern: Option<&str>, limit: 
         if fuzzy {
             let all = db::search_symbols_fuzzy(&conn, name, limit * 5)?;
             all.into_iter()
-                .filter(|s| matches!(s.kind.as_str(), "class" | "interface" | "object" | "enum" | "protocol" | "struct" | "actor" | "package"))
+                .filter(|s| {
+                    matches!(
+                        s.kind.as_str(),
+                        "class"
+                            | "interface"
+                            | "object"
+                            | "enum"
+                            | "protocol"
+                            | "struct"
+                            | "actor"
+                            | "package"
+                    )
+                })
                 .take(limit)
                 .collect()
         } else {
@@ -294,7 +373,13 @@ pub fn cmd_class(root: &Path, name: Option<&str>, pattern: Option<&str>, limit: 
     println!("{}", format!("Classes matching '{}':", query_str).bold());
 
     for s in &results {
-        println!("  {} [{}]: {}:{}", s.name.cyan(), s.kind, s.path, s.line);
+        println!(
+            "  {} [{}]: {}:{}",
+            symbol_display_name(s).cyan(),
+            s.kind,
+            s.path,
+            s.line
+        );
     }
 
     if results.is_empty() {
@@ -305,7 +390,13 @@ pub fn cmd_class(root: &Path, name: Option<&str>, pattern: Option<&str>, limit: 
 }
 
 /// Find implementations of interface/class
-pub fn cmd_implementations(root: &Path, parent: &str, limit: usize, format: &str, scope: &SearchScope) -> Result<()> {
+pub fn cmd_implementations(
+    root: &Path,
+    parent: &str,
+    limit: usize,
+    format: &str,
+    scope: &SearchScope,
+) -> Result<()> {
     if !db::db_exists(root) {
         println!(
             "{}",
@@ -327,13 +418,16 @@ pub fn cmd_implementations(root: &Path, parent: &str, limit: usize, format: &str
         return Ok(());
     }
 
-    println!(
-        "{}",
-        format!("Implementations of '{}':", parent).bold()
-    );
+    println!("{}", format!("Implementations of '{}':", parent).bold());
 
     for s in &impls {
-        println!("  {} [{}]: {}:{}", s.name.cyan(), s.kind, s.path, s.line);
+        println!(
+            "  {} [{}]: {}:{}",
+            symbol_display_name(s).cyan(),
+            s.kind,
+            s.path,
+            s.line
+        );
     }
 
     if impls.is_empty() {
@@ -354,7 +448,8 @@ pub fn cmd_refs(root: &Path, symbol: &str, limit: usize, format: &str) -> Result
     }
 
     let conn = db::open_db(root)?;
-    let (mut definitions, mut imports, mut usages) = db::find_cross_references(&conn, symbol, limit)?;
+    let (mut definitions, mut imports, mut usages) =
+        db::find_cross_references(&conn, symbol, limit)?;
 
     let resolver = PathResolver::from_conn(root, &conn);
     for s in &mut definitions {
@@ -382,7 +477,13 @@ pub fn cmd_refs(root: &Path, symbol: &str, limit: usize, format: &str) -> Result
     if !definitions.is_empty() {
         println!("\n  {}", "Definitions:".cyan());
         for s in &definitions {
-            println!("    {} [{}]: {}:{}", s.name.cyan(), s.kind, s.path, s.line);
+            println!(
+                "    {} [{}]: {}:{}",
+                symbol_display_name(s).cyan(),
+                s.kind,
+                s.path,
+                s.line
+            );
         }
     }
 
@@ -432,7 +533,11 @@ pub fn cmd_hierarchy(root: &Path, name: &str, limit: usize, scope: &SearchScope)
     let packages = db::find_symbols_by_name(&conn, name, Some("package"), 1)?;
     let protocols = db::find_symbols_by_name(&conn, name, Some("protocol"), 1)?;
 
-    let target = classes.first().or(interfaces.first()).or(packages.first()).or(protocols.first());
+    let target = classes
+        .first()
+        .or(interfaces.first())
+        .or(packages.first())
+        .or(protocols.first());
 
     if target.is_none() {
         println!("{}", format!("Class '{}' not found.", name).red());
@@ -443,10 +548,12 @@ pub fn cmd_hierarchy(root: &Path, name: &str, limit: usize, scope: &SearchScope)
 
     // Find parents
     let mut stmt = conn.prepare(
-        "SELECT i.parent_name, i.kind FROM inheritance i JOIN symbols s ON i.child_id = s.id WHERE s.name = ?1",
+        "SELECT i.parent_name, i.kind FROM inheritance i JOIN symbols s ON i.child_id = s.id WHERE s.name = ?1 OR s.qualified_name = ?2",
     )?;
     let parents: Vec<(String, String)> = stmt
-        .query_map([name], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .query_map([target.unwrap().name.as_str(), name], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
         .collect::<Result<_, _>>()?;
 
     if !parents.is_empty() {
@@ -463,18 +570,27 @@ pub fn cmd_hierarchy(root: &Path, name: &str, limit: usize, scope: &SearchScope)
         db::find_implementations(&conn, name, limit)?
     } else {
         let all = db::find_implementations(&conn, name, total.max(limit))?;
-        all.into_iter().filter(|s| {
-            if let Some(in_file) = scope.in_file {
-                if !s.path.contains(in_file) { return false; }
-            }
-            if let Some(module) = scope.module {
-                if !s.path.starts_with(module) { return false; }
-            }
-            if let Some(prefix) = scope.dir_prefix {
-                if !s.path.starts_with(prefix) { return false; }
-            }
-            true
-        }).take(limit).collect()
+        all.into_iter()
+            .filter(|s| {
+                if let Some(in_file) = scope.in_file {
+                    if !s.path.contains(in_file) {
+                        return false;
+                    }
+                }
+                if let Some(module) = scope.module {
+                    if !s.path.starts_with(module) {
+                        return false;
+                    }
+                }
+                if let Some(prefix) = scope.dir_prefix {
+                    if !s.path.starts_with(prefix) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .take(limit)
+            .collect()
     };
     let resolver = PathResolver::from_conn(root, &conn);
     for c in &mut children {
@@ -484,13 +600,16 @@ pub fn cmd_hierarchy(root: &Path, name: &str, limit: usize, scope: &SearchScope)
         let header = if scope.is_empty() && total > children.len() {
             format!("Children ({} of {} shown):", children.len(), total)
         } else if !scope.is_empty() && children.len() == limit {
-            format!("Children (showing {}, more may exist within scope):", children.len())
+            format!(
+                "Children (showing {}, more may exist within scope):",
+                children.len()
+            )
         } else {
             format!("Children ({}):", children.len())
         };
         println!("\n  {}", header.cyan());
         for c in &children {
-            println!("    {} [{}]: {}", c.name, c.kind, c.path);
+            println!("    {} [{}]: {}", symbol_display_name(c), c.kind, c.path);
         }
         if scope.is_empty() && total > children.len() {
             println!(
@@ -506,14 +625,26 @@ pub fn cmd_hierarchy(root: &Path, name: &str, limit: usize, scope: &SearchScope)
 }
 
 /// Find symbol usages (indexed or grep-based)
-pub fn cmd_usages(root: &Path, symbol: &str, limit: usize, format: &str, scope: &SearchScope) -> Result<()> {
+pub fn cmd_usages(
+    root: &Path,
+    symbol: &str,
+    limit: usize,
+    format: &str,
+    scope: &SearchScope,
+) -> Result<()> {
     // Try to use index first
     let db_path = db::get_db_path(root)?;
     if db_path.exists() {
         let conn = Connection::open(&db_path)?;
 
         // Check if refs table has data
-        let refs_count: i64 = conn.query_row("SELECT COUNT(*) FROM refs WHERE name = ?1 LIMIT 1", params![symbol], |row| row.get(0)).unwrap_or(0);
+        let refs_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM refs WHERE name = ?1 LIMIT 1",
+                params![symbol],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
 
         if refs_count > 0 {
             // Use indexed references with scope filtering
@@ -528,7 +659,10 @@ pub fn cmd_usages(root: &Path, symbol: &str, limit: usize, format: &str, scope: 
                 return Ok(());
             }
 
-            println!("{}", format!("Usages of '{}' ({}):", symbol, refs.len()).bold());
+            println!(
+                "{}",
+                format!("Usages of '{}' ({}):", symbol, refs.len()).bold()
+            );
 
             for r in &refs {
                 println!("  {}:{}", r.path.cyan(), r.line);
@@ -556,32 +690,44 @@ pub fn cmd_usages(root: &Path, symbol: &str, limit: usize, format: &str, scope: 
     let mut usages: Vec<(String, usize, String)> = vec![];
 
     search_files(root, &pattern, &["kt", "java"], |path, line_num, line| {
-        if usages.len() >= limit { return; }
+        if usages.len() >= limit {
+            return;
+        }
 
         // Skip definitions
-        if def_pattern.is_match(line) { return; }
+        if def_pattern.is_match(line) {
+            return;
+        }
 
         let rel_path = relative_path(root, path);
         // Apply scope filter for grep results
         if let Some(in_file) = scope.in_file {
-            if !rel_path.contains(in_file) { return; }
+            if !rel_path.contains(in_file) {
+                return;
+            }
         }
         if let Some(module) = scope.module {
-            if !rel_path.starts_with(module) { return; }
+            if !rel_path.starts_with(module) {
+                return;
+            }
         }
         let content: String = line.trim().chars().take(80).collect();
         usages.push((rel_path, line_num, content));
     })?;
 
     if format == "json" {
-        let result: Vec<_> = usages.iter().map(|(p, l, c)| {
-            serde_json::json!({"path": p, "line": l, "content": c})
-        }).collect();
+        let result: Vec<_> = usages
+            .iter()
+            .map(|(p, l, c)| serde_json::json!({"path": p, "line": l, "content": c}))
+            .collect();
         println!("{}", serde_json::to_string_pretty(&result)?);
         return Ok(());
     }
 
-    println!("{}", format!("Usages of '{}' ({}):", symbol, usages.len()).bold());
+    println!(
+        "{}",
+        format!("Usages of '{}' ({}):", symbol, usages.len()).bold()
+    );
 
     for (path, line_num, content) in &usages {
         println!("  {}:{}", path.cyan(), line_num);

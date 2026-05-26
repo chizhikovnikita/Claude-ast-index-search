@@ -11,6 +11,7 @@
 //! - Includes (#include)
 
 use anyhow::Result;
+use std::collections::HashMap;
 use std::sync::LazyLock;
 use tree_sitter::{Language, Node, Query, QueryCursor, StreamingIterator};
 
@@ -80,11 +81,11 @@ impl LanguageParser for CppParser {
             // --- Class with body (not forward declaration) ---
             if let Some(name_cap) = find_capture(m, idx_class_name) {
                 if find_capture(m, idx_class_node).is_some() {
-                    let name = node_text_with_namespace(content, &name_cap.node);
+                    let name = node_text(content, &name_cap.node);
                     let line = node_line(&name_cap.node);
                     let parents = extract_base_classes(content, &name_cap.node);
                     symbols.push(ParsedSymbol {
-                        name,
+                        name: name.to_string(),
                         kind: SymbolKind::Class,
                         line,
                         signature: line_text(content, line).trim().to_string(),
@@ -97,11 +98,11 @@ impl LanguageParser for CppParser {
             // --- Struct with body ---
             if let Some(name_cap) = find_capture(m, idx_struct_name) {
                 if find_capture(m, idx_struct_node).is_some() {
-                    let name = node_text_with_namespace(content, &name_cap.node);
+                    let name = node_text(content, &name_cap.node);
                     let line = node_line(&name_cap.node);
                     let parents = extract_base_classes(content, &name_cap.node);
                     symbols.push(ParsedSymbol {
-                        name,
+                        name: name.to_string(),
                         kind: SymbolKind::Class,
                         line,
                         signature: line_text(content, line).trim().to_string(),
@@ -114,11 +115,11 @@ impl LanguageParser for CppParser {
             // --- Template class with body ---
             if let Some(name_cap) = find_capture(m, idx_template_class_name) {
                 if find_capture(m, idx_template_class_node).is_some() {
-                    let name = node_text_with_namespace(content, &name_cap.node);
+                    let name = node_text(content, &name_cap.node);
                     let line = node_line(&name_cap.node);
                     let parents = extract_base_classes(content, &name_cap.node);
                     symbols.push(ParsedSymbol {
-                        name,
+                        name: name.to_string(),
                         kind: SymbolKind::Class,
                         line,
                         signature: line_text(content, line).trim().to_string(),
@@ -131,11 +132,11 @@ impl LanguageParser for CppParser {
             // --- Template struct with body ---
             if let Some(name_cap) = find_capture(m, idx_template_struct_name) {
                 if find_capture(m, idx_template_struct_node).is_some() {
-                    let name = node_text_with_namespace(content, &name_cap.node);
+                    let name = node_text(content, &name_cap.node);
                     let line = node_line(&name_cap.node);
                     let parents = extract_base_classes(content, &name_cap.node);
                     symbols.push(ParsedSymbol {
-                        name,
+                        name: name.to_string(),
                         kind: SymbolKind::Class,
                         line,
                         signature: line_text(content, line).trim().to_string(),
@@ -148,7 +149,7 @@ impl LanguageParser for CppParser {
             // --- Method definition: ClassName::MethodName ---
             if let Some(class_cap) = find_capture(m, idx_method_class) {
                 if let Some(name_cap) = find_capture(m, idx_method_name) {
-                    let class_name = node_text_with_namespace(content, &class_cap.node);
+                    let class_name = node_text(content, &class_cap.node);
                     let method_name = node_text(content, &name_cap.node);
                     let line = node_line(&name_cap.node);
 
@@ -184,7 +185,7 @@ impl LanguageParser for CppParser {
             // --- Template method definition: ClassName::MethodName ---
             if let Some(class_cap) = find_capture(m, idx_template_method_class) {
                 if let Some(name_cap) = find_capture(m, idx_template_method_name) {
-                    let class_name = node_text_with_namespace(content, &class_cap.node);
+                    let class_name = node_text(content, &class_cap.node);
                     let method_name = node_text(content, &name_cap.node);
                     let line = node_line(&name_cap.node);
                     if !is_reserved_word(method_name) {
@@ -203,7 +204,7 @@ impl LanguageParser for CppParser {
             // --- Destructor definition: ClassName::~ClassName ---
             if let Some(class_cap) = find_capture(m, idx_destructor_class) {
                 if let Some(name_cap) = find_capture(m, idx_destructor_name) {
-                    let class_name = node_text_with_namespace(content, &class_cap.node);
+                    let class_name = node_text(content, &class_cap.node);
                     let dtor_name = node_text(content, &name_cap.node);
                     let line = node_line(&name_cap.node);
                     symbols.push(ParsedSymbol {
@@ -219,11 +220,11 @@ impl LanguageParser for CppParser {
 
             // --- Template function ---
             if let Some(cap) = find_capture(m, idx_template_func_name) {
-                let name = node_text_with_namespace(content, &cap.node);
+                let name = node_text(content, &cap.node);
                 let line = node_line(&cap.node);
-                if !is_reserved_word(&name) {
+                if !is_reserved_word(name) {
                     symbols.push(ParsedSymbol {
-                        name,
+                        name: name.to_string(),
                         kind: SymbolKind::Function,
                         line,
                         signature: line_text(content, line).trim().to_string(),
@@ -235,7 +236,7 @@ impl LanguageParser for CppParser {
 
             // --- Regular function ---
             if let Some(cap) = find_capture(m, idx_func_name) {
-                let name = node_text_with_namespace(content, &cap.node);
+                let name = node_text(content, &cap.node);
                 let line = node_line(&cap.node);
 
                 // Check for JNI pattern in signature line
@@ -253,9 +254,9 @@ impl LanguageParser for CppParser {
                     }
                 }
 
-                if !is_reserved_word(&name) {
+                if !is_reserved_word(name) {
                     symbols.push(ParsedSymbol {
-                        name,
+                        name: name.to_string(),
                         kind: SymbolKind::Function,
                         line,
                         signature: sig_line,
@@ -267,34 +268,24 @@ impl LanguageParser for CppParser {
 
             // --- Namespace ---
             if let Some(cap) = find_capture(m, idx_namespace_name) {
-                let full_name = node_text_with_namespace(content, &cap.node);
+                let raw_name = node_text(content, &cap.node);
                 let line = node_line(&cap.node);
                 let sig = line_text(content, line).trim().to_string();
 
-                if !full_name.is_empty() {
-                    // For nested namespaces (a::b::c), emit each part and the full name
-                    if full_name.contains("::") {
-                        for part in full_name.split("::") {
-                            if !part.is_empty() {
-                                symbols.push(ParsedSymbol {
-                                    name: part.to_string(),
-                                    kind: SymbolKind::Package,
-                                    line,
-                                    signature: sig.clone(),
-                                    parents: vec![],
-                                });
-                            }
+                if !raw_name.is_empty() {
+                    if raw_name.contains("::") {
+                        for part in raw_name.split("::").filter(|part| !part.is_empty()) {
+                            symbols.push(ParsedSymbol {
+                                name: part.to_string(),
+                                kind: SymbolKind::Package,
+                                line,
+                                signature: sig.clone(),
+                                parents: vec![],
+                            });
                         }
-                        symbols.push(ParsedSymbol {
-                            name: full_name.to_string(),
-                            kind: SymbolKind::Package,
-                            line,
-                            signature: sig,
-                            parents: vec![],
-                        });
                     } else {
                         symbols.push(ParsedSymbol {
-                            name: full_name.to_string(),
+                            name: raw_name.to_string(),
                             kind: SymbolKind::Package,
                             line,
                             signature: sig,
@@ -307,10 +298,10 @@ impl LanguageParser for CppParser {
 
             // --- Enum ---
             if let Some(cap) = find_capture(m, idx_enum_name) {
-                let name = node_text_with_namespace(content, &cap.node);
+                let name = node_text(content, &cap.node);
                 let line = node_line(&cap.node);
                 symbols.push(ParsedSymbol {
-                    name,
+                    name: name.to_string(),
                     kind: SymbolKind::Enum,
                     line,
                     signature: line_text(content, line).trim().to_string(),
@@ -321,10 +312,10 @@ impl LanguageParser for CppParser {
 
             // --- Typedef (simple: typedef ... Name;) ---
             if let Some(cap) = find_capture(m, idx_typedef_name) {
-                let name = node_text_with_namespace(content, &cap.node);
+                let name = node_text(content, &cap.node);
                 let line = node_line(&cap.node);
                 symbols.push(ParsedSymbol {
-                    name,
+                    name: name.to_string(),
                     kind: SymbolKind::TypeAlias,
                     line,
                     signature: line_text(content, line).trim().to_string(),
@@ -354,10 +345,10 @@ impl LanguageParser for CppParser {
 
             // --- Using alias ---
             if let Some(cap) = find_capture(m, idx_using_alias_name) {
-                let name = node_text_with_namespace(content, &cap.node);
+                let name = node_text(content, &cap.node);
                 let line = node_line(&cap.node);
                 symbols.push(ParsedSymbol {
-                    name,
+                    name: name.to_string(),
                     kind: SymbolKind::TypeAlias,
                     line,
                     signature: line_text(content, line).trim().to_string(),
@@ -368,10 +359,10 @@ impl LanguageParser for CppParser {
 
             // --- Function-like macro ---
             if let Some(cap) = find_capture(m, idx_macro_name) {
-                let name = node_text_with_namespace(content, &cap.node);
+                let name = node_text(content, &cap.node);
                 let line = node_line(&cap.node);
                 symbols.push(ParsedSymbol {
-                    name,
+                    name: name.to_string(),
                     kind: SymbolKind::Constant,
                     line,
                     signature: line_text(content, line).trim().to_string(),
@@ -403,6 +394,257 @@ impl LanguageParser for CppParser {
         }
 
         Ok(symbols)
+    }
+}
+
+pub fn collect_qualified_names(content: &str) -> Result<HashMap<(String, usize, String), String>> {
+    let tree = parse_tree(content, &CPP_LANGUAGE)?;
+    let mut qualified = HashMap::new();
+    let mut cursor = QueryCursor::new();
+    let query = &*CPP_QUERY;
+
+    let capture_names = query.capture_names();
+    let idx = |name: &str| -> Option<u32> {
+        capture_names
+            .iter()
+            .position(|n| *n == name)
+            .map(|i| i as u32)
+    };
+
+    let idx_class_name = idx("class_name");
+    let idx_class_node = idx("class_node");
+    let idx_struct_name = idx("struct_name");
+    let idx_struct_node = idx("struct_node");
+    let idx_template_class_name = idx("template_class_name");
+    let idx_template_class_node = idx("template_class_node");
+    let idx_template_struct_name = idx("template_struct_name");
+    let idx_template_struct_node = idx("template_struct_node");
+    let idx_func_name = idx("func_name");
+    let idx_template_func_name = idx("template_func_name");
+    let idx_method_class = idx("method_class");
+    let idx_method_name = idx("method_name");
+    let idx_template_method_class = idx("template_method_class");
+    let idx_template_method_name = idx("template_method_name");
+    let idx_destructor_class = idx("destructor_class");
+    let idx_destructor_name = idx("destructor_name");
+    let idx_namespace_name = idx("namespace_name");
+    let idx_enum_name = idx("enum_name");
+    let idx_typedef_name = idx("typedef_name");
+    let idx_typedef_node = idx("typedef_node");
+    let idx_using_alias_name = idx("using_alias_name");
+
+    let mut matches = cursor.matches(query, tree.root_node(), content.as_bytes());
+
+    while let Some(m) = matches.next() {
+        if let Some(name_cap) = find_capture(m, idx_class_name) {
+            if find_capture(m, idx_class_node).is_some() {
+                remember_qualified_name(
+                    &mut qualified,
+                    SymbolKind::Class,
+                    node_line(&name_cap.node),
+                    node_text(content, &name_cap.node),
+                    node_text_with_namespace(content, &name_cap.node),
+                );
+            }
+            continue;
+        }
+
+        if let Some(name_cap) = find_capture(m, idx_struct_name) {
+            if find_capture(m, idx_struct_node).is_some() {
+                remember_qualified_name(
+                    &mut qualified,
+                    SymbolKind::Class,
+                    node_line(&name_cap.node),
+                    node_text(content, &name_cap.node),
+                    node_text_with_namespace(content, &name_cap.node),
+                );
+            }
+            continue;
+        }
+
+        if let Some(name_cap) = find_capture(m, idx_template_class_name) {
+            if find_capture(m, idx_template_class_node).is_some() {
+                remember_qualified_name(
+                    &mut qualified,
+                    SymbolKind::Class,
+                    node_line(&name_cap.node),
+                    node_text(content, &name_cap.node),
+                    node_text_with_namespace(content, &name_cap.node),
+                );
+            }
+            continue;
+        }
+
+        if let Some(name_cap) = find_capture(m, idx_template_struct_name) {
+            if find_capture(m, idx_template_struct_node).is_some() {
+                remember_qualified_name(
+                    &mut qualified,
+                    SymbolKind::Class,
+                    node_line(&name_cap.node),
+                    node_text(content, &name_cap.node),
+                    node_text_with_namespace(content, &name_cap.node),
+                );
+            }
+            continue;
+        }
+
+        if let Some(class_cap) = find_capture(m, idx_method_class) {
+            if let Some(name_cap) = find_capture(m, idx_method_name) {
+                let class_name = node_text_with_namespace(content, &class_cap.node);
+                let method_name = node_text(content, &name_cap.node);
+                remember_qualified_name(
+                    &mut qualified,
+                    SymbolKind::Function,
+                    node_line(&name_cap.node),
+                    method_name,
+                    format!("{class_name}::{method_name}"),
+                );
+            }
+            continue;
+        }
+
+        if let Some(class_cap) = find_capture(m, idx_template_method_class) {
+            if let Some(name_cap) = find_capture(m, idx_template_method_name) {
+                let class_name = node_text_with_namespace(content, &class_cap.node);
+                let method_name = node_text(content, &name_cap.node);
+                remember_qualified_name(
+                    &mut qualified,
+                    SymbolKind::Function,
+                    node_line(&name_cap.node),
+                    method_name,
+                    format!("{class_name}::{method_name}"),
+                );
+            }
+            continue;
+        }
+
+        if let Some(class_cap) = find_capture(m, idx_destructor_class) {
+            if let Some(name_cap) = find_capture(m, idx_destructor_name) {
+                let class_name = node_text_with_namespace(content, &class_cap.node);
+                let method_name = node_text(content, &name_cap.node);
+                remember_qualified_name(
+                    &mut qualified,
+                    SymbolKind::Function,
+                    node_line(&name_cap.node),
+                    method_name,
+                    format!("{class_name}::{method_name}"),
+                );
+            }
+            continue;
+        }
+
+        if let Some(cap) = find_capture(m, idx_template_func_name) {
+            remember_qualified_name(
+                &mut qualified,
+                SymbolKind::Function,
+                node_line(&cap.node),
+                node_text(content, &cap.node),
+                node_text_with_namespace(content, &cap.node),
+            );
+            continue;
+        }
+
+        if let Some(cap) = find_capture(m, idx_func_name) {
+            remember_qualified_name(
+                &mut qualified,
+                SymbolKind::Function,
+                node_line(&cap.node),
+                node_text(content, &cap.node),
+                node_text_with_namespace(content, &cap.node),
+            );
+            continue;
+        }
+
+        if let Some(cap) = find_capture(m, idx_namespace_name) {
+            let raw_name = node_text(content, &cap.node);
+            let line = node_line(&cap.node);
+            if raw_name.contains("::") {
+                let mut current = Vec::new();
+                for part in raw_name.split("::").filter(|part| !part.is_empty()) {
+                    current.push(part);
+                    remember_qualified_name(
+                        &mut qualified,
+                        SymbolKind::Package,
+                        line,
+                        part,
+                        current.join("::"),
+                    );
+                }
+            } else {
+                remember_qualified_name(
+                    &mut qualified,
+                    SymbolKind::Package,
+                    line,
+                    raw_name,
+                    node_text_with_namespace(content, &cap.node),
+                );
+            }
+            continue;
+        }
+
+        if let Some(cap) = find_capture(m, idx_enum_name) {
+            remember_qualified_name(
+                &mut qualified,
+                SymbolKind::Enum,
+                node_line(&cap.node),
+                node_text(content, &cap.node),
+                node_text_with_namespace(content, &cap.node),
+            );
+            continue;
+        }
+
+        if let Some(cap) = find_capture(m, idx_typedef_name) {
+            remember_qualified_name(
+                &mut qualified,
+                SymbolKind::TypeAlias,
+                node_line(&cap.node),
+                node_text(content, &cap.node),
+                node_text_with_namespace(content, &cap.node),
+            );
+            continue;
+        }
+
+        if let Some(cap) = find_capture(m, idx_typedef_node) {
+            if find_capture(m, idx_typedef_name).is_none() {
+                if let Some(name) = extract_typedef_name(&cap.node, content) {
+                    remember_qualified_name(
+                        &mut qualified,
+                        SymbolKind::TypeAlias,
+                        node_line(&cap.node),
+                        &name,
+                        qualify_typedef_name(content, &cap.node, &name),
+                    );
+                }
+            }
+            continue;
+        }
+
+        if let Some(cap) = find_capture(m, idx_using_alias_name) {
+            remember_qualified_name(
+                &mut qualified,
+                SymbolKind::TypeAlias,
+                node_line(&cap.node),
+                node_text(content, &cap.node),
+                node_text_with_namespace(content, &cap.node),
+            );
+        }
+    }
+
+    Ok(qualified)
+}
+
+fn remember_qualified_name(
+    qualified: &mut HashMap<(String, usize, String), String>,
+    kind: SymbolKind,
+    line: usize,
+    bare_name: &str,
+    qualified_name: String,
+) {
+    if bare_name != qualified_name {
+        qualified.insert(
+            (kind.as_str().to_string(), line, bare_name.to_string()),
+            qualified_name,
+        );
     }
 }
 
@@ -440,6 +682,12 @@ fn enclosing_namespaces<'a>(content: &'a str, node: Node<'a>) -> Vec<&'a str> {
 fn node_text_with_namespace(content: &str, node: &Node) -> String {
     let mut parts = enclosing_namespaces(content, *node);
     parts.push(node_text(content, node));
+    parts.join("::")
+}
+
+fn qualify_typedef_name(content: &str, type_def_node: &tree_sitter::Node, name: &str) -> String {
+    let mut parts = enclosing_namespaces(content, *type_def_node);
+    parts.push(name);
     parts.join("::")
 }
 
@@ -859,13 +1107,6 @@ namespace outer {
             "Expected namespace inner, got: {:?}",
             symbols
         );
-        assert!(
-            symbols
-                .iter()
-                .any(|s| s.kind == SymbolKind::Package && s.name == "outer::inner"),
-            "Expected qualified namespace outer::inner, got: {:?}",
-            symbols
-        );
     }
 
     // --- Enums ---
@@ -1054,25 +1295,25 @@ int Widget::size() const {
         assert!(
             symbols
                 .iter()
-                .any(|s| s.kind == SymbolKind::Class && s.name == "mylib::Widget"),
-            "Expected qualified class mylib::Widget"
+                .any(|s| s.kind == SymbolKind::Class && s.name == "Widget"),
+            "Expected class Widget"
         );
         assert!(
             symbols.iter().any(|s| s.name == "draw"
                 && s.kind == SymbolKind::Function
-                && s.parents.iter().any(|(p, _)| p == "mylib::Widget")),
-            "Expected method draw with qualified parent mylib::Widget"
+                && s.parents.iter().any(|(p, _)| p == "Widget")),
+            "Expected method draw with parent Widget"
         );
         assert!(
             symbols.iter().any(|s| s.name == "size"
                 && s.kind == SymbolKind::Function
-                && s.parents.iter().any(|(p, _)| p == "mylib::Widget")),
-            "Expected method size with qualified parent mylib::Widget"
+                && s.parents.iter().any(|(p, _)| p == "Widget")),
+            "Expected method size with parent Widget"
         );
     }
 
     #[test]
-    fn test_parse_qualified_free_function_and_enum() {
+    fn test_parse_namespaced_free_function_and_enum() {
         let content = r#"
 namespace arcanum {
     enum class Mode {
@@ -1088,15 +1329,15 @@ namespace arcanum {
         assert!(
             symbols
                 .iter()
-                .any(|s| s.kind == SymbolKind::Enum && s.name == "arcanum::Mode"),
-            "Expected qualified enum arcanum::Mode, got: {:?}",
+                .any(|s| s.kind == SymbolKind::Enum && s.name == "Mode"),
+            "Expected enum Mode, got: {:?}",
             symbols
         );
         assert!(
             symbols
                 .iter()
-                .any(|s| s.kind == SymbolKind::Function && s.name == "arcanum::makeClient"),
-            "Expected qualified function arcanum::makeClient, got: {:?}",
+                .any(|s| s.kind == SymbolKind::Function && s.name == "makeClient"),
+            "Expected function makeClient, got: {:?}",
             symbols
         );
     }

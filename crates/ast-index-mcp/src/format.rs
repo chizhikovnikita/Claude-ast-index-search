@@ -55,7 +55,9 @@ pub fn to_compact(tool: &str, raw_json: &str) -> String {
 }
 
 fn render_search(v: &Value, out: &mut String) -> bool {
-    let Some(obj) = v.as_object() else { return false };
+    let Some(obj) = v.as_object() else {
+        return false;
+    };
 
     let mut any_section = false;
 
@@ -116,7 +118,9 @@ fn render_search(v: &Value, out: &mut String) -> bool {
 }
 
 fn render_refs(v: &Value, out: &mut String) -> bool {
-    let Some(obj) = v.as_object() else { return false };
+    let Some(obj) = v.as_object() else {
+        return false;
+    };
 
     let mut any = false;
 
@@ -165,7 +169,9 @@ fn render_refs(v: &Value, out: &mut String) -> bool {
 
 fn render_ref_list(v: &Value, out: &mut String) -> bool {
     // usages / callers: array of {name, line, context, path}
-    let Some(arr) = v.as_array() else { return false };
+    let Some(arr) = v.as_array() else {
+        return false;
+    };
     for r in arr {
         write_ref_line(r, "", out);
     }
@@ -174,7 +180,9 @@ fn render_ref_list(v: &Value, out: &mut String) -> bool {
 
 fn render_symbol_list(v: &Value, out: &mut String) -> bool {
     // symbol / class / implementations: array of SearchResult
-    let Some(arr) = v.as_array() else { return false };
+    let Some(arr) = v.as_array() else {
+        return false;
+    };
     for s in arr {
         write_symbol_line(s, "", out);
     }
@@ -182,7 +190,9 @@ fn render_symbol_list(v: &Value, out: &mut String) -> bool {
 }
 
 fn render_file_list(v: &Value, out: &mut String) -> bool {
-    let Some(arr) = v.as_array() else { return false };
+    let Some(arr) = v.as_array() else {
+        return false;
+    };
     for f in arr {
         if let Some(s) = f.as_str() {
             writeln!(out, "{s}").ok();
@@ -192,7 +202,9 @@ fn render_file_list(v: &Value, out: &mut String) -> bool {
 }
 
 fn render_stats(v: &Value, out: &mut String) -> bool {
-    let Some(obj) = v.as_object() else { return false };
+    let Some(obj) = v.as_object() else {
+        return false;
+    };
 
     let project = obj.get("project").and_then(Value::as_str).unwrap_or("?");
     let db_size = obj
@@ -205,9 +217,14 @@ fn render_stats(v: &Value, out: &mut String) -> bool {
     if let Some(stats) = obj.get("stats").and_then(Value::as_object) {
         // Known counters first (stable order, skip zeros to save tokens).
         let keys = [
-            "file_count", "symbol_count", "refs_count", "module_count",
-            "xml_usages_count", "resources_count",
-            "storyboard_usages_count", "ios_assets_count",
+            "file_count",
+            "symbol_count",
+            "refs_count",
+            "module_count",
+            "xml_usages_count",
+            "resources_count",
+            "storyboard_usages_count",
+            "ios_assets_count",
         ];
         for k in keys {
             if let Some(n) = stats.get(k).and_then(Value::as_i64) {
@@ -218,12 +235,7 @@ fn render_stats(v: &Value, out: &mut String) -> bool {
         }
     }
     if db_size > 0 {
-        writeln!(
-            out,
-            "db_size_mb: {:.2}",
-            db_size as f64 / 1024.0 / 1024.0
-        )
-        .ok();
+        writeln!(out, "db_size_mb: {:.2}", db_size as f64 / 1024.0 / 1024.0).ok();
     }
     if !db_path.is_empty() {
         writeln!(out, "db_path: {db_path}").ok();
@@ -232,7 +244,11 @@ fn render_stats(v: &Value, out: &mut String) -> bool {
 }
 
 fn write_symbol_line(s: &Value, indent: &str, out: &mut String) {
-    let name = s.get("name").and_then(Value::as_str).unwrap_or("?");
+    let name = s
+        .get("qualified_name")
+        .and_then(Value::as_str)
+        .or_else(|| s.get("name").and_then(Value::as_str))
+        .unwrap_or("?");
     let kind = s.get("kind").and_then(Value::as_str).unwrap_or("?");
     let path = s.get("path").and_then(Value::as_str).unwrap_or("?");
     let line = s.get("line").and_then(Value::as_i64).unwrap_or(0);
