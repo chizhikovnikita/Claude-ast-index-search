@@ -131,11 +131,7 @@ fn cmd_outline_handles_missing_file_gracefully() {
 fn cmd_outline_parses_a_kotlin_file() {
     let dir = TempDir::new().unwrap();
     let src = dir.path().join("Foo.kt");
-    fs::write(
-        &src,
-        "package demo\n\nclass Foo {\n  fun bar() {}\n}\n",
-    )
-    .unwrap();
+    fs::write(&src, "package demo\n\nclass Foo {\n  fun bar() {}\n}\n").unwrap();
 
     cmd_outline(dir.path(), "Foo.kt").expect("outline of valid Kotlin must succeed");
 }
@@ -158,11 +154,7 @@ fn cmd_outline_handles_unsupported_extension() {
 fn cmd_imports_extracts_python_imports() {
     let dir = TempDir::new().unwrap();
     let src = dir.path().join("script.py");
-    fs::write(
-        &src,
-        "import os\nfrom typing import List\nimport sys\n",
-    )
-    .unwrap();
+    fs::write(&src, "import os\nfrom typing import List\nimport sys\n").unwrap();
 
     cmd_imports(dir.path(), "script.py").expect("python imports must parse");
 }
