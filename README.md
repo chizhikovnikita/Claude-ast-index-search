@@ -620,6 +620,7 @@ exclude:
 - **Harden rebuild/update management paths** — `query` now blocks mutation SQL while still allowing `SELECT`, `WITH`, and `EXPLAIN`; `update` now preserves extra roots, respects `include` allow-lists, and keeps root-level files intact in sub-project rebuild mode
 - **Improve TypeScript/Vue and general parser coverage** — better extraction for Vue Composition API / Pinia / script-setup patterns, broader parser/test coverage across multiple languages, and more reliable file-oriented commands
 - **Make safe rebuild optimizations the default and add benchmarks** — full rebuilds now always bulk-load into a thin schema before creating indexes/FTS, use a slightly larger SQLite cache during rebuild, and ship baseline Criterion benches for rebuild, update, module graph, and Android XML/resource phases
+- **Support Windows-1251 and other legacy source encodings** — source files that aren't valid UTF-8 are auto-detected (`chardetng`) and decoded (`encoding_rs`) instead of being skipped, so Windows-1251, KOI8-R, ISO-8859-*, Shift-JIS and similar legacy files index without pre-conversion; `rebuild`/`update` print a fallback-decode summary, with per-file detail under `--verbose`
 
 ### 3.43.2
 - **Preserve root-level files in sub-project rebuilds** — experimental fast rebuild no longer drops files and module markers that live directly under the selected root when it switches large monorepos into sub-project mode
