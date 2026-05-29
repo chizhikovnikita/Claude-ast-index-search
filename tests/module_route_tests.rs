@@ -78,8 +78,18 @@ fn unreachable_returns_empty_with_reason() {
     drop(conn);
 
     // Should succeed (Ok) but produce an "unreachable" empty_reason in output.
-    cmd_module_route(dir.path(), "alpha", "beta", false, 50, 20, 2000, "all", "text")
-        .expect("unreachable should return Ok");
+    cmd_module_route(
+        dir.path(),
+        "alpha",
+        "beta",
+        false,
+        50,
+        20,
+        2000,
+        "all",
+        "text",
+    )
+    .expect("unreachable should return Ok");
 }
 
 /// REPRO: direct edge A→B with --all should return exactly 1 path (1 hop).
@@ -97,10 +107,13 @@ fn direct_edge_all_returns_one_path() {
     let out = std::process::Command::new(bin)
         .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
         .args([
-            "--format", "json",
+            "--format",
+            "json",
             "module-route",
-            "--from", "app",
-            "--to", "libx",
+            "--from",
+            "app",
+            "--to",
+            "libx",
             "--all",
         ])
         .output()
@@ -111,7 +124,12 @@ fn direct_edge_all_returns_one_path() {
         .unwrap_or_else(|e| panic!("stdout must be JSON: {e}; stdout={stdout}"));
 
     let paths = v["paths"].as_array().expect("paths must be array");
-    assert_eq!(paths.len(), 1, "direct edge --all must yield 1 path; got: {}", stdout);
+    assert_eq!(
+        paths.len(),
+        1,
+        "direct edge --all must yield 1 path; got: {}",
+        stdout
+    );
     assert_eq!(paths[0]["length"].as_u64().unwrap(), 1);
 }
 
@@ -134,10 +152,13 @@ fn direct_plus_indirect_all() {
     let out = std::process::Command::new(bin)
         .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
         .args([
-            "--format", "json",
+            "--format",
+            "json",
             "module-route",
-            "--from", ":app",
-            "--to", ":sdk:clips-viewer:shared:clips-design",
+            "--from",
+            ":app",
+            "--to",
+            ":sdk:clips-viewer:shared:clips-design",
             "--all",
         ])
         .output()
@@ -147,7 +168,12 @@ fn direct_plus_indirect_all() {
     let v: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("must be JSON: {e}; stdout={stdout}"));
     let paths = v["paths"].as_array().expect("paths must be array");
-    assert_eq!(paths.len(), 2, "direct + indirect --all must yield 2 paths; got: {}", stdout);
+    assert_eq!(
+        paths.len(),
+        2,
+        "direct + indirect --all must yield 2 paths; got: {}",
+        stdout
+    );
 }
 
 /// REPRO 3: heavy fanout where DFS may exhaust timeout before finding direct edge.
@@ -167,10 +193,18 @@ fn heavy_fanout_all_with_direct_edge() {
         let child = insert_module(&conn, &format!("child{:02}", i), &format!("c{}", i));
         insert_dep(&conn, app, child, "implementation");
         for j in 0..20 {
-            let gc = insert_module(&conn, &format!("g{:02}_{:02}", i, j), &format!("g{}_{}", i, j));
+            let gc = insert_module(
+                &conn,
+                &format!("g{:02}_{:02}", i, j),
+                &format!("g{}_{}", i, j),
+            );
             insert_dep(&conn, child, gc, "implementation");
             for k in 0..5 {
-                let ggc = insert_module(&conn, &format!("h{:02}_{:02}_{:02}", i, j, k), &format!("h{}_{}_{}", i, j, k));
+                let ggc = insert_module(
+                    &conn,
+                    &format!("h{:02}_{:02}_{:02}", i, j, k),
+                    &format!("h{}_{}_{}", i, j, k),
+                );
                 insert_dep(&conn, gc, ggc, "implementation");
             }
         }
@@ -181,12 +215,16 @@ fn heavy_fanout_all_with_direct_edge() {
     let out = std::process::Command::new(bin)
         .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
         .args([
-            "--format", "json",
+            "--format",
+            "json",
             "module-route",
-            "--from", "app",
-            "--to", "zzz.target",
+            "--from",
+            "app",
+            "--to",
+            "zzz.target",
             "--all",
-            "--timeout-ms", "100", // tight timeout to force the bug
+            "--timeout-ms",
+            "100", // tight timeout to force the bug
         ])
         .output()
         .unwrap();
@@ -197,12 +235,20 @@ fn heavy_fanout_all_with_direct_edge() {
     let paths = v["paths"].as_array().unwrap();
     // After fix: direct-target edge is processed first, so we always find the
     // 1-hop path even with a tight timeout.
-    assert!(!paths.is_empty(), "must record direct edge before exploring siblings; got: {}", stdout);
+    assert!(
+        !paths.is_empty(),
+        "must record direct edge before exploring siblings; got: {}",
+        stdout
+    );
     assert_eq!(paths[0]["length"].as_u64().unwrap(), 1);
 
     // search_stats must be populated for --all mode.
     let stats = &v["search_stats"];
-    assert!(stats.is_object(), "search_stats must be present for --all; got: {}", stdout);
+    assert!(
+        stats.is_object(),
+        "search_stats must be present for --all; got: {}",
+        stdout
+    );
     // edges_explored must include the direct edge. nodes_visited may be 0
     // because reverse-BFS pruning lets us record the direct hit without
     // ever pushing a child frame.
@@ -225,7 +271,11 @@ fn unreachable_pruning_avoids_timeout() {
         let c = insert_module(&conn, &format!("c{:02}", i), &format!("c{}", i));
         insert_dep(&conn, app, c, "implementation");
         for j in 0..15 {
-            let g = insert_module(&conn, &format!("g{:02}_{:02}", i, j), &format!("g{}_{}", i, j));
+            let g = insert_module(
+                &conn,
+                &format!("g{:02}_{:02}", i, j),
+                &format!("g{}_{}", i, j),
+            );
             insert_dep(&conn, c, g, "implementation");
         }
     }
@@ -235,12 +285,16 @@ fn unreachable_pruning_avoids_timeout() {
     let out = std::process::Command::new(bin)
         .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
         .args([
-            "--format", "json",
+            "--format",
+            "json",
             "module-route",
-            "--from", "app",
-            "--to", "isolated.target",
+            "--from",
+            "app",
+            "--to",
+            "isolated.target",
             "--all",
-            "--timeout-ms", "5000",
+            "--timeout-ms",
+            "5000",
         ])
         .output()
         .unwrap();
@@ -248,7 +302,11 @@ fn unreachable_pruning_avoids_timeout() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     let empty_reason = v["empty_reason"].as_str().unwrap_or("");
-    assert_eq!(empty_reason, "unreachable", "pruning must short-circuit; got: {}", stdout);
+    assert_eq!(
+        empty_reason, "unreachable",
+        "pruning must short-circuit; got: {}",
+        stdout
+    );
 }
 
 /// REPRO 5: large connected DAG with many simple paths from app→target —
@@ -266,7 +324,11 @@ fn many_paths_hits_max_paths_cap() {
     for layer in 0..3 {
         let mut cur: Vec<i64> = Vec::new();
         for i in 0..5 {
-            let n = insert_module(&conn, &format!("L{}_{:02}", layer, i), &format!("L{}_{}", layer, i));
+            let n = insert_module(
+                &conn,
+                &format!("L{}_{:02}", layer, i),
+                &format!("L{}_{}", layer, i),
+            );
             cur.push(n);
         }
         for &p in &prev_layer {
@@ -285,12 +347,16 @@ fn many_paths_hits_max_paths_cap() {
     let out = std::process::Command::new(bin)
         .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
         .args([
-            "--format", "json",
+            "--format",
+            "json",
             "module-route",
-            "--from", "app",
-            "--to", "target",
+            "--from",
+            "app",
+            "--to",
+            "target",
             "--all",
-            "--max-paths", "5",
+            "--max-paths",
+            "5",
         ])
         .output()
         .unwrap();
@@ -347,18 +413,20 @@ fn all_paths_returns_diamond() {
     let out = std::process::Command::new(bin)
         .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
         .args([
-            "--format", "json",
+            "--format",
+            "json",
             "module-route",
-            "--from", "a",
-            "--to", "d",
+            "--from",
+            "a",
+            "--to",
+            "d",
             "--all",
         ])
         .output()
         .expect("binary invocation must succeed");
 
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let v: serde_json::Value = serde_json::from_str(&stdout)
-        .expect("stdout must be valid JSON");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("stdout must be valid JSON");
 
     let paths = v["paths"].as_array().expect("paths must be array");
     assert_eq!(
@@ -389,21 +457,27 @@ fn kind_filter_eliminates_only_path() {
     let out = std::process::Command::new(bin)
         .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
         .args([
-            "--format", "json",
+            "--format",
+            "json",
             "module-route",
-            "--from", "x",
-            "--to", "y",
-            "--via-kind", "api",
+            "--from",
+            "x",
+            "--to",
+            "y",
+            "--via-kind",
+            "api",
         ])
         .output()
         .expect("binary invocation must succeed");
 
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let v: serde_json::Value = serde_json::from_str(&stdout)
-        .expect("stdout must be valid JSON");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("stdout must be valid JSON");
 
     let paths = v["paths"].as_array().expect("paths must be array");
-    assert!(paths.is_empty(), "api filter must eliminate implementation-only path");
+    assert!(
+        paths.is_empty(),
+        "api filter must eliminate implementation-only path"
+    );
 
     // Should have an empty_reason of "kind_filter" or "unreachable".
     let reason = v["empty_reason"].as_str().unwrap_or("");
@@ -429,10 +503,13 @@ fn json_output_shape_is_clean() {
     let out = std::process::Command::new(bin)
         .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
         .args([
-            "--format", "json",
+            "--format",
+            "json",
             "module-route",
-            "--from", "mod_a",
-            "--to", "mod_b",
+            "--from",
+            "mod_a",
+            "--to",
+            "mod_b",
         ])
         .output()
         .expect("binary invocation must succeed");
@@ -447,15 +524,17 @@ fn json_output_shape_is_clean() {
 
     // Must parse as JSON.
     let stdout = String::from_utf8_lossy(stdout_bytes);
-    let v: serde_json::Value = serde_json::from_str(&stdout)
-        .expect("stdout must be valid JSON");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("stdout must be valid JSON");
 
     // Required top-level keys.
     assert!(v.get("from").is_some(), "JSON must have 'from' key");
     assert!(v.get("to").is_some(), "JSON must have 'to' key");
     assert!(v.get("paths").is_some(), "JSON must have 'paths' key");
     assert!(v.get("count").is_some(), "JSON must have 'count' key");
-    assert!(v.get("truncated").is_some(), "JSON must have 'truncated' key");
+    assert!(
+        v.get("truncated").is_some(),
+        "JSON must have 'truncated' key"
+    );
 
     // Path from mod_a → mod_b (direct api edge).
     assert_eq!(v["count"].as_u64().unwrap(), 1);
@@ -481,23 +560,30 @@ fn max_paths_truncation_signals() {
     let out = std::process::Command::new(bin)
         .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
         .args([
-            "--format", "json",
+            "--format",
+            "json",
             "module-route",
-            "--from", "root",
-            "--to", "target",
+            "--from",
+            "root",
+            "--to",
+            "target",
             "--all",
-            "--max-paths", "3",
+            "--max-paths",
+            "3",
         ])
         .output()
         .expect("binary invocation must succeed");
 
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let v: serde_json::Value = serde_json::from_str(&stdout)
-        .expect("stdout must be valid JSON");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("stdout must be valid JSON");
 
     let paths = v["paths"].as_array().expect("paths must be array");
     assert_eq!(paths.len(), 3, "max-paths=3 must cap at 3 paths");
-    assert_eq!(v["truncated"].as_bool().unwrap(), true, "truncated must be true");
+    assert_eq!(
+        v["truncated"].as_bool().unwrap(),
+        true,
+        "truncated must be true"
+    );
     assert_eq!(
         v["truncation_reason"].as_str().unwrap_or(""),
         "max_paths",
@@ -523,17 +609,19 @@ fn self_query_no_self_edge_returns_empty_self_reason() {
     let out = std::process::Command::new(bin)
         .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
         .args([
-            "--format", "json",
+            "--format",
+            "json",
             "module-route",
-            "--from", "self_mod",
-            "--to", "self_mod",
+            "--from",
+            "self_mod",
+            "--to",
+            "self_mod",
         ])
         .output()
         .expect("binary invocation must succeed");
 
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let v: serde_json::Value = serde_json::from_str(&stdout)
-        .expect("stdout must be valid JSON");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("stdout must be valid JSON");
 
     assert_eq!(
         v["empty_reason"].as_str().unwrap_or(""),
@@ -564,10 +652,13 @@ fn mermaid_output_uses_id_aliases() {
     let out = std::process::Command::new(bin)
         .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
         .args([
-            "--format", "mermaid",
+            "--format",
+            "mermaid",
             "module-route",
-            "--from", "ma",
-            "--to", "mb",
+            "--from",
+            "ma",
+            "--to",
+            "mb",
         ])
         .output()
         .expect("binary invocation must succeed");
@@ -603,7 +694,11 @@ fn prune_timeout_sets_truncation_reason() {
         // Give each source its own chain so the graph is wide enough to
         // trigger the deadline inside compute_reverse_distances.
         for j in 0..20 {
-            let anc = insert_module(&conn, &format!("anc{:03}_{:02}", i, j), &format!("anc{}_{}", i, j));
+            let anc = insert_module(
+                &conn,
+                &format!("anc{:03}_{:02}", i, j),
+                &format!("anc{}_{}", i, j),
+            );
             insert_dep(&conn, anc, src, "implementation");
         }
     }
@@ -613,12 +708,16 @@ fn prune_timeout_sets_truncation_reason() {
     let out = std::process::Command::new(bin)
         .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
         .args([
-            "--format", "json",
+            "--format",
+            "json",
             "module-route",
-            "--from", "anc000_00",
-            "--to", "target",
+            "--from",
+            "anc000_00",
+            "--to",
+            "target",
             "--all",
-            "--timeout-ms", "1",
+            "--timeout-ms",
+            "1",
         ])
         .output()
         .unwrap();
@@ -675,12 +774,16 @@ fn three_hop_path_preserves_distinct_kinds() {
     let out = std::process::Command::new(bin)
         .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
         .args([
-            "--format", "json",
+            "--format",
+            "json",
             "module-route",
-            "--from", "kindA",
-            "--to", "kindD",
+            "--from",
+            "kindA",
+            "--to",
+            "kindD",
             "--all",
-            "--via-kind", "all",
+            "--via-kind",
+            "all",
         ])
         .output()
         .unwrap();
@@ -695,19 +798,64 @@ fn three_hop_path_preserves_distinct_kinds() {
     assert_eq!(hops.len(), 3, "path must have 3 hops; got: {}", stdout);
 
     // Hop 0: kindA → kindB, kind = "api"
-    assert_eq!(hops[0]["from"].as_str(), Some("kindA"), "hop0 from; stdout={}", stdout);
-    assert_eq!(hops[0]["to"].as_str(), Some("kindB"), "hop0 to; stdout={}", stdout);
-    assert_eq!(hops[0]["kind"].as_str(), Some("api"), "hop0 kind must be api; stdout={}", stdout);
+    assert_eq!(
+        hops[0]["from"].as_str(),
+        Some("kindA"),
+        "hop0 from; stdout={}",
+        stdout
+    );
+    assert_eq!(
+        hops[0]["to"].as_str(),
+        Some("kindB"),
+        "hop0 to; stdout={}",
+        stdout
+    );
+    assert_eq!(
+        hops[0]["kind"].as_str(),
+        Some("api"),
+        "hop0 kind must be api; stdout={}",
+        stdout
+    );
 
     // Hop 1: kindB → kindC, kind = "implementation"
-    assert_eq!(hops[1]["from"].as_str(), Some("kindB"), "hop1 from; stdout={}", stdout);
-    assert_eq!(hops[1]["to"].as_str(), Some("kindC"), "hop1 to; stdout={}", stdout);
-    assert_eq!(hops[1]["kind"].as_str(), Some("implementation"), "hop1 kind must be implementation; stdout={}", stdout);
+    assert_eq!(
+        hops[1]["from"].as_str(),
+        Some("kindB"),
+        "hop1 from; stdout={}",
+        stdout
+    );
+    assert_eq!(
+        hops[1]["to"].as_str(),
+        Some("kindC"),
+        "hop1 to; stdout={}",
+        stdout
+    );
+    assert_eq!(
+        hops[1]["kind"].as_str(),
+        Some("implementation"),
+        "hop1 kind must be implementation; stdout={}",
+        stdout
+    );
 
     // Hop 2: kindC → kindD, kind = "compileOnly"
-    assert_eq!(hops[2]["from"].as_str(), Some("kindC"), "hop2 from; stdout={}", stdout);
-    assert_eq!(hops[2]["to"].as_str(), Some("kindD"), "hop2 to; stdout={}", stdout);
-    assert_eq!(hops[2]["kind"].as_str(), Some("compileOnly"), "hop2 kind must be compileOnly; stdout={}", stdout);
+    assert_eq!(
+        hops[2]["from"].as_str(),
+        Some("kindC"),
+        "hop2 from; stdout={}",
+        stdout
+    );
+    assert_eq!(
+        hops[2]["to"].as_str(),
+        Some("kindD"),
+        "hop2 to; stdout={}",
+        stdout
+    );
+    assert_eq!(
+        hops[2]["kind"].as_str(),
+        Some("compileOnly"),
+        "hop2 kind must be compileOnly; stdout={}",
+        stdout
+    );
 }
 
 /// Self-loop: when a module has a self-edge in the DB, querying from==to
@@ -726,10 +874,13 @@ fn self_edge_returns_real_cycle_path() {
     let out = std::process::Command::new(bin)
         .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
         .args([
-            "--format", "json",
+            "--format",
+            "json",
             "module-route",
-            "--from", "cyclic_mod",
-            "--to", "cyclic_mod",
+            "--from",
+            "cyclic_mod",
+            "--to",
+            "cyclic_mod",
         ])
         .output()
         .unwrap();
@@ -740,15 +891,39 @@ fn self_edge_returns_real_cycle_path() {
 
     // Must return a real 1-hop path, not empty with reason="self".
     let paths = v["paths"].as_array().expect("paths must be array");
-    assert_eq!(paths.len(), 1, "self-edge must produce 1 path; got: {}", stdout);
-    assert_eq!(paths[0]["length"].as_u64().unwrap_or(0), 1, "self-loop path must have length 1; got: {}", stdout);
+    assert_eq!(
+        paths.len(),
+        1,
+        "self-edge must produce 1 path; got: {}",
+        stdout
+    );
+    assert_eq!(
+        paths[0]["length"].as_u64().unwrap_or(0),
+        1,
+        "self-loop path must have length 1; got: {}",
+        stdout
+    );
 
     let empty_reason = v["empty_reason"].as_str().unwrap_or("none");
-    assert_ne!(empty_reason, "self", "self-edge must not report empty_reason=self; got: {}", stdout);
+    assert_ne!(
+        empty_reason, "self",
+        "self-edge must not report empty_reason=self; got: {}",
+        stdout
+    );
 
     let hops = paths[0]["hops"].as_array().expect("hops must be array");
-    assert_eq!(hops[0]["from"].as_str(), Some("cyclic_mod"), "self-loop from; stdout={}", stdout);
-    assert_eq!(hops[0]["to"].as_str(), Some("cyclic_mod"), "self-loop to; stdout={}", stdout);
+    assert_eq!(
+        hops[0]["from"].as_str(),
+        Some("cyclic_mod"),
+        "self-loop from; stdout={}",
+        stdout
+    );
+    assert_eq!(
+        hops[0]["to"].as_str(),
+        Some("cyclic_mod"),
+        "self-loop to; stdout={}",
+        stdout
+    );
 }
 
 /// invalid --format emits error to stderr (not stdout) and stdout is empty.
@@ -765,10 +940,13 @@ fn invalid_format_text_mode_emits_to_stderr() {
     let out = std::process::Command::new(bin)
         .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
         .args([
-            "--format", "bogus",
+            "--format",
+            "bogus",
             "module-route",
-            "--from", "fa",
-            "--to", "fb",
+            "--from",
+            "fa",
+            "--to",
+            "fb",
         ])
         .output()
         .unwrap();
@@ -803,18 +981,23 @@ fn invalid_via_kind_json_mode_emits_envelope() {
     let out = std::process::Command::new(bin)
         .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
         .args([
-            "--format", "json",
+            "--format",
+            "json",
             "module-route",
-            "--from", "vka",
-            "--to", "vkb",
-            "--via-kind", "badkind",
+            "--from",
+            "vka",
+            "--to",
+            "vkb",
+            "--via-kind",
+            "badkind",
         ])
         .output()
         .unwrap();
 
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let v: serde_json::Value = serde_json::from_str(&stdout)
-        .unwrap_or_else(|e| panic!("must be JSON for invalid --via-kind in json mode: {e}; stdout={stdout}"));
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("must be JSON for invalid --via-kind in json mode: {e}; stdout={stdout}")
+    });
 
     assert_eq!(
         v["empty_reason"].as_str().unwrap_or(""),
@@ -845,9 +1028,12 @@ fn invalid_via_kind_text_mode_emits_to_stderr() {
         .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
         .args([
             "module-route",
-            "--from", "tvka",
-            "--to", "tvkb",
-            "--via-kind", "badkind",
+            "--from",
+            "tvka",
+            "--to",
+            "tvkb",
+            "--via-kind",
+            "badkind",
         ])
         .output()
         .unwrap();
@@ -882,20 +1068,28 @@ fn mermaid_escapes_special_chars_in_module_names() {
     let out = std::process::Command::new(bin)
         .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
         .args([
-            "--format", "mermaid",
+            "--format",
+            "mermaid",
             "module-route",
-            "--from", ":feature:auth-impl(jvm)",
-            "--to", "core",
+            "--from",
+            ":feature:auth-impl(jvm)",
+            "--to",
+            "core",
         ])
         .output()
         .unwrap();
 
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("```mermaid"), "must have mermaid fence; got: {}", stdout);
+    assert!(
+        stdout.contains("```mermaid"),
+        "must have mermaid fence; got: {}",
+        stdout
+    );
     // The raw name must NOT appear unescaped in node declarations.
     // Specifically the `(jvm)` part would break Mermaid if not escaped.
     assert!(
-        !stdout.contains("n0[:feature:auth-impl(jvm)]") && !stdout.contains("n1[:feature:auth-impl(jvm)]"),
+        !stdout.contains("n0[:feature:auth-impl(jvm)]")
+            && !stdout.contains("n1[:feature:auth-impl(jvm)]"),
         "raw special-char name must not appear unescaped in node declaration; stdout={}",
         stdout
     );
@@ -916,10 +1110,13 @@ fn dot_format_smoke_test() {
     let out = std::process::Command::new(bin)
         .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
         .args([
-            "--format", "dot",
+            "--format",
+            "dot",
             "module-route",
-            "--from", "dota",
-            "--to", "dotb",
+            "--from",
+            "dota",
+            "--to",
+            "dotb",
         ])
         .output()
         .unwrap();
@@ -957,11 +1154,15 @@ fn max_depth_cuts_long_path() {
     let out = std::process::Command::new(bin)
         .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
         .args([
-            "--format", "json",
+            "--format",
+            "json",
             "module-route",
-            "--from", "mdA",
-            "--to", "mdD",
-            "--max-depth", "2",
+            "--from",
+            "mdA",
+            "--to",
+            "mdD",
+            "--max-depth",
+            "2",
         ])
         .output()
         .unwrap();
@@ -994,10 +1195,13 @@ fn not_indexed_json_envelope_shape() {
     let out = std::process::Command::new(bin)
         .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
         .args([
-            "--format", "json",
+            "--format",
+            "json",
             "module-route",
-            "--from", "x",
-            "--to", "y",
+            "--from",
+            "x",
+            "--to",
+            "y",
         ])
         .output()
         .unwrap();
@@ -1037,11 +1241,15 @@ fn shortest_mode_timeout_signals_truncated_not_unreachable() {
     let out = std::process::Command::new(bin)
         .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
         .args([
-            "--format", "json",
+            "--format",
+            "json",
             "module-route",
-            "--from", "a",
-            "--to", "b",
-            "--timeout-ms", "0",
+            "--from",
+            "a",
+            "--to",
+            "b",
+            "--timeout-ms",
+            "0",
         ])
         .output()
         .expect("binary invocation must succeed");
@@ -1091,11 +1299,15 @@ fn self_edge_surfaces_real_kind_under_via_kind_all() {
     let out = std::process::Command::new(bin)
         .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
         .args([
-            "--format", "json",
+            "--format",
+            "json",
             "module-route",
-            "--from", "api_self_mod",
-            "--to", "api_self_mod",
-            "--via-kind", "all",
+            "--from",
+            "api_self_mod",
+            "--to",
+            "api_self_mod",
+            "--via-kind",
+            "all",
         ])
         .output()
         .expect("binary invocation must succeed");
@@ -1105,7 +1317,12 @@ fn self_edge_surfaces_real_kind_under_via_kind_all() {
         .unwrap_or_else(|e| panic!("must be JSON: {e}; stdout={stdout}"));
 
     let paths = v["paths"].as_array().expect("paths must be array");
-    assert_eq!(paths.len(), 1, "self-edge must yield 1 path; got: {}", stdout);
+    assert_eq!(
+        paths.len(),
+        1,
+        "self-edge must yield 1 path; got: {}",
+        stdout
+    );
     let kind = paths[0]["hops"][0]["kind"].as_str().unwrap_or("");
     assert_eq!(
         kind, "api",
@@ -1130,12 +1347,16 @@ fn max_paths_zero_returns_no_paths() {
     let out = std::process::Command::new(bin)
         .env("AST_INDEX_DB_PATH", db::get_db_path(dir.path()).unwrap())
         .args([
-            "--format", "json",
+            "--format",
+            "json",
             "module-route",
-            "--from", "a",
-            "--to", "b",
+            "--from",
+            "a",
+            "--to",
+            "b",
             "--all",
-            "--max-paths", "0",
+            "--max-paths",
+            "0",
         ])
         .output()
         .expect("binary invocation must succeed");
@@ -1146,17 +1367,20 @@ fn max_paths_zero_returns_no_paths() {
 
     let paths = v["paths"].as_array().expect("paths must be array");
     assert_eq!(
-        paths.len(), 0,
+        paths.len(),
+        0,
         "--max-paths 0 must yield zero paths; got: {}",
         stdout
     );
     assert_eq!(
-        v["count"].as_u64().unwrap_or(99), 0,
+        v["count"].as_u64().unwrap_or(99),
+        0,
         "--max-paths 0 must report count=0; got: {}",
         stdout
     );
     assert_eq!(
-        v["truncated"].as_bool().unwrap_or(false), true,
+        v["truncated"].as_bool().unwrap_or(false),
+        true,
         "--max-paths 0 must report truncated=true; got: {}",
         stdout
     );

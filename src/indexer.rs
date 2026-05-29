@@ -2,11 +2,12 @@ use anyhow::Result;
 use rayon::prelude::*;
 use regex::Regex;
 use rusqlite::Connection;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::LazyLock;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use crate::db;
@@ -159,7 +160,6 @@ impl ProjectType {
 /// Project configuration loaded from `.ast-index.yaml`
 #[derive(serde::Deserialize, Default, Debug)]
 pub struct ProjectConfig {
-    pub project_type: Option<String>,
     pub roots: Option<Vec<String>>,
     pub exclude: Option<Vec<String>>,
     /// Allow-list: only index these directories (relative to root).
@@ -543,9 +543,11 @@ pub fn detect_project_type(root: &Path) -> ProjectType {
 /// Parsed file data for parallel processing
 struct ParsedFile {
     rel_path: String,
+    root_path: String,
     mtime: i64,
     size: i64,
     symbols: Vec<ParsedSymbol>,
+    qualified_names: HashMap<(String, usize, String), String>,
     refs: Vec<ParsedRef>,
 }
 
@@ -557,6 +559,7 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
         .duration_since(SystemTime::UNIX_EPOCH)?
         .as_secs() as i64;
     let size = metadata.len() as i64;
+    let root_path = db::normalize_root_for_storage(root);
 
     let rel_path = file_path
         .strip_prefix(root)
@@ -568,9 +571,11 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
     if size > 1_000_000 {
         return Ok(ParsedFile {
             rel_path,
+            root_path,
             mtime,
             size,
             symbols: vec![],
+            qualified_names: HashMap::new(),
             refs: vec![],
         });
     }
@@ -588,15 +593,22 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
         None => {
             return Ok(ParsedFile {
                 rel_path,
+                root_path,
                 mtime,
                 size,
                 symbols: vec![],
+                qualified_names: HashMap::new(),
                 refs: vec![],
             });
         }
     };
 
     let (mut symbols, refs) = parsers::parse_file_symbols(&content, file_type)?;
+    let mut qualified_names = HashMap::new();
+
+    if file_type == parsers::FileType::Cpp {
+        qualified_names = parsers::treesitter::cpp::collect_qualified_names(&content)?;
+    }
 
     // BSL (1C:Enterprise) — module names are encoded in directory structure,
     // not in file content. Extract module name from path and emit synthetic symbol.
@@ -614,9 +626,11 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
 
     Ok(ParsedFile {
         rel_path,
+        root_path,
         mtime,
         size,
         symbols,
+        qualified_names,
         refs,
     })
 }
@@ -857,7 +871,8 @@ impl WalkErrorSummary {
     fn merge_from(&mut self, other: Self) {
         self.count += other.count;
         let remaining = Self::MAX_SAMPLES.saturating_sub(self.samples.len());
-        self.samples.extend(other.samples.into_iter().take(remaining));
+        self.samples
+            .extend(other.samples.into_iter().take(remaining));
     }
 }
 
@@ -985,17 +1000,7 @@ pub fn index_directory(
     progress: bool,
     no_ignore: bool,
 ) -> Result<WalkResult> {
-    index_directory_scoped(conn, root, root, progress, no_ignore, None, None)
-}
-
-pub fn index_directory_with_type(
-    conn: &mut Connection,
-    root: &Path,
-    progress: bool,
-    no_ignore: bool,
-    project_type: Option<ProjectType>,
-) -> Result<WalkResult> {
-    index_directory_scoped(conn, root, root, progress, no_ignore, project_type, None)
+    index_directory_scoped(conn, root, root, progress, no_ignore, None)
 }
 
 pub fn index_directory_with_config(
@@ -1003,18 +1008,9 @@ pub fn index_directory_with_config(
     root: &Path,
     progress: bool,
     no_ignore: bool,
-    project_type: Option<ProjectType>,
     extra_exclude: Option<&[String]>,
 ) -> Result<WalkResult> {
-    index_directory_scoped(
-        conn,
-        root,
-        root,
-        progress,
-        no_ignore,
-        project_type,
-        extra_exclude,
-    )
+    index_directory_scoped(conn, root, root, progress, no_ignore, extra_exclude)
 }
 
 /// Index only direct entries under `root`.
@@ -1027,7 +1023,6 @@ pub fn index_directory_direct_entries(
     root: &Path,
     progress: bool,
     no_ignore: bool,
-    project_type: Option<ProjectType>,
     extra_exclude: Option<&[String]>,
 ) -> Result<WalkResult> {
     index_directory_scoped_with_max_depth(
@@ -1036,7 +1031,6 @@ pub fn index_directory_direct_entries(
         root,
         progress,
         no_ignore,
-        project_type,
         extra_exclude,
         Some(1),
     )
@@ -1052,7 +1046,6 @@ pub fn index_directory_scoped(
     walk_dir: &Path,
     progress: bool,
     no_ignore: bool,
-    project_type_override: Option<ProjectType>,
     extra_exclude: Option<&[String]>,
 ) -> Result<WalkResult> {
     index_directory_scoped_with_max_depth(
@@ -1061,7 +1054,6 @@ pub fn index_directory_scoped(
         walk_dir,
         progress,
         no_ignore,
-        project_type_override,
         extra_exclude,
         Some(50),
     )
@@ -1073,7 +1065,6 @@ fn index_directory_scoped_with_max_depth(
     walk_dir: &Path,
     progress: bool,
     no_ignore: bool,
-    project_type_override: Option<ProjectType>,
     extra_exclude: Option<&[String]>,
     max_depth: Option<usize>,
 ) -> Result<WalkResult> {
@@ -1081,18 +1072,7 @@ fn index_directory_scoped_with_max_depth(
     use std::time::Instant;
 
     let verbose = std::env::var("AST_INDEX_VERBOSE").is_ok();
-    let experimental_parallel_walk =
-        std::env::var("AST_INDEX_EXPERIMENTAL_PARALLEL_WALK").is_ok();
-
-    // Detect project type (or use override)
-    let project_type = project_type_override.unwrap_or_else(|| detect_project_type(walk_dir));
-    if progress {
-        if project_type_override.is_some() {
-            eprintln!("Forced project type: {}", project_type.as_str());
-        } else {
-            eprintln!("Detected project type: {}", project_type.as_str());
-        }
-    }
+    let experimental_parallel_walk = std::env::var("AST_INDEX_EXPERIMENTAL_PARALLEL_WALK").is_ok();
 
     // Collect all file paths (paths are lightweight, OK to keep in memory)
     if verbose {
@@ -1367,14 +1347,16 @@ fn write_batch_to_db(
 
     {
         let file_sql = match mode {
-            WriteMode::FreshRebuild => "INSERT INTO files (path, mtime, size) VALUES (?1, ?2, ?3)",
+            WriteMode::FreshRebuild => {
+                "INSERT INTO files (path, root_path, mtime, size) VALUES (?1, ?2, ?3, ?4)"
+            }
             WriteMode::ReplaceExisting => {
-                "INSERT OR REPLACE INTO files (path, mtime, size) VALUES (?1, ?2, ?3)"
+                "INSERT OR REPLACE INTO files (path, root_path, mtime, size) VALUES (?1, ?2, ?3, ?4)"
             }
         };
         let mut file_stmt = tx.prepare_cached(file_sql)?;
         let mut sym_stmt = tx.prepare_cached(
-            "INSERT INTO symbols (file_id, name, kind, line, signature) VALUES (?1, ?2, ?3, ?4, ?5)"
+            "INSERT INTO symbols (file_id, name, qualified_name, kind, line, signature) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
         )?;
         let mut inh_stmt = tx.prepare_cached(
             "INSERT INTO inheritance (child_id, parent_name, kind) VALUES (?1, ?2, ?3)",
@@ -1384,16 +1366,32 @@ fn write_batch_to_db(
         )?;
 
         for pf in batch {
-            file_stmt.execute(rusqlite::params![pf.rel_path, pf.mtime, pf.size])?;
+            let ParsedFile {
+                rel_path,
+                root_path,
+                mtime,
+                size,
+                symbols,
+                qualified_names,
+                refs,
+            } = pf;
+
+            file_stmt.execute(rusqlite::params![rel_path, root_path, mtime, size])?;
             let file_id = tx.last_insert_rowid();
             // `INSERT OR REPLACE` on `files.path` drops the previous file row first, and
             // `ON DELETE CASCADE` clears old symbols/refs automatically. Explicit deletes
             // here only add extra work, especially during full rebuilds on a fresh DB.
 
-            for sym in pf.symbols {
+            for sym in symbols {
+                let qualified_name = qualified_names.get(&(
+                    sym.kind.as_str().to_string(),
+                    sym.line,
+                    sym.name.clone(),
+                ));
                 sym_stmt.execute(rusqlite::params![
                     file_id,
                     sym.name,
+                    qualified_name,
                     sym.kind.as_str(),
                     sym.line as i64,
                     sym.signature
@@ -1405,7 +1403,7 @@ fn write_batch_to_db(
                 }
             }
 
-            for r in pf.refs {
+            for r in refs {
                 ref_stmt.execute(rusqlite::params![file_id, r.name, r.line as i64, r.context])?;
             }
 
@@ -1445,19 +1443,20 @@ pub fn update_directory_incremental(
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     // 1. Load existing files from DB with their mtime
-    let mut existing_files: HashMap<String, (i64, i64)> = HashMap::new(); // path -> (file_id, mtime)
+    let mut existing_files: HashMap<(String, String), (i64, i64)> = HashMap::new(); // (root_path, path) -> (file_id, mtime)
     {
-        let mut stmt = conn.prepare("SELECT id, path, mtime FROM files")?;
+        let mut stmt = conn.prepare("SELECT id, root_path, path, mtime FROM files")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
             ))
         })?;
         for row in rows {
-            let (id, path, mtime) = row?;
-            existing_files.insert(path, (id, mtime));
+            let (id, root_path, path, mtime) = row?;
+            existing_files.insert((root_path, path), (id, mtime));
         }
     }
 
@@ -1500,7 +1499,8 @@ pub fn update_directory_incremental(
     // 3. Walk each (walk_dir, anchor) pair and categorize its files. Paths are
     //    stored relative to `anchor`, matching `index_directory_scoped`'s scheme.
     let mut files_to_parse: Vec<(PathBuf, PathBuf)> = Vec::new(); // (anchor, file_path)
-    let mut current_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut current_paths: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
 
     for (walk_dir, anchor) in &walk_specs {
         let is_git = has_git_repo(walk_dir) || has_git_repo(anchor);
@@ -1549,6 +1549,7 @@ pub fn update_directory_incremental(
                 .unwrap_or(&file_path)
                 .to_string_lossy()
                 .to_string();
+            let root_key = db::normalize_root_for_storage(anchor);
 
             let file_mtime = fs::metadata(&file_path)
                 .and_then(|m| m.modified())
@@ -1557,7 +1558,7 @@ pub fn update_directory_incremental(
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
 
-            let need_parse = match existing_files.get(&rel_path) {
+            let need_parse = match existing_files.get(&(root_key.clone(), rel_path.clone())) {
                 Some((_, db_mtime)) => file_mtime > *db_mtime,
                 None => true,
             };
@@ -1565,12 +1566,12 @@ pub fn update_directory_incremental(
             if need_parse {
                 files_to_parse.push((anchor.clone(), file_path));
             }
-            current_paths.insert(rel_path);
+            current_paths.insert((root_key, rel_path));
         }
     }
 
     // 4. Find deleted files
-    let deleted_paths: Vec<String> = existing_files
+    let deleted_paths: Vec<(String, String)> = existing_files
         .keys()
         .filter(|p| !current_paths.contains(*p))
         .cloned()
@@ -1588,9 +1589,10 @@ pub fn update_directory_incremental(
     if !deleted_paths.is_empty() {
         let tx = conn.transaction()?;
         {
-            let mut del_file_stmt = tx.prepare_cached("DELETE FROM files WHERE path = ?1")?;
-            for path in &deleted_paths {
-                del_file_stmt.execute(rusqlite::params![path])?;
+            let mut del_file_stmt =
+                tx.prepare_cached("DELETE FROM files WHERE root_path = ?1 AND path = ?2")?;
+            for (root_path, path) in &deleted_paths {
+                del_file_stmt.execute(rusqlite::params![root_path, path])?;
             }
         }
         tx.commit()?;
@@ -2107,8 +2109,7 @@ pub fn index_module_dependencies(
     gradle_files: &[PathBuf],
     progress: bool,
 ) -> Result<usize> {
-    let experimental_fast_rebuild =
-        std::env::var("AST_INDEX_EXPERIMENTAL_FAST_REBUILD").is_ok();
+    let experimental_fast_rebuild = std::env::var("AST_INDEX_EXPERIMENTAL_FAST_REBUILD").is_ok();
     // Regex patterns for dependency declarations
     // Gradle projects DSL style: modules { api(projects.features.payments.api) }
     static PROJECTS_DEP_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -2284,7 +2285,8 @@ pub fn index_module_dependencies(
                                 for caps in maven_dep_re.captures_iter(&content) {
                                     let artifact_id = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                                     for (mod_name, &mod_id) in module_ids.iter() {
-                                        let last_segment = mod_name.rsplit('.').next().unwrap_or(mod_name);
+                                        let last_segment =
+                                            mod_name.rsplit('.').next().unwrap_or(mod_name);
                                         if last_segment == artifact_id {
                                             edges.push((module_id, mod_id, "compile".to_string()));
                                         }
@@ -2320,16 +2322,26 @@ pub fn index_module_dependencies(
                                     let section = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                                     for line in section.lines() {
                                         let line = line.trim();
-                                        if line.is_empty() || line.starts_with('#') || line.starts_with('[') {
+                                        if line.is_empty()
+                                            || line.starts_with('#')
+                                            || line.starts_with('[')
+                                        {
                                             continue;
                                         }
                                         if let Some(eq_pos) = line.find('=') {
-                                            let dep_name = line[..eq_pos].trim().trim_matches('"').trim_matches('\'');
+                                            let dep_name = line[..eq_pos]
+                                                .trim()
+                                                .trim_matches('"')
+                                                .trim_matches('\'');
                                             if dep_name == "python" || dep_name.is_empty() {
                                                 continue;
                                             }
                                             if let Some(&dep_id) = module_ids.get(dep_name) {
-                                                edges.push((module_id, dep_id, "compile".to_string()));
+                                                edges.push((
+                                                    module_id,
+                                                    dep_id,
+                                                    "compile".to_string(),
+                                                ));
                                             }
                                         }
                                     }
@@ -2363,7 +2375,8 @@ pub fn index_module_dependencies(
                                     let dep_kind =
                                         caps.get(1).map(|m| m.as_str()).unwrap_or("implementation");
                                     let dep_path = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-                                    let dep_name = dep_path.trim_start_matches(':').replace(':', ".");
+                                    let dep_name =
+                                        dep_path.trim_start_matches(':').replace(':', ".");
                                     if let Some(&dep_id) = module_ids.get(&dep_name) {
                                         if inserted.insert((module_id, dep_id)) {
                                             edges.push((module_id, dep_id, dep_kind.to_string()));
@@ -2373,8 +2386,10 @@ pub fn index_module_dependencies(
                                 for (b_start, b_end) in find_forma_deps_blocks(&content) {
                                     let block = strip_kt_line_comments(&content[b_start..b_end]);
                                     for caps in project_only_re.captures_iter(&block) {
-                                        let dep_path = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                                        let dep_name = dep_path.trim_start_matches(':').replace(':', ".");
+                                        let dep_path =
+                                            caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                                        let dep_name =
+                                            dep_path.trim_start_matches(':').replace(':', ".");
                                         if let Some(&dep_id) = module_ids.get(&dep_name) {
                                             if inserted.insert((module_id, dep_id)) {
                                                 edges.push((
@@ -2499,11 +2514,13 @@ pub fn index_module_dependencies(
                             let section = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                             for line in section.lines() {
                                 let line = line.trim();
-                                if line.is_empty() || line.starts_with('#') || line.starts_with('[') {
+                                if line.is_empty() || line.starts_with('#') || line.starts_with('[')
+                                {
                                     continue;
                                 }
                                 if let Some(eq_pos) = line.find('=') {
-                                    let dep_name = line[..eq_pos].trim().trim_matches('"').trim_matches('\'');
+                                    let dep_name =
+                                        line[..eq_pos].trim().trim_matches('"').trim_matches('\'');
                                     if dep_name == "python" || dep_name.is_empty() {
                                         continue;
                                     }
@@ -2529,7 +2546,8 @@ pub fn index_module_dependencies(
                         let mut inserted: std::collections::HashSet<(i64, i64)> =
                             std::collections::HashSet::new();
                         for caps in projects_dep_re.captures_iter(&content) {
-                            let dep_kind = caps.get(1).map(|m| m.as_str()).unwrap_or("implementation");
+                            let dep_kind =
+                                caps.get(1).map(|m| m.as_str()).unwrap_or("implementation");
                             let dep_name = caps.get(2).map(|m| m.as_str()).unwrap_or("");
                             if let Some(&dep_id) = module_ids.get(dep_name) {
                                 if inserted.insert((module_id, dep_id)) {
@@ -2538,7 +2556,8 @@ pub fn index_module_dependencies(
                             }
                         }
                         for caps in gradle_project_re.captures_iter(&content) {
-                            let dep_kind = caps.get(1).map(|m| m.as_str()).unwrap_or("implementation");
+                            let dep_kind =
+                                caps.get(1).map(|m| m.as_str()).unwrap_or("implementation");
                             let dep_path = caps.get(2).map(|m| m.as_str()).unwrap_or("");
                             let dep_name = dep_path.trim_start_matches(':').replace(':', ".");
                             if let Some(&dep_id) = module_ids.get(&dep_name) {
@@ -2649,8 +2668,7 @@ pub fn index_xml_usages(
     xml_layout_files: &[PathBuf],
     progress: bool,
 ) -> Result<usize> {
-    let experimental_fast_rebuild =
-        std::env::var("AST_INDEX_EXPERIMENTAL_FAST_REBUILD").is_ok();
+    let experimental_fast_rebuild = std::env::var("AST_INDEX_EXPERIMENTAL_FAST_REBUILD").is_ok();
     let module_lookup = ModuleLookup::from_db(conn)?;
 
     // Regex for class names in XML
@@ -2690,94 +2708,48 @@ pub fn index_xml_usages(
             "INSERT INTO xml_usages (module_id, file_path, line, class_name, usage_type, element_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
         )?;
 
-        let usage_rows: Vec<(Option<i64>, String, i64, String, &'static str, Option<String>)> =
-            if experimental_fast_rebuild {
-                let num_threads = effective_num_threads();
-                let pool = rayon::ThreadPoolBuilder::new()
-                    .num_threads(num_threads)
-                    .stack_size(RAYON_WORKER_STACK_SIZE)
-                    .build()
-                    .map_err(|e| anyhow::anyhow!("Failed to build thread pool: {}", e))?;
-                let root_buf = root.to_path_buf();
-                let module_lookup = module_lookup.clone();
+        let usage_rows: Vec<(
+            Option<i64>,
+            String,
+            i64,
+            String,
+            &'static str,
+            Option<String>,
+        )> = if experimental_fast_rebuild {
+            let num_threads = effective_num_threads();
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(num_threads)
+                .stack_size(RAYON_WORKER_STACK_SIZE)
+                .build()
+                .map_err(|e| anyhow::anyhow!("Failed to build thread pool: {}", e))?;
+            let root_buf = root.to_path_buf();
+            let module_lookup = module_lookup.clone();
 
-                pool.install(|| {
-                    xml_layout_files
-                        .par_iter()
-                        .flat_map_iter(|xml_path| {
-                            let rel_path = xml_path
-                                .strip_prefix(&root_buf)
-                                .unwrap_or(xml_path)
-                                .to_string_lossy()
-                                .to_string();
-                            let module_id = module_lookup.find(&rel_path);
-                            let content = match crate::encoding::read_file_to_string(xml_path) {
-                                Ok(content) => content,
-                                Err(_) => return Vec::new(),
-                            };
+            pool.install(|| {
+                xml_layout_files
+                    .par_iter()
+                    .flat_map_iter(|xml_path| {
+                        let rel_path = xml_path
+                            .strip_prefix(&root_buf)
+                            .unwrap_or(xml_path)
+                            .to_string_lossy()
+                            .to_string();
+                        let module_id = module_lookup.find(&rel_path);
+                        let content = match crate::encoding::read_file_to_string(xml_path) {
+                            Ok(content) => content,
+                            Err(_) => return Vec::new(),
+                        };
 
-                            let mut rows = Vec::new();
-                            for (line_idx, line) in content.lines().enumerate() {
-                                if !line.contains('.') && !line.contains("class") && !line.contains("android:name") {
-                                    continue;
-                                }
-
-                                let line_num = line_idx as i64 + 1;
-                                let element_id = id_re
-                                    .captures(line)
-                                    .map(|c| c.get(1).unwrap().as_str().to_string());
-
-                                if line.contains('<') && line.contains('.') {
-                                    for caps in full_class_re.captures_iter(line) {
-                                        rows.push((
-                                            module_id,
-                                            rel_path.clone(),
-                                            line_num,
-                                            caps.get(1).unwrap().as_str().to_string(),
-                                            "view_tag",
-                                            element_id.clone(),
-                                        ));
-                                    }
-                                }
-
-                                if line.contains("class") || line.contains("android:name") {
-                                    let usage_type = if line.contains("<fragment")
-                                        || line.contains("android:name")
-                                    {
-                                        "fragment"
-                                    } else {
-                                        "view_class_attr"
-                                    };
-                                    for caps in class_attr_re.captures_iter(line) {
-                                        rows.push((
-                                            module_id,
-                                            rel_path.clone(),
-                                            line_num,
-                                            caps.get(1).unwrap().as_str().to_string(),
-                                            usage_type,
-                                            element_id.clone(),
-                                        ));
-                                    }
-                                }
+                        let mut rows = Vec::new();
+                        for (line_idx, line) in content.lines().enumerate() {
+                            if !line.contains('.')
+                                && !line.contains("class")
+                                && !line.contains("android:name")
+                            {
+                                continue;
                             }
-                            rows
-                        })
-                        .collect()
-                })
-            } else {
-                let mut rows = Vec::new();
-                for xml_path in xml_layout_files {
-                    let rel_path = xml_path
-                        .strip_prefix(root)
-                        .unwrap_or(xml_path)
-                        .to_string_lossy()
-                        .to_string();
-                    let module_id = module_lookup.find(&rel_path);
 
-                    if let Ok(content) = crate::encoding::read_file_to_string(xml_path) {
-                        for (line_num, line) in content.lines().enumerate() {
-                            let line_num = line_num as i64 + 1;
-
+                            let line_num = line_idx as i64 + 1;
                             let element_id = id_re
                                 .captures(line)
                                 .map(|c| c.get(1).unwrap().as_str().to_string());
@@ -2796,13 +2768,13 @@ pub fn index_xml_usages(
                             }
 
                             if line.contains("class") || line.contains("android:name") {
-                                let usage_type =
-                                    if line.contains("<fragment") || line.contains("android:name")
-                                    {
-                                        "fragment"
-                                    } else {
-                                        "view_class_attr"
-                                    };
+                                let usage_type = if line.contains("<fragment")
+                                    || line.contains("android:name")
+                                {
+                                    "fragment"
+                                } else {
+                                    "view_class_attr"
+                                };
                                 for caps in class_attr_re.captures_iter(line) {
                                     rows.push((
                                         module_id,
@@ -2815,19 +2787,68 @@ pub fn index_xml_usages(
                                 }
                             }
                         }
+                        rows
+                    })
+                    .collect()
+            })
+        } else {
+            let mut rows = Vec::new();
+            for xml_path in xml_layout_files {
+                let rel_path = xml_path
+                    .strip_prefix(root)
+                    .unwrap_or(xml_path)
+                    .to_string_lossy()
+                    .to_string();
+                let module_id = module_lookup.find(&rel_path);
+
+                if let Ok(content) = crate::encoding::read_file_to_string(xml_path) {
+                    for (line_num, line) in content.lines().enumerate() {
+                        let line_num = line_num as i64 + 1;
+
+                        let element_id = id_re
+                            .captures(line)
+                            .map(|c| c.get(1).unwrap().as_str().to_string());
+
+                        if line.contains('<') && line.contains('.') {
+                            for caps in full_class_re.captures_iter(line) {
+                                rows.push((
+                                    module_id,
+                                    rel_path.clone(),
+                                    line_num,
+                                    caps.get(1).unwrap().as_str().to_string(),
+                                    "view_tag",
+                                    element_id.clone(),
+                                ));
+                            }
+                        }
+
+                        if line.contains("class") || line.contains("android:name") {
+                            let usage_type =
+                                if line.contains("<fragment") || line.contains("android:name") {
+                                    "fragment"
+                                } else {
+                                    "view_class_attr"
+                                };
+                            for caps in class_attr_re.captures_iter(line) {
+                                rows.push((
+                                    module_id,
+                                    rel_path.clone(),
+                                    line_num,
+                                    caps.get(1).unwrap().as_str().to_string(),
+                                    usage_type,
+                                    element_id.clone(),
+                                ));
+                            }
+                        }
                     }
                 }
-                rows
-            };
+            }
+            rows
+        };
 
         for (module_id, rel_path, line_num, class_name, usage_type, element_id) in usage_rows {
             stmt.execute(rusqlite::params![
-                module_id,
-                rel_path,
-                line_num,
-                class_name,
-                usage_type,
-                element_id
+                module_id, rel_path, line_num, class_name, usage_type, element_id
             ])?;
             count += 1;
         }
@@ -2889,8 +2910,7 @@ pub fn index_resources(
     res_files: &[PathBuf],
     progress: bool,
 ) -> Result<(usize, usize)> {
-    let experimental_fast_rebuild =
-        std::env::var("AST_INDEX_EXPERIMENTAL_FAST_REBUILD").is_ok();
+    let experimental_fast_rebuild = std::env::var("AST_INDEX_EXPERIMENTAL_FAST_REBUILD").is_ok();
     let module_lookup = ModuleLookup::from_db(conn)?;
 
     if progress {
@@ -3878,16 +3898,18 @@ pub fn index_node_modules_dts(conn: &mut Connection, root: &Path, progress: bool
         .map_err(|e| anyhow::anyhow!("Failed to build thread pool: {}", e))?;
 
     let mut total_count = 0;
+    let root_path = db::normalize_root_for_storage(root);
 
     for chunk in dts_files.chunks(chunk_size) {
         let counter = parsed_global.clone();
         let total = total_files;
+        let root_path = root_path.clone();
 
         let parsed_files: Vec<ParsedFile> = pool.install(|| {
             chunk
                 .par_iter()
                 .filter_map(|(abs_path, rel_path)| {
-                    let result = parse_dts_file(abs_path, rel_path).ok();
+                    let result = parse_dts_file(abs_path, rel_path, &root_path).ok();
                     let c = counter.fetch_add(1, Ordering::Relaxed) + 1;
                     if progress && c % 1000 == 0 {
                         eprintln!("Parsed {} / {} .d.ts files...", c, total);
@@ -3913,7 +3935,7 @@ pub fn index_node_modules_dts(conn: &mut Connection, root: &Path, progress: bool
 }
 
 /// Parse a .d.ts file with an explicit relative path (for pnpm store paths)
-fn parse_dts_file(file_path: &Path, rel_path: &str) -> Result<ParsedFile> {
+fn parse_dts_file(file_path: &Path, rel_path: &str, root_path: &str) -> Result<ParsedFile> {
     let metadata = fs::metadata(file_path)?;
     let mtime = metadata
         .modified()?
@@ -3925,9 +3947,11 @@ fn parse_dts_file(file_path: &Path, rel_path: &str) -> Result<ParsedFile> {
     if size > 1_000_000 {
         return Ok(ParsedFile {
             rel_path: rel_path.to_string(),
+            root_path: root_path.to_string(),
             mtime,
             size,
             symbols: vec![],
+            qualified_names: HashMap::new(),
             refs: vec![],
         });
     }
@@ -3937,9 +3961,11 @@ fn parse_dts_file(file_path: &Path, rel_path: &str) -> Result<ParsedFile> {
 
     Ok(ParsedFile {
         rel_path: rel_path.to_string(),
+        root_path: root_path.to_string(),
         mtime,
         size,
         symbols,
+        qualified_names: HashMap::new(),
         refs,
     })
 }
@@ -4083,6 +4109,31 @@ mod tests {
     fn test_detect_unknown_project() {
         let dir = TempDir::new().unwrap();
         assert_eq!(detect_project_type(dir.path()), ProjectType::Unknown);
+    }
+
+    #[test]
+    fn load_config_ignores_legacy_project_type_field() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".ast-index.yaml"),
+            r#"
+project_type: dart
+roots:
+  - "../shared"
+exclude:
+  - "vendor"
+include:
+  - "src"
+no_ignore: true
+"#,
+        )
+        .unwrap();
+
+        let config = load_config(dir.path()).expect("legacy config should still parse");
+        assert_eq!(config.roots, Some(vec!["../shared".to_string()]));
+        assert_eq!(config.exclude, Some(vec!["vendor".to_string()]));
+        assert_eq!(config.include, Some(vec!["src".to_string()]));
+        assert_eq!(config.no_ignore, Some(true));
     }
 
     #[test]

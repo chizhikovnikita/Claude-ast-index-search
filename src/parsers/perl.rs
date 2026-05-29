@@ -11,8 +11,8 @@ use anyhow::Result;
 use regex::Regex;
 use std::sync::LazyLock;
 
-use crate::db::SymbolKind;
 use super::ParsedSymbol;
+use crate::db::SymbolKind;
 
 /// Parse Perl source code and extract symbols
 pub fn parse_perl_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
@@ -20,31 +20,40 @@ pub fn parse_perl_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
 
     // Regex patterns for Perl constructs
     // Package declaration: package Name;
-    static PACKAGE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*package\s+([A-Za-z_][A-Za-z0-9_:]*)\s*;").unwrap());
+    static PACKAGE_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^\s*package\s+([A-Za-z_][A-Za-z0-9_:]*)\s*;").unwrap());
     let package_re = &*PACKAGE_RE;
 
     // Subroutine definition: sub name { } or sub name($proto) { }
-    static SUB_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*sub\s+([A-Za-z_][A-Za-z0-9_]*)\s*[\{(]?").unwrap());
+    static SUB_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^\s*sub\s+([A-Za-z_][A-Za-z0-9_]*)\s*[\{(]?").unwrap());
 
     let sub_re = &*SUB_RE;
 
     // Constant definition: use constant NAME => value;
-    static CONSTANT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*use\s+constant\s+([A-Z_][A-Z0-9_]*)\s*=>").unwrap());
+    static CONSTANT_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^\s*use\s+constant\s+([A-Z_][A-Z0-9_]*)\s*=>").unwrap());
 
     let constant_re = &*CONSTANT_RE;
 
     // Our variable declaration: our $VAR, our @ARRAY, our %HASH
-    static OUR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*our\s+([\$@%][A-Za-z_][A-Za-z0-9_]*)").unwrap());
+    static OUR_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^\s*our\s+([\$@%][A-Za-z_][A-Za-z0-9_]*)").unwrap());
 
     let our_re = &*OUR_RE;
 
     // Inheritance patterns
     // use base qw/Parent1 Parent2/; or use base 'Parent';
-    static USE_BASE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"use\s+(?:base|parent)\s+(?:qw[/(]([^)/\\]+)[)/\\]|['"]([^'"]+)['"])"#).unwrap());
+    static USE_BASE_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"use\s+(?:base|parent)\s+(?:qw[/(]([^)/\\]+)[)/\\]|['"]([^'"]+)['"])"#)
+            .unwrap()
+    });
 
     let use_base_re = &*USE_BASE_RE;
     // our @ISA = qw(Parent1 Parent2);
-    static ISA_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"our\s+@ISA\s*=\s*(?:qw[/(]([^)/\\]+)[)/\\]|\(([^)]+)\))"#).unwrap());
+    static ISA_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"our\s+@ISA\s*=\s*(?:qw[/(]([^)/\\]+)[)/\\]|\(([^)]+)\))"#).unwrap()
+    });
 
     let isa_re = &*ISA_RE;
 
@@ -198,16 +207,25 @@ mod tests {
     fn test_parse_our_variable() {
         let content = "our $VERSION = '1.0';\nour @EXPORT = qw(foo bar);\nour %CONFIG;\n";
         let symbols = parse_perl_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "$VERSION" && s.kind == SymbolKind::Property));
-        assert!(symbols.iter().any(|s| s.name == "@EXPORT" && s.kind == SymbolKind::Property));
-        assert!(symbols.iter().any(|s| s.name == "%CONFIG" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "$VERSION" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "@EXPORT" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "%CONFIG" && s.kind == SymbolKind::Property));
     }
 
     #[test]
     fn test_skip_isa() {
         let content = "our @ISA = qw(Parent);\n";
         let symbols = parse_perl_symbols(content).unwrap();
-        assert!(!symbols.iter().any(|s| s.name == "@ISA"), "should skip @ISA variable");
+        assert!(
+            !symbols.iter().any(|s| s.name == "@ISA"),
+            "should skip @ISA variable"
+        );
     }
 
     #[test]
@@ -215,8 +233,14 @@ mod tests {
         let content = "package Child;\nuse base qw/Parent1 Parent2/;\n";
         let symbols = parse_perl_symbols(content).unwrap();
         let pkg = symbols.iter().find(|s| s.name == "Child").unwrap();
-        assert!(pkg.parents.iter().any(|(p, k)| p == "Parent1" && k == "extends"));
-        assert!(pkg.parents.iter().any(|(p, k)| p == "Parent2" && k == "extends"));
+        assert!(pkg
+            .parents
+            .iter()
+            .any(|(p, k)| p == "Parent1" && k == "extends"));
+        assert!(pkg
+            .parents
+            .iter()
+            .any(|(p, k)| p == "Parent2" && k == "extends"));
     }
 
     #[test]
@@ -257,11 +281,21 @@ sub process {
 1;
 "#;
         let symbols = parse_perl_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "My::Service" && s.kind == SymbolKind::Package));
-        assert!(symbols.iter().any(|s| s.name == "TIMEOUT" && s.kind == SymbolKind::Constant));
-        assert!(symbols.iter().any(|s| s.name == "$VERSION" && s.kind == SymbolKind::Property));
-        assert!(symbols.iter().any(|s| s.name == "new" && s.kind == SymbolKind::Function));
-        assert!(symbols.iter().any(|s| s.name == "process" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "My::Service" && s.kind == SymbolKind::Package));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "TIMEOUT" && s.kind == SymbolKind::Constant));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "$VERSION" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "new" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "process" && s.kind == SymbolKind::Function));
 
         let pkg = symbols.iter().find(|s| s.name == "My::Service").unwrap();
         assert!(pkg.parents.iter().any(|(p, _)| p == "My::Base"));

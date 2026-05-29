@@ -10,28 +10,28 @@
 //! - ios: iOS-specific commands
 //! - perl: Perl-specific commands
 
-pub mod grep;
-pub mod management;
-pub mod index;
-pub mod modules;
-pub mod files;
-pub mod android;
-pub mod ios;
-pub mod perl;
-pub mod watch;
 pub mod analysis;
+pub mod android;
+pub mod files;
+pub mod grep;
+pub mod index;
+pub mod ios;
+pub mod management;
+pub mod modules;
+pub mod perl;
 pub mod project_info;
+pub mod watch;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use crossbeam_channel as channel;
 use grep_regex::RegexMatcher;
-use grep_searcher::{SearcherBuilder, sinks::UTF8};
 use grep_searcher::MmapChoice;
+use grep_searcher::{sinks::UTF8, SearcherBuilder};
 use ignore::WalkBuilder;
 use rusqlite::Connection;
 
@@ -49,17 +49,26 @@ use crate::db;
 /// root in order and returns the first absolute path that exists on disk.
 pub struct PathResolver {
     primary: PathBuf,
-    extra: Vec<PathBuf>,
+    primary_key: String,
+    extra: Vec<(String, PathBuf)>,
 }
 
 impl PathResolver {
     pub fn from_conn(primary: &Path, conn: &Connection) -> Self {
+        let primary_key = db::normalize_root_for_storage(primary);
         let extra = db::get_extra_roots(conn)
             .unwrap_or_default()
             .into_iter()
-            .map(PathBuf::from)
+            .map(|root| {
+                let path = PathBuf::from(&root);
+                (db::normalize_root_for_storage(&path), path)
+            })
             .collect();
-        Self { primary: primary.to_path_buf(), extra }
+        Self {
+            primary: primary.to_path_buf(),
+            primary_key,
+            extra,
+        }
     }
 
     /// Absolute path of a stored relative path. Returns `rel` unchanged when
@@ -71,13 +80,44 @@ impl PathResolver {
         if self.extra.is_empty() {
             return rel.to_string();
         }
-        for root in std::iter::once(&self.primary).chain(self.extra.iter()) {
+        for root in std::iter::once(&self.primary).chain(self.extra.iter().map(|(_, path)| path)) {
             let abs = root.join(rel);
             if abs.exists() {
                 return abs.to_string_lossy().into_owned();
             }
         }
         rel.to_string()
+    }
+
+    /// Absolute path of a stored relative path when the owning root is known.
+    /// Falls back to generic probing when the hint is absent or stale.
+    pub fn resolve_with_root(&self, rel: &str, root_path: Option<&str>) -> String {
+        if self.extra.is_empty() {
+            return rel.to_string();
+        }
+
+        if let Some(root_path) = root_path {
+            if root_path == self.primary_key {
+                let abs = self.primary.join(rel);
+                if abs.exists() {
+                    return abs.to_string_lossy().into_owned();
+                }
+                return self.resolve(rel);
+            }
+            if let Some((_, root)) = self.extra.iter().find(|(key, _)| key == root_path) {
+                let abs = root.join(rel);
+                if abs.exists() {
+                    return abs.to_string_lossy().into_owned();
+                }
+                return self.resolve(rel);
+            }
+            let abs = PathBuf::from(root_path).join(rel);
+            if abs.exists() {
+                return abs.to_string_lossy().into_owned();
+            }
+        }
+
+        self.resolve(rel)
     }
 }
 
@@ -118,14 +158,23 @@ pub fn relative_path(root: &Path, path: &Path) -> String {
 }
 
 /// Fast parallel file search using grep-searcher and ignore crates
-pub fn search_files<F>(root: &Path, pattern: &str, extensions: &[&str], mut handler: F) -> Result<()>
+pub fn search_files<F>(
+    root: &Path,
+    pattern: &str,
+    extensions: &[&str],
+    mut handler: F,
+) -> Result<()>
 where
     F: FnMut(&Path, usize, &str),
 {
     let matcher = RegexMatcher::new(pattern).context("Invalid regex pattern")?;
     let no_ignore = is_no_ignore_enabled(root);
     let use_git = crate::indexer::has_git_repo(root) && !no_ignore;
-    let arc_root = if no_ignore { None } else { crate::indexer::find_arc_root(root) };
+    let arc_root = if no_ignore {
+        None
+    } else {
+        crate::indexer::find_arc_root(root)
+    };
 
     let mut wb = WalkBuilder::new(root);
     wb.hidden(true)
@@ -147,9 +196,8 @@ where
     let (tx, rx) = channel::bounded::<(Arc<Path>, usize, String)>(10000);
 
     // Use HashSet for O(1) extension lookup instead of O(n) linear search
-    let extensions: Arc<HashSet<String>> = Arc::new(
-        extensions.iter().map(|s| s.to_string()).collect()
-    );
+    let extensions: Arc<HashSet<String>> =
+        Arc::new(extensions.iter().map(|s| s.to_string()).collect());
 
     walker.run(|| {
         let tx = tx.clone();
@@ -175,7 +223,11 @@ where
                             &matcher,
                             path,
                             UTF8(|line_num, line| {
-                                let _ = tx.send((Arc::clone(&path_arc), line_num as usize, line.trim_end().to_string()));
+                                let _ = tx.send((
+                                    Arc::clone(&path_arc),
+                                    line_num as usize,
+                                    line.trim_end().to_string(),
+                                ));
                                 Ok(true)
                             }),
                         );
@@ -209,7 +261,11 @@ where
     let matcher = RegexMatcher::new(pattern).context("Invalid regex pattern")?;
     let no_ignore = is_no_ignore_enabled(root);
     let use_git = crate::indexer::has_git_repo(root) && !no_ignore;
-    let arc_root = if no_ignore { None } else { crate::indexer::find_arc_root(root) };
+    let arc_root = if no_ignore {
+        None
+    } else {
+        crate::indexer::find_arc_root(root)
+    };
 
     let mut wb = WalkBuilder::new(root);
     wb.hidden(true)
@@ -229,9 +285,8 @@ where
 
     let (tx, rx) = channel::bounded::<(Arc<Path>, usize, String)>(limit.max(1000));
 
-    let extensions: Arc<HashSet<String>> = Arc::new(
-        extensions.iter().map(|s| s.to_string()).collect()
-    );
+    let extensions: Arc<HashSet<String>> =
+        Arc::new(extensions.iter().map(|s| s.to_string()).collect());
 
     // Shared counter for early termination
     let found_count = Arc::new(AtomicUsize::new(0));
@@ -279,7 +334,11 @@ where
                                     return Ok(false);
                                 }
 
-                                let _ = tx.send((Arc::clone(&path_arc), line_num as usize, line.trim_end().to_string()));
+                                let _ = tx.send((
+                                    Arc::clone(&path_arc),
+                                    line_num as usize,
+                                    line.trim_end().to_string(),
+                                ));
                                 Ok(true)
                             }),
                         );

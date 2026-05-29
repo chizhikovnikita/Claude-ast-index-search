@@ -1,12 +1,12 @@
 //! Tree-sitter based Elixir parser
 
 use anyhow::Result;
-use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 use std::sync::LazyLock;
+use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
+use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
-use super::{LanguageParser, parse_tree, node_text, node_line, line_text};
 
 static ELIXIR_LANGUAGE: LazyLock<Language> = LazyLock::new(|| tree_sitter_elixir::LANGUAGE.into());
 
@@ -29,7 +29,10 @@ impl LanguageParser for ElixirParser {
         // Build capture name → index map
         let capture_names = query.capture_names();
         let idx = |name: &str| -> Option<u32> {
-            capture_names.iter().position(|n| *n == name).map(|i| i as u32)
+            capture_names
+                .iter()
+                .position(|n| *n == name)
+                .map(|i| i as u32)
         };
 
         let idx_call_type = idx("call_type");
@@ -212,7 +215,10 @@ impl LanguageParser for ElixirParser {
 
 /// Check if the identifier is a def/defmacro keyword
 fn is_def_keyword(s: &str) -> bool {
-    matches!(s, "def" | "defp" | "defmacro" | "defmacrop" | "defguard" | "defguardp" | "defdelegate")
+    matches!(
+        s,
+        "def" | "defp" | "defmacro" | "defmacrop" | "defguard" | "defguardp" | "defdelegate"
+    )
 }
 
 /// Find a capture by index in a match
@@ -235,7 +241,9 @@ mod tests {
 end
 "#;
         let symbols = ELIXIR_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "MyApp.Users" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "MyApp.Users" && s.kind == SymbolKind::Class));
     }
 
     #[test]
@@ -247,7 +255,9 @@ end
 end
 "#;
         let symbols = ELIXIR_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "greet" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "greet" && s.kind == SymbolKind::Function));
     }
 
     #[test]
@@ -259,7 +269,9 @@ end
 end
 "#;
         let symbols = ELIXIR_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "internal_helper" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "internal_helper" && s.kind == SymbolKind::Function));
     }
 
     #[test]
@@ -276,7 +288,9 @@ end
 end
 "#;
         let symbols = ELIXIR_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "my_if" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "my_if" && s.kind == SymbolKind::Function));
     }
 
     #[test]
@@ -286,7 +300,9 @@ end
 end
 "#;
         let symbols = ELIXIR_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "defstruct" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "defstruct" && s.kind == SymbolKind::Class));
     }
 
     #[test]
@@ -297,7 +313,9 @@ end
 end
 "#;
         let symbols = ELIXIR_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "Printable" && s.kind == SymbolKind::Interface));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Printable" && s.kind == SymbolKind::Interface));
     }
 
     #[test]
@@ -307,7 +325,9 @@ end
 end
 "#;
         let symbols = ELIXIR_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "@type" && s.kind == SymbolKind::TypeAlias));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "@type" && s.kind == SymbolKind::TypeAlias));
     }
 
     #[test]
@@ -335,7 +355,9 @@ end
 end
 "#;
         let symbols = ELIXIR_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "Printable(impl)" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Printable(impl)" && s.kind == SymbolKind::Class));
     }
 
     #[test]
@@ -347,6 +369,8 @@ end
 end
 "#;
         let symbols = ELIXIR_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "hello" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "hello" && s.kind == SymbolKind::Function));
     }
 }

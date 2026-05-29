@@ -1,14 +1,15 @@
 //! Tree-sitter based GDScript parser (Godot Engine)
 
 use anyhow::Result;
-use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 use std::sync::LazyLock;
+use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
+use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
-use super::{LanguageParser, parse_tree, node_text, node_line, line_text};
 
-static GDSCRIPT_LANGUAGE: LazyLock<Language> = LazyLock::new(|| tree_sitter_gdscript::LANGUAGE.into());
+static GDSCRIPT_LANGUAGE: LazyLock<Language> =
+    LazyLock::new(|| tree_sitter_gdscript::LANGUAGE.into());
 
 static GDSCRIPT_QUERY: LazyLock<Query> = LazyLock::new(|| {
     Query::new(&GDSCRIPT_LANGUAGE, include_str!("queries/gdscript.scm"))
@@ -28,7 +29,10 @@ impl LanguageParser for GdscriptParser {
 
         let capture_names = query.capture_names();
         let idx = |name: &str| -> Option<u32> {
-            capture_names.iter().position(|n| *n == name).map(|i| i as u32)
+            capture_names
+                .iter()
+                .position(|n| *n == name)
+                .map(|i| i as u32)
         };
 
         let idx_class_name_decl = idx("class_name_decl");
@@ -57,14 +61,19 @@ impl LanguageParser for GdscriptParser {
         let mut constructor_lines = std::collections::HashSet::new();
         {
             let mut walk = tree.root_node().walk();
-            fn find_constructors(cursor: &mut tree_sitter::TreeCursor, lines: &mut std::collections::HashSet<usize>) {
+            fn find_constructors(
+                cursor: &mut tree_sitter::TreeCursor,
+                lines: &mut std::collections::HashSet<usize>,
+            ) {
                 if cursor.node().kind() == "constructor_definition" {
                     lines.insert(cursor.node().start_position().row + 1);
                 }
                 if cursor.goto_first_child() {
                     loop {
                         find_constructors(cursor, lines);
-                        if !cursor.goto_next_sibling() { break; }
+                        if !cursor.goto_next_sibling() {
+                            break;
+                        }
                     }
                     cursor.goto_parent();
                 }
@@ -90,7 +99,8 @@ impl LanguageParser for GdscriptParser {
             if let Some(cap) = find_capture(m, idx_class_name_decl) {
                 let name = node_text(content, &cap.node);
                 let line = node_line(&cap.node);
-                let parents = extends_parent.as_ref()
+                let parents = extends_parent
+                    .as_ref()
                     .map(|p| vec![(p.clone(), "extends".to_string())])
                     .unwrap_or_default();
                 symbols.push(ParsedSymbol {
@@ -195,7 +205,10 @@ impl LanguageParser for GdscriptParser {
     }
 }
 
-fn find_capture<'a>(m: &'a tree_sitter::QueryMatch<'a, 'a>, idx: Option<u32>) -> Option<&'a tree_sitter::QueryCapture<'a>> {
+fn find_capture<'a>(
+    m: &'a tree_sitter::QueryMatch<'a, 'a>,
+    idx: Option<u32>,
+) -> Option<&'a tree_sitter::QueryCapture<'a>> {
     let idx = idx?;
     m.captures.iter().find(|c| c.index == idx)
 }
@@ -213,11 +226,15 @@ func _ready():
     pass
 "#;
         let symbols = GDSCRIPT_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "Player" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Player" && s.kind == SymbolKind::Class));
         let player = symbols.iter().find(|s| s.name == "Player").unwrap();
         assert_eq!(player.parents.len(), 1);
         assert_eq!(player.parents[0].0, "CharacterBody2D");
-        assert!(symbols.iter().any(|s| s.name == "_ready" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "_ready" && s.kind == SymbolKind::Function));
     }
 
     #[test]
@@ -229,9 +246,19 @@ signal health_changed(new_health)
 signal died
 "#;
         let symbols = GDSCRIPT_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "health_changed" && s.kind == SymbolKind::Property),
-            "should find signal health_changed; got: {:?}", symbols.iter().map(|s| (&s.name, &s.kind)).collect::<Vec<_>>());
-        assert!(symbols.iter().any(|s| s.name == "died" && s.kind == SymbolKind::Property));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "health_changed" && s.kind == SymbolKind::Property),
+            "should find signal health_changed; got: {:?}",
+            symbols
+                .iter()
+                .map(|s| (&s.name, &s.kind))
+                .collect::<Vec<_>>()
+        );
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "died" && s.kind == SymbolKind::Property));
     }
 
     #[test]
@@ -241,9 +268,15 @@ const MAX_SPEED = 300
 const GRAVITY: float = 980.0
 "#;
         let symbols = GDSCRIPT_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "State" && s.kind == SymbolKind::Enum));
-        assert!(symbols.iter().any(|s| s.name == "MAX_SPEED" && s.kind == SymbolKind::Constant));
-        assert!(symbols.iter().any(|s| s.name == "GRAVITY" && s.kind == SymbolKind::Constant));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "State" && s.kind == SymbolKind::Enum));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "MAX_SPEED" && s.kind == SymbolKind::Constant));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "GRAVITY" && s.kind == SymbolKind::Constant));
     }
 
     #[test]
@@ -254,11 +287,25 @@ var health: int = 100
 @onready var sprite: Sprite2D = $Sprite2D
 "#;
         let symbols = GDSCRIPT_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "speed" && s.kind == SymbolKind::Property),
-            "should find var speed; got: {:?}", symbols.iter().map(|s| (&s.name, &s.kind)).collect::<Vec<_>>());
-        assert!(symbols.iter().any(|s| s.name == "health" && s.kind == SymbolKind::Property));
-        assert!(symbols.iter().any(|s| s.name == "damage" && s.kind == SymbolKind::Property));
-        assert!(symbols.iter().any(|s| s.name == "sprite" && s.kind == SymbolKind::Property));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "speed" && s.kind == SymbolKind::Property),
+            "should find var speed; got: {:?}",
+            symbols
+                .iter()
+                .map(|s| (&s.name, &s.kind))
+                .collect::<Vec<_>>()
+        );
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "health" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "damage" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "sprite" && s.kind == SymbolKind::Property));
     }
 
     #[test]
@@ -276,10 +323,18 @@ static func create() -> Player:
     return Player.new()
 "#;
         let symbols = GDSCRIPT_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "_init" && s.kind == SymbolKind::Function));
-        assert!(symbols.iter().any(|s| s.name == "_process" && s.kind == SymbolKind::Function));
-        assert!(symbols.iter().any(|s| s.name == "take_damage" && s.kind == SymbolKind::Function));
-        assert!(symbols.iter().any(|s| s.name == "create" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "_init" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "_process" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "take_damage" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "create" && s.kind == SymbolKind::Function));
     }
 
     #[test]
@@ -295,9 +350,15 @@ func attack():
     var info = DamageInfo.new()
 "#;
         let symbols = GDSCRIPT_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "Weapon" && s.kind == SymbolKind::Class));
-        assert!(symbols.iter().any(|s| s.name == "DamageInfo" && s.kind == SymbolKind::Class));
-        assert!(symbols.iter().any(|s| s.name == "attack" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Weapon" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "DamageInfo" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "attack" && s.kind == SymbolKind::Function));
     }
 
     #[test]
@@ -348,22 +409,48 @@ func _chase_state(delta: float) -> void:
         assert_eq!(enemy.kind, SymbolKind::Class);
         assert_eq!(enemy.parents[0].0, "CharacterBody2D");
         // Signals
-        assert!(symbols.iter().any(|s| s.name == "defeated" && s.kind == SymbolKind::Property));
-        assert!(symbols.iter().any(|s| s.name == "health_changed" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "defeated" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "health_changed" && s.kind == SymbolKind::Property));
         // Enum
-        assert!(symbols.iter().any(|s| s.name == "State" && s.kind == SymbolKind::Enum));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "State" && s.kind == SymbolKind::Enum));
         // Constants
-        assert!(symbols.iter().any(|s| s.name == "MAX_SPEED" && s.kind == SymbolKind::Constant));
-        assert!(symbols.iter().any(|s| s.name == "ATTACK_RANGE" && s.kind == SymbolKind::Constant));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "MAX_SPEED" && s.kind == SymbolKind::Constant));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "ATTACK_RANGE" && s.kind == SymbolKind::Constant));
         // Properties
-        assert!(symbols.iter().any(|s| s.name == "health" && s.kind == SymbolKind::Property));
-        assert!(symbols.iter().any(|s| s.name == "nav_agent" && s.kind == SymbolKind::Property));
-        assert!(symbols.iter().any(|s| s.name == "current_state" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "health" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "nav_agent" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "current_state" && s.kind == SymbolKind::Property));
         // Functions
-        assert!(symbols.iter().any(|s| s.name == "_ready" && s.kind == SymbolKind::Function));
-        assert!(symbols.iter().any(|s| s.name == "_physics_process" && s.kind == SymbolKind::Function));
-        assert!(symbols.iter().any(|s| s.name == "take_damage" && s.kind == SymbolKind::Function));
-        assert!(symbols.iter().any(|s| s.name == "_idle_state" && s.kind == SymbolKind::Function));
-        assert!(symbols.iter().any(|s| s.name == "_chase_state" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "_ready" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "_physics_process" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "take_damage" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "_idle_state" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "_chase_state" && s.kind == SymbolKind::Function));
     }
 }

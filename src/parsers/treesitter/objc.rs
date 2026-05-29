@@ -1,12 +1,12 @@
 //! Tree-sitter based Objective-C parser
 
 use anyhow::Result;
-use tree_sitter::{Language, Node, Query, QueryCursor, StreamingIterator};
 use std::sync::LazyLock;
+use tree_sitter::{Language, Node, Query, QueryCursor, StreamingIterator};
 
+use super::{line_text, node_text, parse_tree, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
-use super::{LanguageParser, parse_tree, node_text, line_text};
 
 static OBJC_LANGUAGE: LazyLock<Language> = LazyLock::new(|| tree_sitter_objc::LANGUAGE.into());
 
@@ -28,7 +28,10 @@ impl LanguageParser for ObjcParser {
 
         let capture_names = query.capture_names();
         let idx = |name: &str| -> Option<u32> {
-            capture_names.iter().position(|n| *n == name).map(|i| i as u32)
+            capture_names
+                .iter()
+                .position(|n| *n == name)
+                .map(|i| i as u32)
         };
 
         let idx_class_interface = idx("class_interface");
@@ -258,7 +261,11 @@ fn extract_protocols(content: &str, node: &Node, parents: &mut Vec<(String, Stri
 }
 
 /// Recursively extract type identifiers from parameterized_arguments children
-fn extract_type_names_as_protocols(content: &str, node: &Node, parents: &mut Vec<(String, String)>) {
+fn extract_type_names_as_protocols(
+    content: &str,
+    node: &Node,
+    parents: &mut Vec<(String, String)>,
+) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
@@ -267,7 +274,10 @@ fn extract_type_names_as_protocols(content: &str, node: &Node, parents: &mut Vec
                 let mut tn_cursor = child.walk();
                 for tn_child in child.children(&mut tn_cursor) {
                     match tn_child.kind() {
-                        "type_identifier" | "identifier" | "typedefed_identifier" | "type_specifier" => {
+                        "type_identifier"
+                        | "identifier"
+                        | "typedefed_identifier"
+                        | "type_specifier" => {
                             let proto = node_text(content, &tn_child).to_string();
                             if !proto.is_empty() {
                                 parents.push((proto, "implements".to_string()));
@@ -400,8 +410,11 @@ fn extract_declarator_name(content: &str, node: &Node) -> Option<String> {
             "identifier" | "_field_identifier" | "field_identifier" => {
                 return Some(node_text(content, &child).to_string());
             }
-            "pointer_declarator" | "parenthesized_declarator" | "array_declarator"
-            | "function_declarator" | "block_pointer_declarator" => {
+            "pointer_declarator"
+            | "parenthesized_declarator"
+            | "array_declarator"
+            | "function_declarator"
+            | "block_pointer_declarator" => {
                 return extract_declarator_name(content, &child);
             }
             _ => {}
@@ -482,7 +495,8 @@ fn extract_typedef_name_from_text(content: &str, node: &Node) -> Option<String> 
     let start_line = node.start_position().row + 1;
     let end_line = node.end_position().row + 1;
     // Get the text of the entire typedef (could be multiline)
-    let lines: Vec<&str> = content.lines()
+    let lines: Vec<&str> = content
+        .lines()
         .skip(start_line - 1)
         .take(end_line - start_line + 1)
         .collect();
@@ -509,39 +523,74 @@ mod tests {
 
     #[test]
     fn test_parse_interface_with_superclass_and_protocols() {
-        let content = "@interface MyView : UIView <UITableViewDelegate, UITableViewDataSource>\n@end\n";
+        let content =
+            "@interface MyView : UIView <UITableViewDelegate, UITableViewDataSource>\n@end\n";
         let symbols = OBJC_PARSER.parse_symbols(content).unwrap();
-        let cls = symbols.iter().find(|s| s.name == "MyView" && s.kind == SymbolKind::Class).unwrap();
-        assert!(cls.parents.iter().any(|(p, k)| p == "UIView" && k == "extends"),
-            "expected superclass UIView, got parents: {:?}", cls.parents);
-        assert!(cls.parents.iter().any(|(p, k)| p == "UITableViewDelegate" && k == "implements"),
-            "expected protocol UITableViewDelegate, got parents: {:?}", cls.parents);
-        assert!(cls.parents.iter().any(|(p, k)| p == "UITableViewDataSource" && k == "implements"),
-            "expected protocol UITableViewDataSource, got parents: {:?}", cls.parents);
+        let cls = symbols
+            .iter()
+            .find(|s| s.name == "MyView" && s.kind == SymbolKind::Class)
+            .unwrap();
+        assert!(
+            cls.parents
+                .iter()
+                .any(|(p, k)| p == "UIView" && k == "extends"),
+            "expected superclass UIView, got parents: {:?}",
+            cls.parents
+        );
+        assert!(
+            cls.parents
+                .iter()
+                .any(|(p, k)| p == "UITableViewDelegate" && k == "implements"),
+            "expected protocol UITableViewDelegate, got parents: {:?}",
+            cls.parents
+        );
+        assert!(
+            cls.parents
+                .iter()
+                .any(|(p, k)| p == "UITableViewDataSource" && k == "implements"),
+            "expected protocol UITableViewDataSource, got parents: {:?}",
+            cls.parents
+        );
     }
 
     #[test]
     fn test_parse_interface_no_superclass() {
         let content = "@interface MyRoot\n@end\n";
         let symbols = OBJC_PARSER.parse_symbols(content).unwrap();
-        let cls = symbols.iter().find(|s| s.name == "MyRoot" && s.kind == SymbolKind::Class).unwrap();
-        assert!(cls.parents.is_empty(), "expected no parents, got: {:?}", cls.parents);
+        let cls = symbols
+            .iter()
+            .find(|s| s.name == "MyRoot" && s.kind == SymbolKind::Class)
+            .unwrap();
+        assert!(
+            cls.parents.is_empty(),
+            "expected no parents, got: {:?}",
+            cls.parents
+        );
     }
 
     #[test]
     fn test_parse_interface_only_superclass() {
         let content = "@interface MyChild : NSObject\n@end\n";
         let symbols = OBJC_PARSER.parse_symbols(content).unwrap();
-        let cls = symbols.iter().find(|s| s.name == "MyChild" && s.kind == SymbolKind::Class).unwrap();
+        let cls = symbols
+            .iter()
+            .find(|s| s.name == "MyChild" && s.kind == SymbolKind::Class)
+            .unwrap();
         assert_eq!(cls.parents.len(), 1);
-        assert!(cls.parents.iter().any(|(p, k)| p == "NSObject" && k == "extends"));
+        assert!(cls
+            .parents
+            .iter()
+            .any(|(p, k)| p == "NSObject" && k == "extends"));
     }
 
     #[test]
     fn test_parse_category() {
         let content = "@interface NSString (Utilities)\n@end\n";
         let symbols = OBJC_PARSER.parse_symbols(content).unwrap();
-        let cat = symbols.iter().find(|s| s.name == "NSString+Category").unwrap();
+        let cat = symbols
+            .iter()
+            .find(|s| s.name == "NSString+Category")
+            .unwrap();
         assert_eq!(cat.kind, SymbolKind::Object);
         assert!(cat.parents.iter().any(|(p, _)| p == "NSString"));
     }
@@ -552,8 +601,13 @@ mod tests {
         let symbols = OBJC_PARSER.parse_symbols(content).unwrap();
         let p = symbols.iter().find(|s| s.name == "Fetchable").unwrap();
         assert_eq!(p.kind, SymbolKind::Interface);
-        assert!(p.parents.iter().any(|(p, k)| p == "NSObject" && k == "extends"),
-            "expected parent NSObject, got: {:?}", p.parents);
+        assert!(
+            p.parents
+                .iter()
+                .any(|(p, k)| p == "NSObject" && k == "extends"),
+            "expected parent NSObject, got: {:?}",
+            p.parents
+        );
     }
 
     #[test]
@@ -580,7 +634,10 @@ mod tests {
     fn test_parse_implementation() {
         let content = "@implementation MyService\n- (void)doWork {\n}\n@end\n";
         let symbols = OBJC_PARSER.parse_symbols(content).unwrap();
-        let cls = symbols.iter().find(|s| s.name == "MyService" && s.kind == SymbolKind::Class).unwrap();
+        let cls = symbols
+            .iter()
+            .find(|s| s.name == "MyService" && s.kind == SymbolKind::Class)
+            .unwrap();
         assert!(cls.parents.is_empty());
     }
 
@@ -588,7 +645,10 @@ mod tests {
     fn test_implementation_skipped_if_interface_exists() {
         let content = "@interface MyClass : NSObject\n@end\n@implementation MyClass\n@end\n";
         let symbols = OBJC_PARSER.parse_symbols(content).unwrap();
-        let count = symbols.iter().filter(|s| s.name == "MyClass" && s.kind == SymbolKind::Class).count();
+        let count = symbols
+            .iter()
+            .filter(|s| s.name == "MyClass" && s.kind == SymbolKind::Class)
+            .count();
         assert_eq!(count, 1, "should not duplicate class from @implementation");
     }
 
@@ -596,44 +656,80 @@ mod tests {
     fn test_parse_method_declaration() {
         let content = "@interface MyClass : NSObject\n- (void)viewDidLoad;\n+ (instancetype)sharedInstance;\n@end\n";
         let symbols = OBJC_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "viewDidLoad" && s.kind == SymbolKind::Function),
-            "expected viewDidLoad, got: {:?}", symbols);
-        assert!(symbols.iter().any(|s| s.name == "sharedInstance" && s.kind == SymbolKind::Function),
-            "expected sharedInstance, got: {:?}", symbols);
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "viewDidLoad" && s.kind == SymbolKind::Function),
+            "expected viewDidLoad, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "sharedInstance" && s.kind == SymbolKind::Function),
+            "expected sharedInstance, got: {:?}",
+            symbols
+        );
     }
 
     #[test]
     fn test_parse_method_definition() {
         let content = "@implementation MyService\n- (void)doWork {\n    NSLog(@\"working\");\n}\n+ (instancetype)shared {\n    return nil;\n}\n@end\n";
         let symbols = OBJC_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "doWork" && s.kind == SymbolKind::Function),
-            "expected doWork, got: {:?}", symbols);
-        assert!(symbols.iter().any(|s| s.name == "shared" && s.kind == SymbolKind::Function),
-            "expected shared, got: {:?}", symbols);
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "doWork" && s.kind == SymbolKind::Function),
+            "expected doWork, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "shared" && s.kind == SymbolKind::Function),
+            "expected shared, got: {:?}",
+            symbols
+        );
     }
 
     #[test]
     fn test_parse_property() {
-        let content = "@interface MyClass : NSObject\n@property (nonatomic, strong) NSString *name;\n@end\n";
+        let content =
+            "@interface MyClass : NSObject\n@property (nonatomic, strong) NSString *name;\n@end\n";
         let symbols = OBJC_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "name" && s.kind == SymbolKind::Property),
-            "expected property 'name', got: {:?}", symbols);
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "name" && s.kind == SymbolKind::Property),
+            "expected property 'name', got: {:?}",
+            symbols
+        );
     }
 
     #[test]
     fn test_parse_property_no_attributes() {
         let content = "@interface Config\n@property NSInteger count;\n@end\n";
         let symbols = OBJC_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "count" && s.kind == SymbolKind::Property),
-            "expected property 'count', got: {:?}", symbols);
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "count" && s.kind == SymbolKind::Property),
+            "expected property 'count', got: {:?}",
+            symbols
+        );
     }
 
     #[test]
     fn test_parse_typedef_struct() {
         let content = "typedef struct { int x; int y; } CGPoint;\n";
         let symbols = OBJC_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "CGPoint" && s.kind == SymbolKind::TypeAlias),
-            "expected typedef CGPoint, got: {:?}", symbols);
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "CGPoint" && s.kind == SymbolKind::TypeAlias),
+            "expected typedef CGPoint, got: {:?}",
+            symbols
+        );
     }
 
     #[test]
@@ -641,8 +737,11 @@ mod tests {
         let content = "// @interface FakeClass : NSObject\n@interface RealClass : NSObject\n@end\n";
         let symbols = OBJC_PARSER.parse_symbols(content).unwrap();
         assert!(symbols.iter().any(|s| s.name == "RealClass"));
-        assert!(!symbols.iter().any(|s| s.name == "FakeClass"),
-            "should not parse class from comment, got: {:?}", symbols);
+        assert!(
+            !symbols.iter().any(|s| s.name == "FakeClass"),
+            "should not parse class from comment, got: {:?}",
+            symbols
+        );
     }
 
     #[test]
@@ -671,28 +770,48 @@ typedef struct { int x; int y; } CGPoint;
         let symbols = OBJC_PARSER.parse_symbols(content).unwrap();
 
         // Class with superclass and protocols
-        assert!(symbols.iter().any(|s| s.name == "MyView" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "MyView" && s.kind == SymbolKind::Class));
 
         // Category
-        assert!(symbols.iter().any(|s| s.name == "NSString+Category" && s.kind == SymbolKind::Object));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "NSString+Category" && s.kind == SymbolKind::Object));
 
         // Protocol
-        assert!(symbols.iter().any(|s| s.name == "Fetchable" && s.kind == SymbolKind::Interface));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Fetchable" && s.kind == SymbolKind::Interface));
 
         // Methods
-        assert!(symbols.iter().any(|s| s.name == "viewDidLoad" && s.kind == SymbolKind::Function));
-        assert!(symbols.iter().any(|s| s.name == "sharedInstance" && s.kind == SymbolKind::Function));
-        assert!(symbols.iter().any(|s| s.name == "fetchData" && s.kind == SymbolKind::Function));
-        assert!(symbols.iter().any(|s| s.name == "doWork" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "viewDidLoad" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "sharedInstance" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "fetchData" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "doWork" && s.kind == SymbolKind::Function));
 
         // Property
-        assert!(symbols.iter().any(|s| s.name == "title" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "title" && s.kind == SymbolKind::Property));
 
         // Implementation (MyService has no @interface, so it should appear as Class)
-        assert!(symbols.iter().any(|s| s.name == "MyService" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "MyService" && s.kind == SymbolKind::Class));
 
         // Typedef
-        assert!(symbols.iter().any(|s| s.name == "CGPoint" && s.kind == SymbolKind::TypeAlias));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "CGPoint" && s.kind == SymbolKind::TypeAlias));
     }
 
     #[test]
@@ -705,12 +824,27 @@ typedef struct { int x; int y; } CGPoint;
 @end
 "#;
         let symbols = OBJC_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "firstName" && s.kind == SymbolKind::Property),
-            "expected firstName, got: {:?}", symbols);
-        assert!(symbols.iter().any(|s| s.name == "lastName" && s.kind == SymbolKind::Property),
-            "expected lastName, got: {:?}", symbols);
-        assert!(symbols.iter().any(|s| s.name == "age" && s.kind == SymbolKind::Property),
-            "expected age, got: {:?}", symbols);
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "firstName" && s.kind == SymbolKind::Property),
+            "expected firstName, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "lastName" && s.kind == SymbolKind::Property),
+            "expected lastName, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "age" && s.kind == SymbolKind::Property),
+            "expected age, got: {:?}",
+            symbols
+        );
     }
 
     #[test]
@@ -722,10 +856,22 @@ typedef struct { int x; int y; } CGPoint;
 @end
 "#;
         let symbols = OBJC_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "DataSource" && s.kind == SymbolKind::Interface));
-        assert!(symbols.iter().any(|s| s.name == "numberOfItems" && s.kind == SymbolKind::Function),
-            "expected numberOfItems, got: {:?}", symbols);
-        assert!(symbols.iter().any(|s| s.name == "defaultTitle" && s.kind == SymbolKind::Function),
-            "expected defaultTitle, got: {:?}", symbols);
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "DataSource" && s.kind == SymbolKind::Interface));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "numberOfItems" && s.kind == SymbolKind::Function),
+            "expected numberOfItems, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "defaultTitle" && s.kind == SymbolKind::Function),
+            "expected defaultTitle, got: {:?}",
+            symbols
+        );
     }
 }

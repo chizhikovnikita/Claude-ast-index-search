@@ -1,16 +1,15 @@
 //! Tree-sitter based Common Lisp parser
 
 use anyhow::Result;
-use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 use std::sync::LazyLock;
+use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
+use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
-use super::{LanguageParser, parse_tree, node_text, node_line, line_text};
 
-static CL_LANGUAGE: LazyLock<Language> = LazyLock::new(|| {
-    tree_sitter_commonlisp::LANGUAGE_COMMONLISP.into()
-});
+static CL_LANGUAGE: LazyLock<Language> =
+    LazyLock::new(|| tree_sitter_commonlisp::LANGUAGE_COMMONLISP.into());
 
 static CL_QUERY: LazyLock<Query> = LazyLock::new(|| {
     Query::new(&CL_LANGUAGE, include_str!("queries/commonlisp.scm"))
@@ -30,7 +29,10 @@ impl LanguageParser for CommonLispParser {
 
         let capture_names = query.capture_names();
         let idx = |name: &str| -> Option<u32> {
-            capture_names.iter().position(|n| *n == name).map(|i| i as u32)
+            capture_names
+                .iter()
+                .position(|n| *n == name)
+                .map(|i| i as u32)
         };
 
         let idx_kw = idx("kw");
@@ -66,7 +68,8 @@ impl LanguageParser for CommonLispParser {
             if let Some(name_cap) = find_capture(m, idx_func_name_pkg) {
                 let name = node_text(content, &name_cap.node);
                 let line = node_line(&name_cap.node);
-                let kind = kw_to_kind(find_capture(m, idx_kw_pkg).map(|c| node_text(content, &c.node)));
+                let kind =
+                    kw_to_kind(find_capture(m, idx_kw_pkg).map(|c| node_text(content, &c.node)));
                 symbols.push(ParsedSymbol {
                     name: name.to_string(),
                     kind,
@@ -193,28 +196,37 @@ mod tests {
     fn test_parse_defun() {
         let content = "(defun my-function (x y)\n  (+ x y))\n";
         let symbols = COMMON_LISP_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "my-function" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "my-function" && s.kind == SymbolKind::Function));
     }
 
     #[test]
     fn test_parse_defmacro() {
         let content = "(defmacro when-bound (var &body body)\n  `(when (boundp ',var) ,@body))\n";
         let symbols = COMMON_LISP_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "when-bound" && s.kind == SymbolKind::Annotation));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "when-bound" && s.kind == SymbolKind::Annotation));
     }
 
     #[test]
     fn test_parse_defgeneric() {
-        let content = "(defgeneric speak (animal)\n  (:documentation \"Make the animal speak.\"))\n";
+        let content =
+            "(defgeneric speak (animal)\n  (:documentation \"Make the animal speak.\"))\n";
         let symbols = COMMON_LISP_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "speak" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "speak" && s.kind == SymbolKind::Function));
     }
 
     #[test]
     fn test_parse_defmethod() {
         let content = "(defmethod speak ((animal dog))\n  \"Woof!\")\n";
         let symbols = COMMON_LISP_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "speak" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "speak" && s.kind == SymbolKind::Function));
     }
 
     #[test]
@@ -224,56 +236,72 @@ mod tests {
    (sound :accessor animal-sound :initarg :sound)))
 "#;
         let symbols = COMMON_LISP_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "animal" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "animal" && s.kind == SymbolKind::Class));
     }
 
     #[test]
     fn test_parse_defclass_with_superclass() {
         let content = "(defclass dog (animal)\n  ((breed :accessor dog-breed :initarg :breed)))\n";
         let symbols = COMMON_LISP_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "dog" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "dog" && s.kind == SymbolKind::Class));
     }
 
     #[test]
     fn test_parse_defstruct() {
         let content = "(defstruct point\n  x\n  y)\n";
         let symbols = COMMON_LISP_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "point" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "point" && s.kind == SymbolKind::Class));
     }
 
     #[test]
     fn test_parse_defvar() {
         let content = "(defvar *max-retries* 3)\n";
         let symbols = COMMON_LISP_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "*max-retries*" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "*max-retries*" && s.kind == SymbolKind::Property));
     }
 
     #[test]
     fn test_parse_defparameter() {
         let content = "(defparameter *debug-mode* nil)\n";
         let symbols = COMMON_LISP_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "*debug-mode*" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "*debug-mode*" && s.kind == SymbolKind::Property));
     }
 
     #[test]
     fn test_parse_defconstant() {
         let content = "(defconstant +pi+ 3.14159)\n";
         let symbols = COMMON_LISP_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "+pi+" && s.kind == SymbolKind::Constant));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "+pi+" && s.kind == SymbolKind::Constant));
     }
 
     #[test]
     fn test_parse_defpackage_keyword() {
         let content = "(defpackage :my-app\n  (:use :cl)\n  (:export #:main))\n";
         let symbols = COMMON_LISP_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "my-app" && s.kind == SymbolKind::Package));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "my-app" && s.kind == SymbolKind::Package));
     }
 
     #[test]
     fn test_parse_defpackage_symbol() {
         let content = "(defpackage my-utils\n  (:use :cl))\n";
         let symbols = COMMON_LISP_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "my-utils" && s.kind == SymbolKind::Package));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "my-utils" && s.kind == SymbolKind::Package));
     }
 
     #[test]
@@ -326,21 +354,61 @@ mod tests {
 "#;
         let symbols = COMMON_LISP_PARSER.parse_symbols(content).unwrap();
 
-        assert!(symbols.iter().any(|s| s.name == "my-app" && s.kind == SymbolKind::Package),
-            "Expected my-app package, got: {:?}", symbols);
-        assert!(symbols.iter().any(|s| s.name == "+origin+" && s.kind == SymbolKind::Constant),
-            "Expected +origin+ constant, got: {:?}", symbols);
-        assert!(symbols.iter().any(|s| s.name == "*default-color*" && s.kind == SymbolKind::Property),
-            "Expected *default-color* parameter, got: {:?}", symbols);
-        assert!(symbols.iter().any(|s| s.name == "point" && s.kind == SymbolKind::Class),
-            "Expected point struct, got: {:?}", symbols);
-        assert!(symbols.iter().any(|s| s.name == "shape" && s.kind == SymbolKind::Class),
-            "Expected shape class, got: {:?}", symbols);
-        assert!(symbols.iter().any(|s| s.name == "area" && s.kind == SymbolKind::Function),
-            "Expected area generic, got: {:?}", symbols);
-        assert!(symbols.iter().any(|s| s.name == "make-colored-point" && s.kind == SymbolKind::Function),
-            "Expected make-colored-point function, got: {:?}", symbols);
-        assert!(symbols.iter().any(|s| s.name == "with-shape" && s.kind == SymbolKind::Annotation),
-            "Expected with-shape macro, got: {:?}", symbols);
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "my-app" && s.kind == SymbolKind::Package),
+            "Expected my-app package, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "+origin+" && s.kind == SymbolKind::Constant),
+            "Expected +origin+ constant, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "*default-color*" && s.kind == SymbolKind::Property),
+            "Expected *default-color* parameter, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "point" && s.kind == SymbolKind::Class),
+            "Expected point struct, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "shape" && s.kind == SymbolKind::Class),
+            "Expected shape class, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "area" && s.kind == SymbolKind::Function),
+            "Expected area generic, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "make-colored-point" && s.kind == SymbolKind::Function),
+            "Expected make-colored-point function, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "with-shape" && s.kind == SymbolKind::Annotation),
+            "Expected with-shape macro, got: {:?}",
+            symbols
+        );
     }
 }

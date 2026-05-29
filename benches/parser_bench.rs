@@ -1,10 +1,10 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 
 use ast_index::parsers::treesitter::{
-    cpp::CPP_PARSER, csharp::CSHARP_PARSER, dart::DART_PARSER, go::GO_PARSER,
-    java::JAVA_PARSER, kotlin::KOTLIN_PARSER, objc::OBJC_PARSER, proto::PROTO_PARSER,
-    python::PYTHON_PARSER, ruby::RUBY_PARSER, rust_lang::RUST_PARSER, scala::SCALA_PARSER,
-    swift::SWIFT_PARSER, typescript::TYPESCRIPT_PARSER, LanguageParser,
+    cpp::CPP_PARSER, csharp::CSHARP_PARSER, dart::DART_PARSER, go::GO_PARSER, java::JAVA_PARSER,
+    kotlin::KOTLIN_PARSER, objc::OBJC_PARSER, proto::PROTO_PARSER, python::PYTHON_PARSER,
+    ruby::RUBY_PARSER, rust_lang::RUST_PARSER, scala::SCALA_PARSER, swift::SWIFT_PARSER,
+    typescript::TYPESCRIPT_PARSER, LanguageParser,
 };
 
 // ---------------------------------------------------------------------------

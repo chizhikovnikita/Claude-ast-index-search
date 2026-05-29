@@ -36,8 +36,12 @@ unsafe impl GlobalAlloc for TrackingAllocator {
             // Update peak (lock-free CAS loop)
             let mut peak = PEAK.load(Ordering::Relaxed);
             while current > peak {
-                match PEAK.compare_exchange_weak(peak, current, Ordering::Relaxed, Ordering::Relaxed)
-                {
+                match PEAK.compare_exchange_weak(
+                    peak,
+                    current,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
                     Ok(_) => break,
                     Err(actual) => peak = actual,
                 }
@@ -115,10 +119,9 @@ impl MemStats {
 
 use ast_index::db;
 use ast_index::parsers::treesitter::{
-    cpp::CPP_PARSER, dart::DART_PARSER, go::GO_PARSER, java::JAVA_PARSER,
-    kotlin::KOTLIN_PARSER, matlab::MATLAB_PARSER, python::PYTHON_PARSER,
-    ruby::RUBY_PARSER, rust_lang::RUST_PARSER, scala::SCALA_PARSER,
-    swift::SWIFT_PARSER, typescript::TYPESCRIPT_PARSER, LanguageParser,
+    cpp::CPP_PARSER, dart::DART_PARSER, go::GO_PARSER, java::JAVA_PARSER, kotlin::KOTLIN_PARSER,
+    matlab::MATLAB_PARSER, python::PYTHON_PARSER, ruby::RUBY_PARSER, rust_lang::RUST_PARSER,
+    scala::SCALA_PARSER, swift::SWIFT_PARSER, typescript::TYPESCRIPT_PARSER, LanguageParser,
 };
 use ast_index::parsers::{parse_file_symbols, FileType};
 use rusqlite::{params, Connection};
@@ -525,21 +528,81 @@ macro_rules! parser_memory_test {
     };
 }
 
-parser_memory_test!(parser_memory_kotlin, KOTLIN_PARSER, KOTLIN_CODE, PARSER_SMALL_BUDGET);
-parser_memory_test!(parser_memory_java, JAVA_PARSER, JAVA_CODE, PARSER_SMALL_BUDGET);
-parser_memory_test!(parser_memory_swift, SWIFT_PARSER, SWIFT_CODE, PARSER_SMALL_BUDGET);
-parser_memory_test!(parser_memory_typescript, TYPESCRIPT_PARSER, TYPESCRIPT_CODE, PARSER_SMALL_BUDGET);
-parser_memory_test!(parser_memory_python, PYTHON_PARSER, PYTHON_CODE, PARSER_SMALL_BUDGET);
+parser_memory_test!(
+    parser_memory_kotlin,
+    KOTLIN_PARSER,
+    KOTLIN_CODE,
+    PARSER_SMALL_BUDGET
+);
+parser_memory_test!(
+    parser_memory_java,
+    JAVA_PARSER,
+    JAVA_CODE,
+    PARSER_SMALL_BUDGET
+);
+parser_memory_test!(
+    parser_memory_swift,
+    SWIFT_PARSER,
+    SWIFT_CODE,
+    PARSER_SMALL_BUDGET
+);
+parser_memory_test!(
+    parser_memory_typescript,
+    TYPESCRIPT_PARSER,
+    TYPESCRIPT_CODE,
+    PARSER_SMALL_BUDGET
+);
+parser_memory_test!(
+    parser_memory_python,
+    PYTHON_PARSER,
+    PYTHON_CODE,
+    PARSER_SMALL_BUDGET
+);
 parser_memory_test!(parser_memory_go, GO_PARSER, GO_SNIPPET, PARSER_SMALL_BUDGET);
-parser_memory_test!(parser_memory_rust, RUST_PARSER, RUST_SNIPPET, PARSER_SMALL_BUDGET);
-parser_memory_test!(parser_memory_cpp, CPP_PARSER, CPP_SNIPPET, PARSER_SMALL_BUDGET);
-parser_memory_test!(parser_memory_ruby, RUBY_PARSER, RUBY_SNIPPET, PARSER_SMALL_BUDGET);
-parser_memory_test!(parser_memory_dart, DART_PARSER, DART_SNIPPET, PARSER_SMALL_BUDGET);
-parser_memory_test!(parser_memory_scala, SCALA_PARSER, SCALA_SNIPPET, PARSER_SMALL_BUDGET);
-parser_memory_test!(parser_memory_matlab, MATLAB_PARSER, MATLAB_CODE, PARSER_SMALL_BUDGET);
+parser_memory_test!(
+    parser_memory_rust,
+    RUST_PARSER,
+    RUST_SNIPPET,
+    PARSER_SMALL_BUDGET
+);
+parser_memory_test!(
+    parser_memory_cpp,
+    CPP_PARSER,
+    CPP_SNIPPET,
+    PARSER_SMALL_BUDGET
+);
+parser_memory_test!(
+    parser_memory_ruby,
+    RUBY_PARSER,
+    RUBY_SNIPPET,
+    PARSER_SMALL_BUDGET
+);
+parser_memory_test!(
+    parser_memory_dart,
+    DART_PARSER,
+    DART_SNIPPET,
+    PARSER_SMALL_BUDGET
+);
+parser_memory_test!(
+    parser_memory_scala,
+    SCALA_PARSER,
+    SCALA_SNIPPET,
+    PARSER_SMALL_BUDGET
+);
+parser_memory_test!(
+    parser_memory_matlab,
+    MATLAB_PARSER,
+    MATLAB_CODE,
+    PARSER_SMALL_BUDGET
+);
 
 // Large files
-parser_memory_test!(parser_memory_kotlin_large, KOTLIN_PARSER, LARGE_KOTLIN_CODE, PARSER_LARGE_BUDGET);
+parser_memory_test!(
+    parser_memory_kotlin_large,
+    KOTLIN_PARSER,
+    LARGE_KOTLIN_CODE,
+    PARSER_LARGE_BUDGET
+);
 
 // Go, Rust, C++, Ruby, Dart, Scala snippets (reuse from inline — small)
 const GO_SNIPPET: &str = r#"
@@ -829,7 +892,12 @@ fn create_10k_db() -> Connection {
             let rname = format!("Symbol{}", (i + r * 7) % 10_000);
             conn.execute(
                 "INSERT INTO refs (file_id, name, line, context) VALUES (?1, ?2, ?3, ?4)",
-                params![fid, rname, (r * 10) as i64, format!("val x = {}.do()", rname)],
+                params![
+                    fid,
+                    rname,
+                    (r * 10) as i64,
+                    format!("val x = {}.do()", rname)
+                ],
             )
             .unwrap();
         }

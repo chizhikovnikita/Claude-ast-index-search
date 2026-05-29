@@ -28,11 +28,7 @@ impl LanguageParser for LessParser {
         parse_with_query(content, &tree, &LESS_QUERY)
     }
 
-    fn extract_refs(
-        &self,
-        _content: &str,
-        _defined: &[ParsedSymbol],
-    ) -> Result<Vec<ParsedRef>> {
+    fn extract_refs(&self, _content: &str, _defined: &[ParsedSymbol]) -> Result<Vec<ParsedRef>> {
         Ok(Vec::new())
     }
 }
@@ -72,6 +68,8 @@ mod tests {
     fn plain_declarations_are_ignored() {
         let src = ".x { color: red; padding: 10px; }\n";
         let symbols = LESS_PARSER.parse_symbols(src).unwrap();
-        assert!(symbols.iter().all(|s| s.name != "color" && s.name != "padding"));
+        assert!(symbols
+            .iter()
+            .all(|s| s.name != "color" && s.name != "padding"));
     }
 }

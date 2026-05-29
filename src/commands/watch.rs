@@ -9,16 +9,15 @@ use colored::Colorize;
 use notify::RecursiveMode;
 use notify_debouncer_mini::new_debouncer;
 
-use crate::{db, indexer, parsers};
 use crate::commands::{self, management::ScopedEnvVar};
+use crate::{db, indexer, parsers};
 
 /// Acquire an exclusive lock for watch mode, scoped to project root.
 /// Returns the lock file handle (lock held while handle is alive).
 /// Returns None if another watch is already running for this project.
 fn try_acquire_watch_lock(root: &Path) -> Option<std::fs::File> {
     use fs2::FileExt;
-    let lock_path = db::get_db_path(root).ok()?
-        .with_extension("watch.lock");
+    let lock_path = db::get_db_path(root).ok()?.with_extension("watch.lock");
     if let Some(parent) = lock_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -90,8 +89,14 @@ pub fn cmd_watch(root: &Path) -> Result<()> {
                             let s = c.as_os_str().to_str().unwrap_or("");
                             matches!(
                                 s,
-                                "build" | "node_modules" | ".gradle" | ".git" | "target"
-                                    | ".idea" | "__pycache__" | ".dart_tool"
+                                "build"
+                                    | "node_modules"
+                                    | ".gradle"
+                                    | ".git"
+                                    | "target"
+                                    | ".idea"
+                                    | "__pycache__"
+                                    | ".dart_tool"
                             )
                         })
                     })

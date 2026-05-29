@@ -96,3 +96,28 @@ fn resolve_falls_back_to_relative_when_nothing_exists() {
         "stale index entries must fall back to rel path, not lie about location"
     );
 }
+
+#[test]
+fn resolve_with_root_disambiguates_colliding_paths() {
+    let primary = TempDir::new().unwrap();
+    let extra = TempDir::new().unwrap();
+    let conn = open_fresh_db(primary.path());
+
+    db::add_extra_root(&conn, &extra.path().to_string_lossy()).unwrap();
+
+    let rel = "src/Foo.kt";
+    fs::create_dir_all(primary.path().join("src")).unwrap();
+    fs::create_dir_all(extra.path().join("src")).unwrap();
+    fs::write(primary.path().join(rel), "primary").unwrap();
+    fs::write(extra.path().join(rel), "extra").unwrap();
+
+    let resolver = PathResolver::from_conn(primary.path(), &conn);
+    let resolved =
+        resolver.resolve_with_root(rel, Some(&db::normalize_root_for_storage(extra.path())));
+
+    assert_eq!(
+        resolved,
+        extra.path().join(rel).to_string_lossy(),
+        "owning root hint must point to the extra-root copy, not the primary one"
+    );
+}

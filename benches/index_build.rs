@@ -1,16 +1,16 @@
-//! Microbenchmark for `indexer::index_directory` over a small synthetic
-//! project laid out in a `TempDir`.
+//! Microbenchmarks for the default (non-experimental) indexing pipeline over
+//! small synthetic projects laid out in `TempDir`s.
 //!
-//! The fixture is generated deterministically once per process: ~12 source
-//! files (Rust, Kotlin, TypeScript, Python, Go) totalling a few hundred
-//! lines. Each iteration:
-//!   * creates a fresh SQLite DB inside the same temp dir,
-//!   * walks the synthetic project,
-//!   * tears the DB down before the next iteration.
+//! Coverage:
+//!   * full source walk + parse: `indexer::index_directory`
+//!   * incremental update after one changed file: `update_directory_incremental`
+//!   * module dependency graph build: `index_modules` + `index_module_dependencies`
+//!   * Android indexes: `index_xml_usages` + `index_resources`
 //!
-//! This stays well under a few seconds at default sample size; we further
-//! shrink the sample to avoid blowing the bench-time budget on macOS where
-//! tree-sitter loads add fixed cost per call.
+//! Setups are done in Criterion `setup` closures and are *not* included in the
+//! measured iteration time. This keeps the measurements focused on the pipeline
+//! stage under test while still exercising public APIs against real on-disk
+//! fixtures.
 //!
 //! Run with:
 //!     cargo bench --bench index_build
@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 use tempfile::TempDir;
 
 use ast_index::{db, indexer};
@@ -145,6 +145,84 @@ func (s *Stack) Pop() (int, bool) {
 func (s *Stack) Len() int { return len(s.items) }
 "#;
 
+const SETTINGS_GRADLE: &str = r#"
+rootProject.name = "bench"
+include(":app")
+include(":core")
+"#;
+
+const APP_BUILD_GRADLE: &str = r#"
+plugins {
+    kotlin("android")
+}
+
+dependencies {
+    implementation(project(":core"))
+}
+"#;
+
+const CORE_BUILD_GRADLE: &str = r#"
+plugins {
+    kotlin("jvm")
+}
+"#;
+
+const ANDROID_KOTLIN_FILE: &str = r#"
+package com.example.app
+
+class CustomView
+
+class MainActivity {
+    fun title() = R.string.app_name
+    fun logo() = R.drawable.ic_logo
+}
+"#;
+
+const CORE_KOTLIN_FILE: &str = r#"
+package com.example.core
+
+class CoreApi
+"#;
+
+const LAYOUT_XML: &str = r#"
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+    <com.example.app.CustomView
+        android:id="@+id/custom_view"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content" />
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="@string/app_name" />
+</LinearLayout>
+"#;
+
+const STRINGS_XML: &str = r#"
+<resources>
+    <string name="app_name">Bench App</string>
+    <color name="brand_primary">#00FF00</color>
+    <dimen name="screen_margin">16dp</dimen>
+</resources>
+"#;
+
+const DRAWABLE_XML: &str = r#"
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+</vector>
+"#;
+
+fn write_file(path: &Path, content: &str) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    fs::write(path, content).unwrap();
+}
+
 /// Build a synthetic project on disk once. Returns the project root path
 /// (a stable subdirectory inside a `TempDir` held for the bench lifetime).
 fn synth_project() -> &'static Path {
@@ -179,6 +257,61 @@ fn synth_project() -> &'static Path {
     root.as_path()
 }
 
+fn create_synth_project(root: &Path) {
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("kotlin")).unwrap();
+    fs::create_dir_all(root.join("web")).unwrap();
+    fs::create_dir_all(root.join("py")).unwrap();
+    fs::create_dir_all(root.join("go")).unwrap();
+
+    for i in 0..3 {
+        write_file(&root.join(format!("src/lib{i}.rs")), RUST_FILE);
+    }
+    for i in 0..3 {
+        write_file(&root.join(format!("kotlin/Module{i}.kt")), KOTLIN_FILE);
+    }
+    for i in 0..2 {
+        write_file(&root.join(format!("web/mod{i}.ts")), TS_FILE);
+    }
+    for i in 0..2 {
+        write_file(&root.join(format!("py/mod{i}.py")), PYTHON_FILE);
+    }
+    for i in 0..2 {
+        write_file(&root.join(format!("go/mod{i}.go")), GO_FILE);
+    }
+}
+
+fn create_android_project(root: &Path) {
+    write_file(&root.join("settings.gradle.kts"), SETTINGS_GRADLE);
+    write_file(&root.join("app/build.gradle.kts"), APP_BUILD_GRADLE);
+    write_file(&root.join("core/build.gradle.kts"), CORE_BUILD_GRADLE);
+    write_file(
+        &root.join("app/src/main/java/com/example/app/MainActivity.kt"),
+        ANDROID_KOTLIN_FILE,
+    );
+    write_file(
+        &root.join("core/src/main/java/com/example/core/CoreApi.kt"),
+        CORE_KOTLIN_FILE,
+    );
+    write_file(
+        &root.join("app/src/main/res/layout/activity_main.xml"),
+        LAYOUT_XML,
+    );
+    write_file(
+        &root.join("app/src/main/res/values/strings.xml"),
+        STRINGS_XML,
+    );
+    write_file(
+        &root.join("app/src/main/res/drawable/ic_logo.xml"),
+        DRAWABLE_XML,
+    );
+}
+
+fn fresh_db(root: &Path) {
+    let conn = db::open_db(root).unwrap();
+    db::init_db(&conn).unwrap();
+}
+
 fn bench_index_build(c: &mut Criterion) {
     let project = synth_project();
 
@@ -209,5 +342,118 @@ fn bench_index_build(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_index_build);
+fn bench_incremental_update(c: &mut Criterion) {
+    let mut group = c.benchmark_group("index_update");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(5));
+
+    group.bench_function("single_changed_file", |b| {
+        b.iter_batched(
+            || {
+                let tmp = TempDir::new().expect("project tempdir");
+                let root = tmp.path().join("project");
+                create_synth_project(&root);
+                fresh_db(&root);
+
+                let mut conn = db::open_db(&root).unwrap();
+                indexer::index_directory(&mut conn, &root, false, false).unwrap();
+                drop(conn);
+
+                write_file(
+                    &root.join("src/lib1.rs"),
+                    &format!("{RUST_FILE}\npub fn added_bench_symbol() -> u64 {{ 42 }}\n"),
+                );
+                (tmp, root)
+            },
+            |(_tmp, root)| {
+                let mut conn = db::open_db(&root).unwrap();
+                let res =
+                    indexer::update_directory_incremental(&mut conn, &root, false, None, None)
+                        .unwrap();
+                black_box(res);
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
+    group.finish();
+}
+
+fn bench_module_graph(c: &mut Criterion) {
+    let mut group = c.benchmark_group("module_graph");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(5));
+
+    group.bench_function("index_module_dependencies_default", |b| {
+        b.iter_batched(
+            || {
+                let tmp = TempDir::new().expect("android tempdir");
+                let root = tmp.path().join("project");
+                create_android_project(&root);
+                fresh_db(&root);
+
+                let mut conn = db::open_db(&root).unwrap();
+                let walk = indexer::index_directory(&mut conn, &root, false, false).unwrap();
+                let module_count =
+                    indexer::index_modules_from_files(&conn, &root, &walk.module_files).unwrap();
+                assert!(module_count >= 2);
+                let build_files = indexer::collect_build_files_from_db(&conn, &root).unwrap();
+                (tmp, root, build_files)
+            },
+            |(_tmp, root, build_files)| {
+                let mut conn = db::open_db(&root).unwrap();
+                let deps =
+                    indexer::index_module_dependencies(&mut conn, &root, &build_files, false)
+                        .unwrap();
+                let transitive = indexer::build_transitive_deps(&mut conn, false).unwrap();
+                black_box((deps, transitive));
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
+    group.finish();
+}
+
+fn bench_android_indexes(c: &mut Criterion) {
+    let mut group = c.benchmark_group("android_indexes");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(5));
+
+    group.bench_function("xml_and_resources_default", |b| {
+        b.iter_batched(
+            || {
+                let tmp = TempDir::new().expect("android tempdir");
+                let root = tmp.path().join("project");
+                create_android_project(&root);
+                fresh_db(&root);
+
+                let mut conn = db::open_db(&root).unwrap();
+                let walk = indexer::index_directory(&mut conn, &root, false, false).unwrap();
+                let module_count =
+                    indexer::index_modules_from_files(&conn, &root, &walk.module_files).unwrap();
+                assert!(module_count >= 2);
+                (tmp, root, walk.xml_layout_files, walk.res_files)
+            },
+            |(_tmp, root, xml_files, res_files)| {
+                let mut conn = db::open_db(&root).unwrap();
+                let xml = indexer::index_xml_usages(&mut conn, &root, &xml_files, false).unwrap();
+                let resources =
+                    indexer::index_resources(&mut conn, &root, &res_files, false).unwrap();
+                black_box((xml, resources));
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_index_build,
+    bench_incremental_update,
+    bench_module_graph,
+    bench_android_indexes
+);
 criterion_main!(benches);

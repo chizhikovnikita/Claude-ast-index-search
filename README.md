@@ -1,4 +1,4 @@
-# ast-index v3.44.0
+# ast-index v3.44.2
 
 Fast code search CLI for 34 programming languages. Native Rust implementation.
 
@@ -570,9 +570,6 @@ ios_asset_usages (id, asset_id, usage_file, usage_line, usage_type)
 Create `.ast-index.yaml` in your project root to configure ast-index:
 
 ```yaml
-# Force project type (useful when auto-detection fails)
-project_type: bsl
-
 # Additional directories to index
 roots:
   - "../shared-lib"
@@ -590,16 +587,13 @@ no_ignore: false
 
 All fields are optional. CLI flags override config file values.
 
-### Examples
+Legacy `project_type:` keys are ignored for backward compatibility, so old
+configs keep working unchanged.
 
-**1C:Enterprise (BSL) project:**
-```yaml
-project_type: bsl
-```
+### Examples
 
 **Monorepo with shared libraries:**
 ```yaml
-project_type: android
 roots:
   - "../core"
   - "../network"
@@ -614,8 +608,18 @@ exclude:
 
 ## Changelog
 
+### 3.44.2
+- **Allow colliding relative paths across extra roots without crashing rebuild** — files are now keyed by both owning root and relative path, so `rebuild`/`update` no longer fail with `UNIQUE constraint failed: files.path` when the primary root and an extra root both contain files like `Workspace.swift` or `Geko/Config.swift`; path resolution now also preserves the correct absolute file for each root
+
+### 3.44.1
+- **Index C++ enum values and relax symbol CLI compatibility** — C++ enumerators like `kAntifraud` are now indexed as constants, so `symbol kAntifraud`, `symbol AcceptanceOperationInitiator::kAntifraud`, `symbol ::kAntifraud`, and wildcard forms such as `symbol AcceptanceOperationInitiator::*` work without forcing users to switch to `-p`
+
 ### 3.44.0
-- **Support Windows-1251 (and other legacy) encoded source files** — every file read now flows through a single `crate::encoding::read_file_to_string` helper that takes a UTF-8 fast path (zero overhead for the common case) and falls back to `chardetng` auto-detection + `encoding_rs` decoding for the rest. Legacy mixed-encoding projects (e.g. `/var/www/html` with PHP/HTML/JS in Windows-1251 alongside UTF-8) now `rebuild`, `search`, `grep`, and `outline` correctly without any pre-conversion on disk. Decoding is fault-tolerant — unmappable bytes become `U+FFFD` rather than errors, so partially garbled files still yield useful symbols. After `rebuild`/`update`, a one-line stderr summary reports the number of fallback decodings; `--verbose` lists each file and its detected encoding (e.g. `[encoding] decoded /var/www/html/legacy/order.php as windows-1251`)
+- **Add namespace-aware C++ symbol search without breaking bare lookups** — `symbol Client` still finds all matching classes, while `symbol arcanum::Client`, `symbol -p '::Client'`, and `symbol -p 'foo::bar*'` now narrow by fully-qualified names and print qualified results to disambiguate duplicate class names across namespaces
+- **Expand `module-route` diagnostics and graph output** — `module-route` now returns clearer empty/truncated reasons, better timeout handling, self-edge handling, `json`/`mermaid`/`dot` output, and stronger regression coverage for large fanout graphs
+- **Harden rebuild/update management paths** — `query` now blocks mutation SQL while still allowing `SELECT`, `WITH`, and `EXPLAIN`; `update` now preserves extra roots, respects `include` allow-lists, and keeps root-level files intact in sub-project rebuild mode
+- **Improve TypeScript/Vue and general parser coverage** — better extraction for Vue Composition API / Pinia / script-setup patterns, broader parser/test coverage across multiple languages, and more reliable file-oriented commands
+- **Make safe rebuild optimizations the default and add benchmarks** — full rebuilds now always bulk-load into a thin schema before creating indexes/FTS, use a slightly larger SQLite cache during rebuild, and ship baseline Criterion benches for rebuild, update, module graph, and Android XML/resource phases
 
 ### 3.43.2
 - **Preserve root-level files in sub-project rebuilds** — experimental fast rebuild no longer drops files and module markers that live directly under the selected root when it switches large monorepos into sub-project mode

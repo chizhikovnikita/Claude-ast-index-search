@@ -87,17 +87,15 @@ checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
 
 [[package]]
 name = "ast-index"
-version = "3.44.0"
+version = "3.44.2"
 dependencies = [
  "anyhow",
  "cc",
- "chardetng",
  "clap",
  "colored",
  "criterion",
  "crossbeam-channel",
  "dirs",
- "encoding_rs",
  "fs2",
  "grep-matcher",
  "grep-regex",
@@ -115,7 +113,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tempfile",
- "tree-sitter 0.26.5",
+ "tree-sitter",
  "tree-sitter-bash",
  "tree-sitter-c-sharp",
  "tree-sitter-commonlisp",
@@ -140,7 +138,7 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-scala",
  "tree-sitter-scss",
- "tree-sitter-sql",
+ "tree-sitter-sequel",
  "tree-sitter-swift",
  "tree-sitter-typescript",
  "tree-sitter-zig",
@@ -227,17 +225,6 @@ name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
-
-[[package]]
-name = "chardetng"
-version = "0.1.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "14b8f0b65b7b08ae3c8187e8d77174de20cb6777864c6b832d8ad365999cf1ea"
-dependencies = [
- "cfg-if",
- "encoding_rs",
- "memchr",
-]
 
 [[package]]
 name = "ciborium"
@@ -1391,16 +1378,6 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter"
-version = "0.19.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad726ec26496bf4c083fff0f43d4eb3a2ad1bba305323af5ff91383c0b6ecac0"
-dependencies = [
- "cc",
- "regex",
-]
-
-[[package]]
-name = "tree-sitter"
 version = "0.26.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "12987371f54efc9b9306a20dc87ed5aaee9f320c8a8b115e28515c412b2efe39"
@@ -1546,7 +1523,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "66d4fd0af04a7338929f0e27ca078b4831de8e1ebf90ce8182e69012094a0ae0"
 dependencies = [
  "cc",
- "tree-sitter 0.26.5",
+ "tree-sitter",
 ]
 
 [[package]]
@@ -1655,17 +1632,17 @@ version = "1.0.0"
 source = "git+https://github.com/tree-sitter-grammars/tree-sitter-scss?rev=2ef6d42e3ad7a8208900f9346f4529806ae0f9f9#2ef6d42e3ad7a8208900f9346f4529806ae0f9f9"
 dependencies = [
  "cc",
- "tree-sitter 0.26.5",
+ "tree-sitter",
 ]
 
 [[package]]
-name = "tree-sitter-sql"
-version = "0.0.2"
+name = "tree-sitter-sequel"
+version = "0.3.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04e4fb372576528153a04f47ff3ca2d2b535b756ec1890c42ddd5713a66cc82e"
+checksum = "9d198ad3c319c02e43c21efa1ec796b837afcb96ffaef1a40c1978fbdcec7d17"
 dependencies = [
  "cc",
- "tree-sitter 0.19.5",
+ "tree-sitter-language",
 ]
 
 [[package]]

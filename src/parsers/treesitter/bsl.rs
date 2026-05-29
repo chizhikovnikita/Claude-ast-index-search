@@ -2,13 +2,13 @@
 
 use anyhow::Result;
 use regex::Regex;
-use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 use std::collections::HashSet;
 use std::sync::LazyLock;
+use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
+use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
 use crate::db::SymbolKind;
-use crate::parsers::{ParsedSymbol, ParsedRef};
-use super::{LanguageParser, parse_tree, node_text, node_line, line_text};
+use crate::parsers::{ParsedRef, ParsedSymbol};
 
 // Link the tree-sitter-bsl C library (compiled via build.rs)
 unsafe extern "C" {
@@ -59,20 +59,43 @@ pub fn extract_bsl_module_name(path: &str) -> Option<String> {
 
     // Find the metadata collection prefix (e.g., "CommonModules", "Documents")
     // Skip leading directories like "src", "configuration", etc.
-    let (collection_idx, collection) = parts.iter().enumerate().find_map(|(i, &p)| {
-        match p {
-            "CommonModules" | "Documents" | "Catalogs" | "Enums"
-            | "InformationRegisters" | "AccumulationRegisters" | "AccountingRegisters"
-            | "CalculationRegisters" | "Reports" | "DataProcessors" | "ChartsOfAccounts"
-            | "ChartsOfCharacteristicTypes" | "ChartsOfCalculationTypes"
-            | "Constants" | "ExchangePlans" | "BusinessProcesses" | "Tasks"
-            | "DocumentJournals" | "Subsystems" | "CommonForms" | "SettingsStorages"
-            | "WebServices" | "HTTPServices" | "CommonCommands" | "CommandGroups"
-            | "FilterCriteria" | "EventSubscriptions" | "ScheduledJobs"
-            | "FunctionalOptions" | "FunctionalOptionsParameters" | "DefinedTypes"
-            | "Sequences" | "DocumentNumerators" | "Roles" | "ExternalDataSources" => Some((i, p)),
-            _ => None,
-        }
+    let (collection_idx, collection) = parts.iter().enumerate().find_map(|(i, &p)| match p {
+        "CommonModules"
+        | "Documents"
+        | "Catalogs"
+        | "Enums"
+        | "InformationRegisters"
+        | "AccumulationRegisters"
+        | "AccountingRegisters"
+        | "CalculationRegisters"
+        | "Reports"
+        | "DataProcessors"
+        | "ChartsOfAccounts"
+        | "ChartsOfCharacteristicTypes"
+        | "ChartsOfCalculationTypes"
+        | "Constants"
+        | "ExchangePlans"
+        | "BusinessProcesses"
+        | "Tasks"
+        | "DocumentJournals"
+        | "Subsystems"
+        | "CommonForms"
+        | "SettingsStorages"
+        | "WebServices"
+        | "HTTPServices"
+        | "CommonCommands"
+        | "CommandGroups"
+        | "FilterCriteria"
+        | "EventSubscriptions"
+        | "ScheduledJobs"
+        | "FunctionalOptions"
+        | "FunctionalOptionsParameters"
+        | "DefinedTypes"
+        | "Sequences"
+        | "DocumentNumerators"
+        | "Roles"
+        | "ExternalDataSources" => Some((i, p)),
+        _ => None,
     })?;
 
     // The name comes right after the collection
@@ -189,7 +212,12 @@ fn extract_annotation(content: &str, decl_node: &tree_sitter::Node) -> Option<(S
 }
 
 /// Build enriched signature including annotation line if present
-fn build_signature(content: &str, decl_line: usize, annotation: &Option<(String, usize)>, is_async: bool) -> String {
+fn build_signature(
+    content: &str,
+    decl_line: usize,
+    annotation: &Option<(String, usize)>,
+    is_async: bool,
+) -> String {
     let base = line_text(content, decl_line).trim().to_string();
     let mut parts = Vec::new();
     if let Some((ann_text, _)) = annotation {
@@ -225,7 +253,10 @@ impl LanguageParser for BslParser {
 
         let capture_names = query.capture_names();
         let idx = |name: &str| -> Option<u32> {
-            capture_names.iter().position(|n| *n == name).map(|i| i as u32)
+            capture_names
+                .iter()
+                .position(|n| *n == name)
+                .map(|i| i as u32)
         };
 
         let idx_proc_name = idx("proc_name");
@@ -383,26 +414,89 @@ impl LanguageParser for BslParser {
         static BSL_KEYWORDS: LazyLock<HashSet<&str>> = LazyLock::new(|| {
             [
                 // Russian keywords (per 1C:Enterprise 8.3.27 docs, section 4.2.4.6)
-                "Если", "Тогда", "ИначеЕсли", "Иначе", "КонецЕсли",
-                "Для", "Каждого", "Из", "По", "Цикл", "КонецЦикла", "Пока",
-                "Процедура", "КонецПроцедуры", "Функция", "КонецФункции",
-                "Перем", "Возврат", "Продолжить", "Прервать",
-                "Попытка", "Исключение", "КонецПопытки", "ВызватьИсключение",
-                "Новый", "Выполнить", "Не", "И", "Или",
-                "Истина", "Ложь", "Неопределено", "Null",
-                "Экспорт", "Знач", "Перейти", "Асинх", "Ждать",
-                "ДобавитьОбработчик", "УдалитьОбработчик",
+                "Если",
+                "Тогда",
+                "ИначеЕсли",
+                "Иначе",
+                "КонецЕсли",
+                "Для",
+                "Каждого",
+                "Из",
+                "По",
+                "Цикл",
+                "КонецЦикла",
+                "Пока",
+                "Процедура",
+                "КонецПроцедуры",
+                "Функция",
+                "КонецФункции",
+                "Перем",
+                "Возврат",
+                "Продолжить",
+                "Прервать",
+                "Попытка",
+                "Исключение",
+                "КонецПопытки",
+                "ВызватьИсключение",
+                "Новый",
+                "Выполнить",
+                "Не",
+                "И",
+                "Или",
+                "Истина",
+                "Ложь",
+                "Неопределено",
+                "Null",
+                "Экспорт",
+                "Знач",
+                "Перейти",
+                "Асинх",
+                "Ждать",
+                "ДобавитьОбработчик",
+                "УдалитьОбработчик",
                 // English keywords
-                "If", "Then", "ElsIf", "Else", "EndIf",
-                "For", "Each", "In", "To", "Do", "EndDo", "While",
-                "Procedure", "EndProcedure", "Function", "EndFunction",
-                "Var", "Return", "Continue", "Break",
-                "Try", "Except", "EndTry", "Raise",
-                "New", "Execute", "Not", "And", "Or",
-                "True", "False", "Undefined",
-                "Export", "Val", "Goto", "Async", "Await",
-                "AddHandler", "RemoveHandler",
-            ].into_iter().collect()
+                "If",
+                "Then",
+                "ElsIf",
+                "Else",
+                "EndIf",
+                "For",
+                "Each",
+                "In",
+                "To",
+                "Do",
+                "EndDo",
+                "While",
+                "Procedure",
+                "EndProcedure",
+                "Function",
+                "EndFunction",
+                "Var",
+                "Return",
+                "Continue",
+                "Break",
+                "Try",
+                "Except",
+                "EndTry",
+                "Raise",
+                "New",
+                "Execute",
+                "Not",
+                "And",
+                "Or",
+                "True",
+                "False",
+                "Undefined",
+                "Export",
+                "Val",
+                "Goto",
+                "Async",
+                "Await",
+                "AddHandler",
+                "RemoveHandler",
+            ]
+            .into_iter()
+            .collect()
         });
         let keywords = &*BSL_KEYWORDS;
 
@@ -413,8 +507,12 @@ impl LanguageParser for BslParser {
             let line_num = line_num + 1;
             let trimmed = line.trim();
 
-            if trimmed.len() > 2000 { continue; }
-            if trimmed.starts_with("//") { continue; }
+            if trimmed.len() > 2000 {
+                continue;
+            }
+            if trimmed.starts_with("//") {
+                continue;
+            }
 
             // Function/procedure calls
             for caps in BSL_IDENT_RE.captures_iter(line) {
@@ -507,7 +605,9 @@ mod tests {
     #[test]
     fn test_extract_bsl_module_name_info_register() {
         assert_eq!(
-            extract_bsl_module_name("InformationRegisters/ЦеныНоменклатуры/Ext/RecordSetModule.bsl"),
+            extract_bsl_module_name(
+                "InformationRegisters/ЦеныНоменклатуры/Ext/RecordSetModule.bsl"
+            ),
             Some("РегистрСведений.ЦеныНоменклатуры.НаборЗаписей".to_string())
         );
     }
@@ -551,36 +651,52 @@ mod tests {
         let tree = parse_tree(content, &BSL_LANGUAGE).unwrap();
         eprintln!("DEBUG tree: {}", tree.root_node().to_sexp());
         let symbols = BSL_PARSER.parse_symbols(content).unwrap();
-        eprintln!("DEBUG symbols: {:?}", symbols.iter().map(|s| (&s.name, &s.kind)).collect::<Vec<_>>());
-        assert!(symbols.iter().any(|s| s.name == "МояПроцедура" && s.kind == SymbolKind::Procedure));
+        eprintln!(
+            "DEBUG symbols: {:?}",
+            symbols
+                .iter()
+                .map(|s| (&s.name, &s.kind))
+                .collect::<Vec<_>>()
+        );
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "МояПроцедура" && s.kind == SymbolKind::Procedure));
     }
 
     #[test]
     fn test_parse_function_en() {
         let content = "Function GetData() Export\n    Return 42;\nEndFunction\n";
         let symbols = BSL_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "GetData" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "GetData" && s.kind == SymbolKind::Function));
     }
 
     #[test]
     fn test_parse_procedure_en() {
         let content = "Procedure DoWork(Param1)\n    // work\nEndProcedure\n";
         let symbols = BSL_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "DoWork" && s.kind == SymbolKind::Procedure));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "DoWork" && s.kind == SymbolKind::Procedure));
     }
 
     #[test]
     fn test_parse_variable() {
         let content = "Перем МояПеременная;\n";
         let symbols = BSL_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "МояПеременная" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "МояПеременная" && s.kind == SymbolKind::Property));
     }
 
     #[test]
     fn test_parse_region() {
         let content = "#Область ОбработчикиСобытий\n#КонецОбласти\n";
         let symbols = BSL_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "ОбработчикиСобытий" && s.kind == SymbolKind::Package));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "ОбработчикиСобытий" && s.kind == SymbolKind::Package));
     }
 
     #[test]
@@ -600,10 +716,22 @@ mod tests {
 #КонецОбласти
 "#;
         let symbols = BSL_PARSER.parse_symbols(content).unwrap();
-        let procs: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Procedure).collect();
-        let funcs: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Function).collect();
-        let props: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Property).collect();
-        let pkgs: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Package).collect();
+        let procs: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Procedure)
+            .collect();
+        let funcs: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .collect();
+        let props: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Property)
+            .collect();
+        let pkgs: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Package)
+            .collect();
         assert_eq!(procs.len(), 1, "should have 1 procedure");
         assert_eq!(funcs.len(), 1, "should have 1 function");
         assert!(props.len() >= 1);
@@ -631,7 +759,11 @@ mod tests {
         let content = "Функция ПолучитьДанные() Экспорт\n    Возврат 42;\nКонецФункции\n";
         let symbols = BSL_PARSER.parse_symbols(content).unwrap();
         let func = symbols.iter().find(|s| s.name == "ПолучитьДанные").unwrap();
-        assert!(func.signature.contains("Экспорт"), "signature should contain Экспорт: {}", func.signature);
+        assert!(
+            func.signature.contains("Экспорт"),
+            "signature should contain Экспорт: {}",
+            func.signature
+        );
     }
 
     #[test]
@@ -639,7 +771,11 @@ mod tests {
         let content = "Function GetData() Export\n    Return 42;\nEndFunction\n";
         let symbols = BSL_PARSER.parse_symbols(content).unwrap();
         let func = symbols.iter().find(|s| s.name == "GetData").unwrap();
-        assert!(func.signature.contains("Export"), "signature should contain Export: {}", func.signature);
+        assert!(
+            func.signature.contains("Export"),
+            "signature should contain Export: {}",
+            func.signature
+        );
     }
 
     #[test]
@@ -652,9 +788,16 @@ mod tests {
         let proc = proc.unwrap();
         assert_eq!(proc.kind, SymbolKind::Procedure);
         // Signature should include the directive
-        assert!(proc.signature.contains("НаСервере"), "signature should include directive: {}", proc.signature);
+        assert!(
+            proc.signature.contains("НаСервере"),
+            "signature should include directive: {}",
+            proc.signature
+        );
         // Annotation should be emitted as separate symbol
-        let annotations: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Annotation).collect();
+        let annotations: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Annotation)
+            .collect();
         assert!(!annotations.is_empty(), "should have annotation symbol");
     }
 
@@ -665,7 +808,11 @@ mod tests {
         let proc = symbols.iter().find(|s| s.name == "OnOpen");
         assert!(proc.is_some(), "should find procedure");
         let proc = proc.unwrap();
-        assert!(proc.signature.contains("AtClient"), "signature should include directive: {}", proc.signature);
+        assert!(
+            proc.signature.contains("AtClient"),
+            "signature should include directive: {}",
+            proc.signature
+        );
     }
 
     #[test]
@@ -677,8 +824,14 @@ mod tests {
 "#;
         let symbols = BSL_PARSER.parse_symbols(content).unwrap();
         let refs = BSL_PARSER.extract_refs(content, &symbols).unwrap();
-        assert!(refs.iter().any(|r| r.name == "ПолучитьДанные"), "should find ПолучитьДанные call");
-        assert!(refs.iter().any(|r| r.name == "ЗаписатьВЖурнал"), "should find ЗаписатьВЖурнал call");
+        assert!(
+            refs.iter().any(|r| r.name == "ПолучитьДанные"),
+            "should find ПолучитьДанные call"
+        );
+        assert!(
+            refs.iter().any(|r| r.name == "ЗаписатьВЖурнал"),
+            "should find ЗаписатьВЖурнал call"
+        );
     }
 
     #[test]
@@ -700,8 +853,14 @@ mod tests {
 "#;
         let symbols = BSL_PARSER.parse_symbols(content).unwrap();
         let refs = BSL_PARSER.extract_refs(content, &symbols).unwrap();
-        assert!(refs.iter().any(|r| r.name == "GetData"), "should find English call");
-        assert!(refs.iter().any(|r| r.name == "ТаблицаЗначений"), "should find Cyrillic type ref");
+        assert!(
+            refs.iter().any(|r| r.name == "GetData"),
+            "should find English call"
+        );
+        assert!(
+            refs.iter().any(|r| r.name == "ТаблицаЗначений"),
+            "should find Cyrillic type ref"
+        );
     }
 
     #[test]
@@ -712,7 +871,11 @@ mod tests {
         assert!(proc.is_some(), "should find async procedure");
         let proc = proc.unwrap();
         assert_eq!(proc.kind, SymbolKind::Procedure);
-        assert!(proc.signature.contains("Асинх"), "signature should contain Асинх: {}", proc.signature);
+        assert!(
+            proc.signature.contains("Асинх"),
+            "signature should contain Асинх: {}",
+            proc.signature
+        );
     }
 
     #[test]
@@ -723,6 +886,10 @@ mod tests {
         assert!(func.is_some(), "should find async function");
         let func = func.unwrap();
         assert_eq!(func.kind, SymbolKind::Function);
-        assert!(func.signature.contains("Async"), "signature should contain Async: {}", func.signature);
+        assert!(
+            func.signature.contains("Async"),
+            "signature should contain Async: {}",
+            func.signature
+        );
     }
 }

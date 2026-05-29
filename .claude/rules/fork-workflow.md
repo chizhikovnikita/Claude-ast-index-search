@@ -18,6 +18,23 @@ Verify with `git remote -v`. If `upstream` is missing:
 git remote add upstream https://github.com/defendend/Claude-ast-index-search.git
 ```
 
+## Never push to upstream
+
+**Nothing is ever pushed to `upstream` — not commits, not branches, not tags,
+not now, not in the future.** `upstream` is fetch-only. Every push goes
+exclusively to `origin` (the fork). Syncing means `git fetch upstream` then
+merge into `main`; publishing means `git push origin <branch>`.
+
+A git-level guardrail enforces this: `upstream`'s push URL is set to a bogus
+value so an accidental push fails to resolve instead of reaching the parent:
+
+```bash
+git remote set-url --push upstream DISABLED_no_push_to_upstream
+git remote -v   # upstream (push) should read DISABLED_no_push_to_upstream
+```
+
+Do not restore or "fix" that push URL.
+
 ## Before starting any work — sync with upstream
 
 Stale forks accumulate conflicts. **Always** fetch upstream before writing
@@ -60,3 +77,5 @@ Sync on entry, not at PR time.
   `--force-with-lease` and only on feature branches.
 - **Local commits to the fork's `main`.** Keep `main` mirrored to
   `upstream/main`; do work on feature branches.
+- **Pushing to `upstream`.** Never. `upstream` is fetch-only; all pushes go
+  to `origin`. The disabled push URL is a guardrail, not an inconvenience.

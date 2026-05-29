@@ -102,5 +102,10 @@ fn bench_search_refs(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_find_files, bench_find_symbols, bench_search_refs);
+criterion_group!(
+    benches,
+    bench_find_files,
+    bench_find_symbols,
+    bench_search_refs
+);
 criterion_main!(benches);

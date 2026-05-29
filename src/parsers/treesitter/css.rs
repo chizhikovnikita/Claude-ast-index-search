@@ -28,11 +28,7 @@ impl LanguageParser for CssParser {
         parse_with_query(content, &tree, &CSS_QUERY)
     }
 
-    fn extract_refs(
-        &self,
-        _content: &str,
-        _defined: &[ParsedSymbol],
-    ) -> Result<Vec<ParsedRef>> {
+    fn extract_refs(&self, _content: &str, _defined: &[ParsedSymbol]) -> Result<Vec<ParsedRef>> {
         // Default regex-based ref extraction is tuned for CamelCase types and
         // `name(` calls — it produces only noise for kebab-case CSS selectors.
         // Skip refs entirely for now; revisit when adding cross-file usages.

@@ -11,12 +11,13 @@
 //! - Includes (#include)
 
 use anyhow::Result;
-use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
+use std::collections::HashMap;
 use std::sync::LazyLock;
+use tree_sitter::{Language, Node, Query, QueryCursor, StreamingIterator};
 
+use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
-use super::{LanguageParser, parse_tree, node_text, node_line, line_text};
 
 static CPP_LANGUAGE: LazyLock<Language> = LazyLock::new(|| tree_sitter_cpp::LANGUAGE.into());
 
@@ -39,7 +40,10 @@ impl LanguageParser for CppParser {
         // Build capture name -> index map
         let capture_names = query.capture_names();
         let idx = |name: &str| -> Option<u32> {
-            capture_names.iter().position(|n| *n == name).map(|i| i as u32)
+            capture_names
+                .iter()
+                .position(|n| *n == name)
+                .map(|i| i as u32)
         };
 
         // Class/struct captures
@@ -65,6 +69,7 @@ impl LanguageParser for CppParser {
         // Other captures
         let idx_namespace_name = idx("namespace_name");
         let idx_enum_name = idx("enum_name");
+        let idx_enum_value = idx("enum_value");
         let idx_typedef_name = idx("typedef_name");
         let idx_typedef_node = idx("typedef_node");
         let idx_using_alias_name = idx("using_alias_name");
@@ -264,34 +269,24 @@ impl LanguageParser for CppParser {
 
             // --- Namespace ---
             if let Some(cap) = find_capture(m, idx_namespace_name) {
-                let full_name = node_text(content, &cap.node);
+                let raw_name = node_text(content, &cap.node);
                 let line = node_line(&cap.node);
                 let sig = line_text(content, line).trim().to_string();
 
-                if !full_name.is_empty() {
-                    // For nested namespaces (a::b::c), emit each part and the full name
-                    if full_name.contains("::") {
-                        for part in full_name.split("::") {
-                            if !part.is_empty() {
-                                symbols.push(ParsedSymbol {
-                                    name: part.to_string(),
-                                    kind: SymbolKind::Package,
-                                    line,
-                                    signature: sig.clone(),
-                                    parents: vec![],
-                                });
-                            }
+                if !raw_name.is_empty() {
+                    if raw_name.contains("::") {
+                        for part in raw_name.split("::").filter(|part| !part.is_empty()) {
+                            symbols.push(ParsedSymbol {
+                                name: part.to_string(),
+                                kind: SymbolKind::Package,
+                                line,
+                                signature: sig.clone(),
+                                parents: vec![],
+                            });
                         }
-                        symbols.push(ParsedSymbol {
-                            name: full_name.to_string(),
-                            kind: SymbolKind::Package,
-                            line,
-                            signature: sig,
-                            parents: vec![],
-                        });
                     } else {
                         symbols.push(ParsedSymbol {
-                            name: full_name.to_string(),
+                            name: raw_name.to_string(),
                             kind: SymbolKind::Package,
                             line,
                             signature: sig,
@@ -313,6 +308,18 @@ impl LanguageParser for CppParser {
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
                 });
+
+                if let Some(value_cap) = find_capture(m, idx_enum_value) {
+                    let value = node_text(content, &value_cap.node);
+                    let value_line = node_line(&value_cap.node);
+                    symbols.push(ParsedSymbol {
+                        name: value.to_string(),
+                        kind: SymbolKind::Constant,
+                        line: value_line,
+                        signature: line_text(content, value_line).trim().to_string(),
+                        parents: vec![(name.to_string(), "member".to_string())],
+                    });
+                }
                 continue;
             }
 
@@ -403,6 +410,335 @@ impl LanguageParser for CppParser {
     }
 }
 
+pub fn collect_qualified_names(content: &str) -> Result<HashMap<(String, usize, String), String>> {
+    let tree = parse_tree(content, &CPP_LANGUAGE)?;
+    let mut qualified = HashMap::new();
+    let mut cursor = QueryCursor::new();
+    let query = &*CPP_QUERY;
+
+    let capture_names = query.capture_names();
+    let idx = |name: &str| -> Option<u32> {
+        capture_names
+            .iter()
+            .position(|n| *n == name)
+            .map(|i| i as u32)
+    };
+
+    let idx_class_name = idx("class_name");
+    let idx_class_node = idx("class_node");
+    let idx_struct_name = idx("struct_name");
+    let idx_struct_node = idx("struct_node");
+    let idx_template_class_name = idx("template_class_name");
+    let idx_template_class_node = idx("template_class_node");
+    let idx_template_struct_name = idx("template_struct_name");
+    let idx_template_struct_node = idx("template_struct_node");
+    let idx_func_name = idx("func_name");
+    let idx_template_func_name = idx("template_func_name");
+    let idx_method_class = idx("method_class");
+    let idx_method_name = idx("method_name");
+    let idx_template_method_class = idx("template_method_class");
+    let idx_template_method_name = idx("template_method_name");
+    let idx_destructor_class = idx("destructor_class");
+    let idx_destructor_name = idx("destructor_name");
+    let idx_namespace_name = idx("namespace_name");
+    let idx_enum_name = idx("enum_name");
+    let idx_enum_value = idx("enum_value");
+    let idx_typedef_name = idx("typedef_name");
+    let idx_typedef_node = idx("typedef_node");
+    let idx_using_alias_name = idx("using_alias_name");
+
+    let mut matches = cursor.matches(query, tree.root_node(), content.as_bytes());
+
+    while let Some(m) = matches.next() {
+        if let Some(name_cap) = find_capture(m, idx_class_name) {
+            if find_capture(m, idx_class_node).is_some() {
+                remember_qualified_name(
+                    &mut qualified,
+                    SymbolKind::Class,
+                    node_line(&name_cap.node),
+                    node_text(content, &name_cap.node),
+                    node_text_with_namespace(content, &name_cap.node),
+                );
+            }
+            continue;
+        }
+
+        if let Some(name_cap) = find_capture(m, idx_struct_name) {
+            if find_capture(m, idx_struct_node).is_some() {
+                remember_qualified_name(
+                    &mut qualified,
+                    SymbolKind::Class,
+                    node_line(&name_cap.node),
+                    node_text(content, &name_cap.node),
+                    node_text_with_namespace(content, &name_cap.node),
+                );
+            }
+            continue;
+        }
+
+        if let Some(name_cap) = find_capture(m, idx_template_class_name) {
+            if find_capture(m, idx_template_class_node).is_some() {
+                remember_qualified_name(
+                    &mut qualified,
+                    SymbolKind::Class,
+                    node_line(&name_cap.node),
+                    node_text(content, &name_cap.node),
+                    node_text_with_namespace(content, &name_cap.node),
+                );
+            }
+            continue;
+        }
+
+        if let Some(name_cap) = find_capture(m, idx_template_struct_name) {
+            if find_capture(m, idx_template_struct_node).is_some() {
+                remember_qualified_name(
+                    &mut qualified,
+                    SymbolKind::Class,
+                    node_line(&name_cap.node),
+                    node_text(content, &name_cap.node),
+                    node_text_with_namespace(content, &name_cap.node),
+                );
+            }
+            continue;
+        }
+
+        if let Some(class_cap) = find_capture(m, idx_method_class) {
+            if let Some(name_cap) = find_capture(m, idx_method_name) {
+                let class_name = node_text_with_namespace(content, &class_cap.node);
+                let method_name = node_text(content, &name_cap.node);
+                remember_qualified_name(
+                    &mut qualified,
+                    SymbolKind::Function,
+                    node_line(&name_cap.node),
+                    method_name,
+                    format!("{class_name}::{method_name}"),
+                );
+            }
+            continue;
+        }
+
+        if let Some(class_cap) = find_capture(m, idx_template_method_class) {
+            if let Some(name_cap) = find_capture(m, idx_template_method_name) {
+                let class_name = node_text_with_namespace(content, &class_cap.node);
+                let method_name = node_text(content, &name_cap.node);
+                remember_qualified_name(
+                    &mut qualified,
+                    SymbolKind::Function,
+                    node_line(&name_cap.node),
+                    method_name,
+                    format!("{class_name}::{method_name}"),
+                );
+            }
+            continue;
+        }
+
+        if let Some(class_cap) = find_capture(m, idx_destructor_class) {
+            if let Some(name_cap) = find_capture(m, idx_destructor_name) {
+                let class_name = node_text_with_namespace(content, &class_cap.node);
+                let method_name = node_text(content, &name_cap.node);
+                remember_qualified_name(
+                    &mut qualified,
+                    SymbolKind::Function,
+                    node_line(&name_cap.node),
+                    method_name,
+                    format!("{class_name}::{method_name}"),
+                );
+            }
+            continue;
+        }
+
+        if let Some(cap) = find_capture(m, idx_template_func_name) {
+            remember_qualified_name(
+                &mut qualified,
+                SymbolKind::Function,
+                node_line(&cap.node),
+                node_text(content, &cap.node),
+                node_text_with_namespace(content, &cap.node),
+            );
+            continue;
+        }
+
+        if let Some(cap) = find_capture(m, idx_func_name) {
+            remember_qualified_name(
+                &mut qualified,
+                SymbolKind::Function,
+                node_line(&cap.node),
+                node_text(content, &cap.node),
+                node_text_with_namespace(content, &cap.node),
+            );
+            continue;
+        }
+
+        if let Some(cap) = find_capture(m, idx_namespace_name) {
+            let raw_name = node_text(content, &cap.node);
+            let line = node_line(&cap.node);
+            if raw_name.contains("::") {
+                let mut current = Vec::new();
+                for part in raw_name.split("::").filter(|part| !part.is_empty()) {
+                    current.push(part);
+                    remember_qualified_name(
+                        &mut qualified,
+                        SymbolKind::Package,
+                        line,
+                        part,
+                        current.join("::"),
+                    );
+                }
+            } else {
+                remember_qualified_name(
+                    &mut qualified,
+                    SymbolKind::Package,
+                    line,
+                    raw_name,
+                    node_text_with_namespace(content, &cap.node),
+                );
+            }
+            continue;
+        }
+
+        if let Some(cap) = find_capture(m, idx_enum_name) {
+            remember_qualified_name(
+                &mut qualified,
+                SymbolKind::Enum,
+                node_line(&cap.node),
+                node_text(content, &cap.node),
+                node_text_with_namespace(content, &cap.node),
+            );
+
+            if let Some(value_cap) = find_capture(m, idx_enum_value) {
+                let enum_name = node_text(content, &cap.node);
+                let value_name = node_text(content, &value_cap.node);
+                let qualified_value = qualify_enum_value(content, &cap.node, enum_name, value_name);
+                remember_qualified_name(
+                    &mut qualified,
+                    SymbolKind::Constant,
+                    node_line(&value_cap.node),
+                    value_name,
+                    qualified_value,
+                );
+            }
+            continue;
+        }
+
+        if let Some(cap) = find_capture(m, idx_typedef_name) {
+            remember_qualified_name(
+                &mut qualified,
+                SymbolKind::TypeAlias,
+                node_line(&cap.node),
+                node_text(content, &cap.node),
+                node_text_with_namespace(content, &cap.node),
+            );
+            continue;
+        }
+
+        if let Some(cap) = find_capture(m, idx_typedef_node) {
+            if find_capture(m, idx_typedef_name).is_none() {
+                if let Some(name) = extract_typedef_name(&cap.node, content) {
+                    remember_qualified_name(
+                        &mut qualified,
+                        SymbolKind::TypeAlias,
+                        node_line(&cap.node),
+                        &name,
+                        qualify_typedef_name(content, &cap.node, &name),
+                    );
+                }
+            }
+            continue;
+        }
+
+        if let Some(cap) = find_capture(m, idx_using_alias_name) {
+            remember_qualified_name(
+                &mut qualified,
+                SymbolKind::TypeAlias,
+                node_line(&cap.node),
+                node_text(content, &cap.node),
+                node_text_with_namespace(content, &cap.node),
+            );
+        }
+    }
+
+    Ok(qualified)
+}
+
+fn remember_qualified_name(
+    qualified: &mut HashMap<(String, usize, String), String>,
+    kind: SymbolKind,
+    line: usize,
+    bare_name: &str,
+    qualified_name: String,
+) {
+    if bare_name != qualified_name {
+        qualified.insert(
+            (kind.as_str().to_string(), line, bare_name.to_string()),
+            qualified_name,
+        );
+    }
+}
+
+fn enclosing_namespaces<'a>(content: &'a str, node: Node<'a>) -> Vec<&'a str> {
+    let mut namespaces = Vec::new();
+    let mut current = node.parent();
+
+    if let Some(parent) = current {
+        let is_current_namespace_name = parent.kind() == "namespace_definition"
+            && parent
+                .child_by_field_name("name")
+                .map(|name_node| name_node == node)
+                .unwrap_or(false);
+        if is_current_namespace_name {
+            current = parent.parent();
+        }
+    }
+
+    while let Some(parent) = current {
+        if parent.kind() == "namespace_definition" {
+            if let Some(name_node) = parent.child_by_field_name("name") {
+                let name = node_text(content, &name_node);
+                if !name.is_empty() {
+                    namespaces.push(name);
+                }
+            }
+        }
+        current = parent.parent();
+    }
+
+    namespaces.reverse();
+    namespaces
+}
+
+fn node_text_with_namespace(content: &str, node: &Node) -> String {
+    let mut parts = enclosing_namespaces(content, *node);
+    parts.push(node_text(content, node));
+    parts.join("::")
+}
+
+fn qualify_typedef_name(content: &str, type_def_node: &tree_sitter::Node, name: &str) -> String {
+    let mut parts = enclosing_namespaces(content, *type_def_node);
+    parts.push(name);
+    parts.join("::")
+}
+
+fn qualify_enum_value(
+    content: &str,
+    enum_name_node: &tree_sitter::Node,
+    enum_name: &str,
+    value_name: &str,
+) -> String {
+    let enum_node = enum_name_node.parent();
+    let enum_text = enum_node
+        .as_ref()
+        .map(|node| node_text(content, node))
+        .unwrap_or("");
+
+    let mut parts = enclosing_namespaces(content, *enum_name_node);
+    // Scoped enums (`enum class` / `enum struct`) require EnumName::Value.
+    if enum_text.contains("enum class") || enum_text.contains("enum struct") {
+        parts.push(enum_name);
+    }
+    parts.push(value_name);
+    parts.join("::")
+}
+
 /// Extract the name from a complex typedef declaration.
 /// For `typedef void (*Callback)(int, int);`, the name "Callback" is nested inside
 /// function_declarator -> parenthesized_declarator -> pointer_declarator -> type_identifier.
@@ -479,7 +815,9 @@ fn extract_jni_method_name(line: &str) -> Option<String> {
     let java_start = line.find("Java_")?;
     let rest = &line[java_start..];
     // The JNI name ends at '(' or whitespace
-    let end = rest.find(|c: char| c == '(' || c.is_whitespace()).unwrap_or(rest.len());
+    let end = rest
+        .find(|c: char| c == '(' || c.is_whitespace())
+        .unwrap_or(rest.len());
     let jni_name = &rest[..end];
     // Method name is after the last '_'
     let method = jni_name.rsplit('_').next()?;
@@ -494,17 +832,66 @@ fn extract_jni_method_name(line: &str) -> Option<String> {
 fn is_reserved_word(name: &str) -> bool {
     matches!(
         name,
-        "if" | "else" | "while" | "for" | "do" | "switch" | "case" | "default"
-            | "break" | "continue" | "return" | "goto" | "try" | "catch" | "throw"
-            | "new" | "delete" | "this" | "sizeof" | "typeid" | "static_cast"
-            | "dynamic_cast" | "const_cast" | "reinterpret_cast" | "nullptr"
-            | "true" | "false" | "auto" | "register" | "static" | "extern"
-            | "mutable" | "thread_local" | "inline" | "virtual" | "explicit"
-            | "friend" | "constexpr" | "decltype" | "noexcept" | "override"
-            | "final" | "public" | "private" | "protected" | "using" | "namespace"
-            | "class" | "struct" | "union" | "enum" | "typedef" | "template"
-            | "typename" | "concept" | "requires" | "co_await" | "co_return"
-            | "co_yield" | "operator" | "main"
+        "if" | "else"
+            | "while"
+            | "for"
+            | "do"
+            | "switch"
+            | "case"
+            | "default"
+            | "break"
+            | "continue"
+            | "return"
+            | "goto"
+            | "try"
+            | "catch"
+            | "throw"
+            | "new"
+            | "delete"
+            | "this"
+            | "sizeof"
+            | "typeid"
+            | "static_cast"
+            | "dynamic_cast"
+            | "const_cast"
+            | "reinterpret_cast"
+            | "nullptr"
+            | "true"
+            | "false"
+            | "auto"
+            | "register"
+            | "static"
+            | "extern"
+            | "mutable"
+            | "thread_local"
+            | "inline"
+            | "virtual"
+            | "explicit"
+            | "friend"
+            | "constexpr"
+            | "decltype"
+            | "noexcept"
+            | "override"
+            | "final"
+            | "public"
+            | "private"
+            | "protected"
+            | "using"
+            | "namespace"
+            | "class"
+            | "struct"
+            | "union"
+            | "enum"
+            | "typedef"
+            | "template"
+            | "typename"
+            | "concept"
+            | "requires"
+            | "co_await"
+            | "co_return"
+            | "co_yield"
+            | "operator"
+            | "main"
     )
 }
 
@@ -533,8 +920,11 @@ public:
 "#;
         let symbols = CPP_PARSER.parse_symbols(content).unwrap();
         assert!(
-            symbols.iter().any(|s| s.kind == SymbolKind::Class && s.name == "TJavaException"),
-            "Expected to find class TJavaException, got: {:?}", symbols
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Class && s.name == "TJavaException"),
+            "Expected to find class TJavaException, got: {:?}",
+            symbols
         );
     }
 
@@ -547,11 +937,15 @@ public:
 };
 "#;
         let symbols = CPP_PARSER.parse_symbols(content).unwrap();
-        let class = symbols.iter().find(|s| s.name == "TJniClass").expect("TJniClass not found");
+        let class = symbols
+            .iter()
+            .find(|s| s.name == "TJniClass")
+            .expect("TJniClass not found");
         assert_eq!(class.kind, SymbolKind::Class);
         assert!(
             class.parents.iter().any(|(p, _)| p == "TJniReference"),
-            "Expected parent TJniReference, got: {:?}", class.parents
+            "Expected parent TJniReference, got: {:?}",
+            class.parents
         );
     }
 
@@ -564,11 +958,15 @@ public:
 };
 "#;
         let symbols = CPP_PARSER.parse_symbols(content).unwrap();
-        let class = symbols.iter().find(|s| s.name == "TJniClass").expect("TJniClass not found");
+        let class = symbols
+            .iter()
+            .find(|s| s.name == "TJniClass")
+            .expect("TJniClass not found");
         assert_eq!(class.kind, SymbolKind::Class);
         assert!(
             class.parents.iter().any(|(p, _)| p == "TJniReference"),
-            "Expected parent TJniReference, got: {:?}", class.parents
+            "Expected parent TJniReference, got: {:?}",
+            class.parents
         );
     }
 
@@ -582,8 +980,11 @@ struct Point {
 "#;
         let symbols = CPP_PARSER.parse_symbols(content).unwrap();
         assert!(
-            symbols.iter().any(|s| s.kind == SymbolKind::Class && s.name == "Point"),
-            "Expected to find struct Point as Class, got: {:?}", symbols
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Class && s.name == "Point"),
+            "Expected to find struct Point as Class, got: {:?}",
+            symbols
         );
     }
 
@@ -599,8 +1000,11 @@ public:
 "#;
         let symbols = CPP_PARSER.parse_symbols(content).unwrap();
         assert!(
-            symbols.iter().any(|s| s.kind == SymbolKind::Class && s.name == "TJniReference"),
-            "Expected to find template class TJniReference, got: {:?}", symbols
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Class && s.name == "TJniReference"),
+            "Expected to find template class TJniReference, got: {:?}",
+            symbols
         );
     }
 
@@ -613,12 +1017,18 @@ struct Bar;
         let symbols = CPP_PARSER.parse_symbols(content).unwrap();
         // Forward declarations have no body, so should not be captured
         assert!(
-            !symbols.iter().any(|s| s.name == "Foo" && s.kind == SymbolKind::Class),
-            "Forward declaration class Foo should be skipped, got: {:?}", symbols
+            !symbols
+                .iter()
+                .any(|s| s.name == "Foo" && s.kind == SymbolKind::Class),
+            "Forward declaration class Foo should be skipped, got: {:?}",
+            symbols
         );
         assert!(
-            !symbols.iter().any(|s| s.name == "Bar" && s.kind == SymbolKind::Class),
-            "Forward declaration struct Bar should be skipped, got: {:?}", symbols
+            !symbols
+                .iter()
+                .any(|s| s.name == "Bar" && s.kind == SymbolKind::Class),
+            "Forward declaration struct Bar should be skipped, got: {:?}",
+            symbols
         );
     }
 
@@ -633,8 +1043,11 @@ void doSomething(int x) {
 "#;
         let symbols = CPP_PARSER.parse_symbols(content).unwrap();
         assert!(
-            symbols.iter().any(|s| s.kind == SymbolKind::Function && s.name == "doSomething"),
-            "Expected function doSomething, got: {:?}", symbols
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Function && s.name == "doSomething"),
+            "Expected function doSomething, got: {:?}",
+            symbols
         );
     }
 
@@ -649,8 +1062,11 @@ auto jniWrapExceptions(JNIEnv* env, Func&& func) {
 "#;
         let symbols = CPP_PARSER.parse_symbols(content).unwrap();
         assert!(
-            symbols.iter().any(|s| s.kind == SymbolKind::Function && s.name == "jniWrapExceptions"),
-            "Expected template function jniWrapExceptions, got: {:?}", symbols
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Function && s.name == "jniWrapExceptions"),
+            "Expected template function jniWrapExceptions, got: {:?}",
+            symbols
         );
     }
 
@@ -662,11 +1078,18 @@ void MyClass::doWork(int x) {
 }
 "#;
         let symbols = CPP_PARSER.parse_symbols(content).unwrap();
-        let method = symbols.iter().find(|s| s.name == "doWork").expect("doWork not found");
+        let method = symbols
+            .iter()
+            .find(|s| s.name == "doWork")
+            .expect("doWork not found");
         assert_eq!(method.kind, SymbolKind::Function);
         assert!(
-            method.parents.iter().any(|(p, k)| p == "MyClass" && k == "member"),
-            "Expected parent MyClass with role member, got: {:?}", method.parents
+            method
+                .parents
+                .iter()
+                .any(|(p, k)| p == "MyClass" && k == "member"),
+            "Expected parent MyClass with role member, got: {:?}",
+            method.parents
         );
     }
 
@@ -679,9 +1102,13 @@ MyClass::~MyClass() {
 "#;
         let symbols = CPP_PARSER.parse_symbols(content).unwrap();
         assert!(
-            symbols.iter().any(|s| s.name == "~MyClass" && s.kind == SymbolKind::Function
-                && s.parents.iter().any(|(p, k)| p == "MyClass" && k == "member")),
-            "Expected destructor ~MyClass with parent MyClass, got: {:?}", symbols
+            symbols.iter().any(|s| s.name == "~MyClass"
+                && s.kind == SymbolKind::Function
+                && s.parents
+                    .iter()
+                    .any(|(p, k)| p == "MyClass" && k == "member")),
+            "Expected destructor ~MyClass with parent MyClass, got: {:?}",
+            symbols
         );
     }
 
@@ -696,8 +1123,11 @@ namespace NDirect {
 "#;
         let symbols = CPP_PARSER.parse_symbols(content).unwrap();
         assert!(
-            symbols.iter().any(|s| s.kind == SymbolKind::Package && s.name == "NDirect"),
-            "Expected namespace NDirect, got: {:?}", symbols
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Package && s.name == "NDirect"),
+            "Expected namespace NDirect, got: {:?}",
+            symbols
         );
     }
 
@@ -712,12 +1142,18 @@ namespace outer {
 "#;
         let symbols = CPP_PARSER.parse_symbols(content).unwrap();
         assert!(
-            symbols.iter().any(|s| s.kind == SymbolKind::Package && s.name == "outer"),
-            "Expected namespace outer, got: {:?}", symbols
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Package && s.name == "outer"),
+            "Expected namespace outer, got: {:?}",
+            symbols
         );
         assert!(
-            symbols.iter().any(|s| s.kind == SymbolKind::Package && s.name == "inner"),
-            "Expected namespace inner, got: {:?}", symbols
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Package && s.name == "inner"),
+            "Expected namespace inner, got: {:?}",
+            symbols
         );
     }
 
@@ -734,8 +1170,32 @@ enum Color {
 "#;
         let symbols = CPP_PARSER.parse_symbols(content).unwrap();
         assert!(
-            symbols.iter().any(|s| s.kind == SymbolKind::Enum && s.name == "Color"),
-            "Expected enum Color, got: {:?}", symbols
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Enum && s.name == "Color"),
+            "Expected enum Color, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Constant && s.name == "RED"),
+            "Expected enum value RED, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Constant && s.name == "GREEN"),
+            "Expected enum value GREEN, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Constant && s.name == "BLUE"),
+            "Expected enum value BLUE, got: {:?}",
+            symbols
         );
     }
 
@@ -750,8 +1210,32 @@ enum class Status {
 "#;
         let symbols = CPP_PARSER.parse_symbols(content).unwrap();
         assert!(
-            symbols.iter().any(|s| s.kind == SymbolKind::Enum && s.name == "Status"),
-            "Expected enum class Status, got: {:?}", symbols
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Enum && s.name == "Status"),
+            "Expected enum class Status, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Constant && s.name == "Active"),
+            "Expected enum class value Active, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Constant && s.name == "Inactive"),
+            "Expected enum class value Inactive, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Constant && s.name == "Deleted"),
+            "Expected enum class value Deleted, got: {:?}",
+            symbols
         );
     }
 
@@ -764,8 +1248,11 @@ typedef unsigned long ulong;
 "#;
         let symbols = CPP_PARSER.parse_symbols(content).unwrap();
         assert!(
-            symbols.iter().any(|s| s.kind == SymbolKind::TypeAlias && s.name == "ulong"),
-            "Expected typedef ulong, got: {:?}", symbols
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::TypeAlias && s.name == "ulong"),
+            "Expected typedef ulong, got: {:?}",
+            symbols
         );
     }
 
@@ -776,8 +1263,11 @@ using StringVec = std::vector<std::string>;
 "#;
         let symbols = CPP_PARSER.parse_symbols(content).unwrap();
         assert!(
-            symbols.iter().any(|s| s.kind == SymbolKind::TypeAlias && s.name == "StringVec"),
-            "Expected using alias StringVec, got: {:?}", symbols
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::TypeAlias && s.name == "StringVec"),
+            "Expected using alias StringVec, got: {:?}",
+            symbols
         );
     }
 
@@ -790,8 +1280,11 @@ using StringVec = std::vector<std::string>;
 "#;
         let symbols = CPP_PARSER.parse_symbols(content).unwrap();
         assert!(
-            symbols.iter().any(|s| s.kind == SymbolKind::Constant && s.name == "MAX"),
-            "Expected macro MAX, got: {:?}", symbols
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Constant && s.name == "MAX"),
+            "Expected macro MAX, got: {:?}",
+            symbols
         );
     }
 
@@ -806,16 +1299,25 @@ using StringVec = std::vector<std::string>;
 "#;
         let symbols = CPP_PARSER.parse_symbols(content).unwrap();
         assert!(
-            symbols.iter().any(|s| s.kind == SymbolKind::Import && s.name == "jni.h"),
-            "Expected include jni.h, got: {:?}", symbols
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Import && s.name == "jni.h"),
+            "Expected include jni.h, got: {:?}",
+            symbols
         );
         assert!(
-            symbols.iter().any(|s| s.kind == SymbolKind::Import && s.name == "util.h"),
-            "Expected include util.h, got: {:?}", symbols
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Import && s.name == "util.h"),
+            "Expected include util.h, got: {:?}",
+            symbols
         );
         assert!(
-            symbols.iter().any(|s| s.kind == SymbolKind::Import && s.name == "string.h"),
-            "Expected include string.h (from util/generic/string.h), got: {:?}", symbols
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Import && s.name == "string.h"),
+            "Expected include string.h (from util/generic/string.h), got: {:?}",
+            symbols
         );
     }
 
@@ -875,22 +1377,65 @@ int Widget::size() const {
 "#;
         let symbols = CPP_PARSER.parse_symbols(content).unwrap();
         assert!(
-            symbols.iter().any(|s| s.kind == SymbolKind::Package && s.name == "mylib"),
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Package && s.name == "mylib"),
             "Expected namespace mylib"
         );
         assert!(
-            symbols.iter().any(|s| s.kind == SymbolKind::Class && s.name == "Widget"),
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Class && s.name == "Widget"),
             "Expected class Widget"
         );
         assert!(
-            symbols.iter().any(|s| s.name == "draw" && s.kind == SymbolKind::Function
+            symbols.iter().any(|s| s.name == "draw"
+                && s.kind == SymbolKind::Function
                 && s.parents.iter().any(|(p, _)| p == "Widget")),
             "Expected method draw with parent Widget"
         );
         assert!(
-            symbols.iter().any(|s| s.name == "size" && s.kind == SymbolKind::Function
+            symbols.iter().any(|s| s.name == "size"
+                && s.kind == SymbolKind::Function
                 && s.parents.iter().any(|(p, _)| p == "Widget")),
             "Expected method size with parent Widget"
+        );
+    }
+
+    #[test]
+    fn test_parse_namespaced_free_function_and_enum() {
+        let content = r#"
+namespace arcanum {
+    enum class Mode {
+        Fast,
+    };
+
+    Client makeClient() {
+        return {};
+    }
+}
+"#;
+        let symbols = CPP_PARSER.parse_symbols(content).unwrap();
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Enum && s.name == "Mode"),
+            "Expected enum Mode, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Constant && s.name == "Fast"),
+            "Expected enum class value Fast, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Function && s.name == "makeClient"),
+            "Expected function makeClient, got: {:?}",
+            symbols
         );
     }
 
@@ -902,14 +1447,19 @@ class MyClass : public Base1, public Base2 {
 };
 "#;
         let symbols = CPP_PARSER.parse_symbols(content).unwrap();
-        let class = symbols.iter().find(|s| s.name == "MyClass").expect("MyClass not found");
+        let class = symbols
+            .iter()
+            .find(|s| s.name == "MyClass")
+            .expect("MyClass not found");
         assert!(
             class.parents.iter().any(|(p, _)| p == "Base1"),
-            "Expected parent Base1, got: {:?}", class.parents
+            "Expected parent Base1, got: {:?}",
+            class.parents
         );
         assert!(
             class.parents.iter().any(|(p, _)| p == "Base2"),
-            "Expected parent Base2, got: {:?}", class.parents
+            "Expected parent Base2, got: {:?}",
+            class.parents
         );
     }
 
@@ -922,8 +1472,11 @@ constexpr int square(int x) {
 "#;
         let symbols = CPP_PARSER.parse_symbols(content).unwrap();
         assert!(
-            symbols.iter().any(|s| s.kind == SymbolKind::Function && s.name == "square"),
-            "Expected constexpr function square, got: {:?}", symbols
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Function && s.name == "square"),
+            "Expected constexpr function square, got: {:?}",
+            symbols
         );
     }
 
@@ -936,8 +1489,11 @@ inline void helper() {
 "#;
         let symbols = CPP_PARSER.parse_symbols(content).unwrap();
         assert!(
-            symbols.iter().any(|s| s.kind == SymbolKind::Function && s.name == "helper"),
-            "Expected inline function helper, got: {:?}", symbols
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Function && s.name == "helper"),
+            "Expected inline function helper, got: {:?}",
+            symbols
         );
     }
 
@@ -951,8 +1507,11 @@ static int counter() {
 "#;
         let symbols = CPP_PARSER.parse_symbols(content).unwrap();
         assert!(
-            symbols.iter().any(|s| s.kind == SymbolKind::Function && s.name == "counter"),
-            "Expected static function counter, got: {:?}", symbols
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Function && s.name == "counter"),
+            "Expected static function counter, got: {:?}",
+            symbols
         );
     }
 
@@ -967,8 +1526,11 @@ struct Optional {
 "#;
         let symbols = CPP_PARSER.parse_symbols(content).unwrap();
         assert!(
-            symbols.iter().any(|s| s.kind == SymbolKind::Class && s.name == "Optional"),
-            "Expected template struct Optional, got: {:?}", symbols
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Class && s.name == "Optional"),
+            "Expected template struct Optional, got: {:?}",
+            symbols
         );
     }
 
@@ -983,8 +1545,32 @@ enum class Color : uint8_t {
 "#;
         let symbols = CPP_PARSER.parse_symbols(content).unwrap();
         assert!(
-            symbols.iter().any(|s| s.kind == SymbolKind::Enum && s.name == "Color"),
-            "Expected enum class Color with underlying type, got: {:?}", symbols
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Enum && s.name == "Color"),
+            "Expected enum class Color with underlying type, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Constant && s.name == "Red"),
+            "Expected enum class value Red, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Constant && s.name == "Green"),
+            "Expected enum class value Green, got: {:?}",
+            symbols
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Constant && s.name == "Blue"),
+            "Expected enum class value Blue, got: {:?}",
+            symbols
         );
     }
 
@@ -995,15 +1581,20 @@ typedef void (*Callback)(int, int);
 "#;
         let symbols = CPP_PARSER.parse_symbols(content).unwrap();
         assert!(
-            symbols.iter().any(|s| s.kind == SymbolKind::TypeAlias && s.name == "Callback"),
-            "Expected typedef function pointer Callback, got: {:?}", symbols
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::TypeAlias && s.name == "Callback"),
+            "Expected typedef function pointer Callback, got: {:?}",
+            symbols
         );
     }
 
     #[test]
     fn test_jni_extraction() {
         assert_eq!(
-            extract_jni_method_name("JNIEXPORT jobject JNICALL Java_com_example_TextProcessor_analyze"),
+            extract_jni_method_name(
+                "JNIEXPORT jobject JNICALL Java_com_example_TextProcessor_analyze"
+            ),
             Some("analyze".to_string())
         );
     }
@@ -1028,11 +1619,14 @@ namespace {
         // Anonymous namespaces have no name, so no namespace symbol emitted
         assert!(
             !symbols.iter().any(|s| s.kind == SymbolKind::Package),
-            "Anonymous namespace should not emit a Package symbol, got: {:?}", symbols
+            "Anonymous namespace should not emit a Package symbol, got: {:?}",
+            symbols
         );
         // But the function inside should still be captured
         assert!(
-            symbols.iter().any(|s| s.kind == SymbolKind::Function && s.name == "internal_func"),
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Function && s.name == "internal_func"),
             "Expected function internal_func inside anonymous namespace"
         );
     }
@@ -1076,32 +1670,63 @@ using StringRef = const std::string&;
         let symbols = CPP_PARSER.parse_symbols(content).unwrap();
 
         // Includes
-        assert!(symbols.iter().any(|s| s.kind == SymbolKind::Import && s.name == "iostream"));
-        assert!(symbols.iter().any(|s| s.kind == SymbolKind::Import && s.name == "myheader.h"));
+        assert!(symbols
+            .iter()
+            .any(|s| s.kind == SymbolKind::Import && s.name == "iostream"));
+        assert!(symbols
+            .iter()
+            .any(|s| s.kind == SymbolKind::Import && s.name == "myheader.h"));
 
         // Macro
-        assert!(symbols.iter().any(|s| s.kind == SymbolKind::Constant && s.name == "STRINGIFY"));
+        assert!(symbols
+            .iter()
+            .any(|s| s.kind == SymbolKind::Constant && s.name == "STRINGIFY"));
 
         // Namespace
-        assert!(symbols.iter().any(|s| s.kind == SymbolKind::Package && s.name == "utils"));
+        assert!(symbols
+            .iter()
+            .any(|s| s.kind == SymbolKind::Package && s.name == "utils"));
 
         // Enum class
-        assert!(symbols.iter().any(|s| s.kind == SymbolKind::Enum && s.name == "LogLevel"));
+        assert!(symbols
+            .iter()
+            .any(|s| s.kind == SymbolKind::Enum && s.name == "LogLevel"));
+        assert!(symbols
+            .iter()
+            .any(|s| s.kind == SymbolKind::Constant && s.name == "Debug"));
+        assert!(symbols
+            .iter()
+            .any(|s| s.kind == SymbolKind::Constant && s.name == "Info"));
+        assert!(symbols
+            .iter()
+            .any(|s| s.kind == SymbolKind::Constant && s.name == "Warning"));
+        assert!(symbols
+            .iter()
+            .any(|s| s.kind == SymbolKind::Constant && s.name == "Error"));
 
         // Class
-        assert!(symbols.iter().any(|s| s.kind == SymbolKind::Class && s.name == "Logger"));
+        assert!(symbols
+            .iter()
+            .any(|s| s.kind == SymbolKind::Class && s.name == "Logger"));
 
         // Method definition
-        assert!(symbols.iter().any(|s| s.name == "log" && s.kind == SymbolKind::Function
+        assert!(symbols.iter().any(|s| s.name == "log"
+            && s.kind == SymbolKind::Function
             && s.parents.iter().any(|(p, _)| p == "Logger")));
 
         // Template function
-        assert!(symbols.iter().any(|s| s.kind == SymbolKind::Function && s.name == "clamp"));
+        assert!(symbols
+            .iter()
+            .any(|s| s.kind == SymbolKind::Function && s.name == "clamp"));
 
         // Typedef
-        assert!(symbols.iter().any(|s| s.kind == SymbolKind::TypeAlias && s.name == "LogCallback"));
+        assert!(symbols
+            .iter()
+            .any(|s| s.kind == SymbolKind::TypeAlias && s.name == "LogCallback"));
 
         // Using alias
-        assert!(symbols.iter().any(|s| s.kind == SymbolKind::TypeAlias && s.name == "StringRef"));
+        assert!(symbols
+            .iter()
+            .any(|s| s.kind == SymbolKind::TypeAlias && s.name == "StringRef"));
     }
 }

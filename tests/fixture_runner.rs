@@ -44,7 +44,11 @@ fn is_result_line(line: &str) -> bool {
 fn collect_trials(dir: &Path, root: &Path, trials: &mut Vec<Trial>) {
     let yaml_path = dir.join("tests.yaml");
     if yaml_path.exists() {
-        let rel = dir.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+        let rel = dir
+            .strip_prefix(root)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         let yaml = fs::read_to_string(&yaml_path)
             .unwrap_or_else(|e| panic!("can't read {}: {e}", yaml_path.display()));
         let cases: Vec<TestCase> = serde_yaml::from_str(&yaml)
@@ -55,7 +59,10 @@ fn collect_trials(dir: &Path, root: &Path, trials: &mut Vec<Trial>) {
         let fixture = dir.to_path_buf();
 
         let (ok, stdout, stderr) = run_ast_index(&fixture, &db_path, &["rebuild"]);
-        assert!(ok, "rebuild failed for {rel}:\nstdout: {stdout}\nstderr: {stderr}");
+        assert!(
+            ok,
+            "rebuild failed for {rel}:\nstdout: {stdout}\nstderr: {stderr}"
+        );
 
         for case in cases {
             let name = format!("{rel} | {}", case.command.join(" "));
@@ -90,7 +97,11 @@ fn collect_trials(dir: &Path, root: &Path, trials: &mut Vec<Trial>) {
                     }
                     msg.push_str(&format!(
                         "\n  stdout:\n{}",
-                        stdout.lines().map(|l| format!("    {l}")).collect::<Vec<_>>().join("\n"),
+                        stdout
+                            .lines()
+                            .map(|l| format!("    {l}"))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
                     ));
                     if !stderr.trim().is_empty() {
                         msg.push_str(&format!("\n  stderr: {}", stderr.trim()));

@@ -1,12 +1,12 @@
 //! Tree-sitter based PHP parser
 
 use anyhow::Result;
-use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 use std::sync::LazyLock;
+use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
+use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
-use super::{LanguageParser, parse_tree, node_text, node_line, line_text};
 
 static PHP_LANGUAGE: LazyLock<Language> = LazyLock::new(|| tree_sitter_php::LANGUAGE_PHP.into());
 
@@ -28,7 +28,10 @@ impl LanguageParser for PhpParser {
 
         let capture_names = query.capture_names();
         let idx = |name: &str| -> Option<u32> {
-            capture_names.iter().position(|n| *n == name).map(|i| i as u32)
+            capture_names
+                .iter()
+                .position(|n| *n == name)
+                .map(|i| i as u32)
         };
 
         let idx_namespace_name = idx("namespace_name");
@@ -93,7 +96,12 @@ impl LanguageParser for PhpParser {
                 let name = node_text(content, &name_cap.node);
                 let line = node_line(&name_cap.node);
                 let parents = find_capture(m, idx_interface_parent)
-                    .map(|p| vec![(node_text(content, &p.node).to_string(), "extends".to_string())])
+                    .map(|p| {
+                        vec![(
+                            node_text(content, &p.node).to_string(),
+                            "extends".to_string(),
+                        )]
+                    })
                     .unwrap_or_default();
                 symbols.push(ParsedSymbol {
                     name: name.to_string(),
@@ -190,8 +198,8 @@ impl LanguageParser for PhpParser {
             }
 
             // Namespace use (import) — qualified or simple name
-            if let Some(cap) = find_capture(m, idx_use_name)
-                .or_else(|| find_capture(m, idx_use_simple_name))
+            if let Some(cap) =
+                find_capture(m, idx_use_name).or_else(|| find_capture(m, idx_use_simple_name))
             {
                 let name = node_text(content, &cap.node);
                 let line = node_line(&cap.node);
@@ -243,114 +251,166 @@ mod tests {
     fn test_parse_namespace() {
         let content = "<?php\nnamespace App\\Models;\n";
         let symbols = PHP_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "App\\Models" && s.kind == SymbolKind::Package));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "App\\Models" && s.kind == SymbolKind::Package));
     }
 
     #[test]
     fn test_parse_class() {
         let content = "<?php\nclass User {\n}\n";
         let symbols = PHP_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "User" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "User" && s.kind == SymbolKind::Class));
     }
 
     #[test]
     fn test_parse_class_extends() {
         let content = "<?php\nclass User extends Model {\n}\n";
         let symbols = PHP_PARSER.parse_symbols(content).unwrap();
-        let cls = symbols.iter().find(|s| s.name == "User" && s.kind == SymbolKind::Class);
+        let cls = symbols
+            .iter()
+            .find(|s| s.name == "User" && s.kind == SymbolKind::Class);
         assert!(cls.is_some());
-        assert!(cls.unwrap().parents.iter().any(|(p, k)| p == "Model" && k == "extends"));
+        assert!(cls
+            .unwrap()
+            .parents
+            .iter()
+            .any(|(p, k)| p == "Model" && k == "extends"));
     }
 
     #[test]
     fn test_parse_class_implements() {
         let content = "<?php\nclass User extends Model implements Authenticatable {\n}\n";
         let symbols = PHP_PARSER.parse_symbols(content).unwrap();
-        let cls = symbols.iter().find(|s| s.name == "User" && s.kind == SymbolKind::Class);
+        let cls = symbols
+            .iter()
+            .find(|s| s.name == "User" && s.kind == SymbolKind::Class);
         assert!(cls.is_some());
-        assert!(cls.unwrap().parents.iter().any(|(p, k)| p == "Model" && k == "extends"));
+        assert!(cls
+            .unwrap()
+            .parents
+            .iter()
+            .any(|(p, k)| p == "Model" && k == "extends"));
         assert!(cls.unwrap().parents.iter().any(|(_, k)| k == "implements"));
     }
 
     #[test]
     fn test_parse_interface() {
-        let content = "<?php\ninterface Authenticatable {\n    public function getAuthIdentifier();\n}\n";
+        let content =
+            "<?php\ninterface Authenticatable {\n    public function getAuthIdentifier();\n}\n";
         let symbols = PHP_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "Authenticatable" && s.kind == SymbolKind::Interface));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Authenticatable" && s.kind == SymbolKind::Interface));
     }
 
     #[test]
     fn test_parse_interface_extends() {
         let content = "<?php\ninterface AdminAuth extends Authenticatable {\n}\n";
         let symbols = PHP_PARSER.parse_symbols(content).unwrap();
-        let iface = symbols.iter().find(|s| s.name == "AdminAuth" && s.kind == SymbolKind::Interface);
+        let iface = symbols
+            .iter()
+            .find(|s| s.name == "AdminAuth" && s.kind == SymbolKind::Interface);
         assert!(iface.is_some());
-        assert!(iface.unwrap().parents.iter().any(|(p, k)| p == "Authenticatable" && k == "extends"));
+        assert!(iface
+            .unwrap()
+            .parents
+            .iter()
+            .any(|(p, k)| p == "Authenticatable" && k == "extends"));
     }
 
     #[test]
     fn test_parse_trait() {
-        let content = "<?php\ntrait HasFactory {\n    public function factory() { return new static; }\n}\n";
+        let content =
+            "<?php\ntrait HasFactory {\n    public function factory() { return new static; }\n}\n";
         let symbols = PHP_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "HasFactory" && s.kind == SymbolKind::Interface));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "HasFactory" && s.kind == SymbolKind::Interface));
     }
 
     #[test]
     fn test_parse_enum() {
         let content = "<?php\nenum Status {\n    case Active;\n    case Inactive;\n}\n";
         let symbols = PHP_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "Status" && s.kind == SymbolKind::Enum));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Status" && s.kind == SymbolKind::Enum));
     }
 
     #[test]
     fn test_parse_function() {
         let content = "<?php\nfunction helper(): string {\n    return 'hello';\n}\n";
         let symbols = PHP_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "helper" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "helper" && s.kind == SymbolKind::Function));
     }
 
     #[test]
     fn test_parse_method() {
         let content = "<?php\nclass User {\n    public function getName(): string {\n        return $this->name;\n    }\n}\n";
         let symbols = PHP_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "getName" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "getName" && s.kind == SymbolKind::Function));
     }
 
     #[test]
     fn test_parse_constant() {
-        let content = "<?php\nclass Config {\n    const MAX_RETRIES = 3;\n    const VERSION = '1.0';\n}\n";
+        let content =
+            "<?php\nclass Config {\n    const MAX_RETRIES = 3;\n    const VERSION = '1.0';\n}\n";
         let symbols = PHP_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "MAX_RETRIES" && s.kind == SymbolKind::Constant));
-        assert!(symbols.iter().any(|s| s.name == "VERSION" && s.kind == SymbolKind::Constant));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "MAX_RETRIES" && s.kind == SymbolKind::Constant));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "VERSION" && s.kind == SymbolKind::Constant));
     }
 
     #[test]
     fn test_parse_property() {
         let content = "<?php\nclass User {\n    public string $name;\n    protected int $age;\n}\n";
         let symbols = PHP_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "$name" && s.kind == SymbolKind::Property));
-        assert!(symbols.iter().any(|s| s.name == "$age" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "$name" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "$age" && s.kind == SymbolKind::Property));
     }
 
     #[test]
     fn test_parse_use_import() {
         let content = "<?php\nuse App\\Models\\User;\nuse Illuminate\\Support\\Facades\\DB;\n";
         let symbols = PHP_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "App\\Models\\User" && s.kind == SymbolKind::Import));
-        assert!(symbols.iter().any(|s| s.name == "Illuminate\\Support\\Facades\\DB" && s.kind == SymbolKind::Import));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "App\\Models\\User" && s.kind == SymbolKind::Import));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Illuminate\\Support\\Facades\\DB" && s.kind == SymbolKind::Import));
     }
 
     #[test]
     fn test_parse_trait_use() {
         let content = "<?php\nclass User {\n    use HasFactory;\n    use Notifiable;\n}\n";
         let symbols = PHP_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "HasFactory" && s.kind == SymbolKind::Import));
-        assert!(symbols.iter().any(|s| s.name == "Notifiable" && s.kind == SymbolKind::Import));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "HasFactory" && s.kind == SymbolKind::Import));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Notifiable" && s.kind == SymbolKind::Import));
     }
 
     #[test]
     fn test_comments_ignored() {
-        let content = "<?php\n// class FakeClass {}\n/* class AnotherFake {} */\nclass RealClass {\n}\n";
+        let content =
+            "<?php\n// class FakeClass {}\n/* class AnotherFake {} */\nclass RealClass {\n}\n";
         let symbols = PHP_PARSER.parse_symbols(content).unwrap();
         assert!(symbols.iter().any(|s| s.name == "RealClass"));
         assert!(!symbols.iter().any(|s| s.name == "FakeClass"));
@@ -387,29 +447,53 @@ class User extends Model implements Authenticatable {
         let symbols = PHP_PARSER.parse_symbols(content).unwrap();
 
         // Namespace
-        assert!(symbols.iter().any(|s| s.name == "App\\Models" && s.kind == SymbolKind::Package));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "App\\Models" && s.kind == SymbolKind::Package));
 
         // Imports
-        assert!(symbols.iter().any(|s| s.name == "Illuminate\\Database\\Eloquent\\Model" && s.kind == SymbolKind::Import));
-        assert!(symbols.iter().any(|s| s.name == "Illuminate\\Contracts\\Auth\\Authenticatable" && s.kind == SymbolKind::Import));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Illuminate\\Database\\Eloquent\\Model"
+                && s.kind == SymbolKind::Import));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Illuminate\\Contracts\\Auth\\Authenticatable"
+                && s.kind == SymbolKind::Import));
 
         // Class
-        let cls = symbols.iter().find(|s| s.name == "User" && s.kind == SymbolKind::Class);
+        let cls = symbols
+            .iter()
+            .find(|s| s.name == "User" && s.kind == SymbolKind::Class);
         assert!(cls.is_some());
 
         // Trait use
-        assert!(symbols.iter().any(|s| s.name == "HasFactory" && s.kind == SymbolKind::Import));
-        assert!(symbols.iter().any(|s| s.name == "Notifiable" && s.kind == SymbolKind::Import));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "HasFactory" && s.kind == SymbolKind::Import));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Notifiable" && s.kind == SymbolKind::Import));
 
         // Constant
-        assert!(symbols.iter().any(|s| s.name == "TABLE" && s.kind == SymbolKind::Constant));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "TABLE" && s.kind == SymbolKind::Constant));
 
         // Properties
-        assert!(symbols.iter().any(|s| s.name == "$name" && s.kind == SymbolKind::Property));
-        assert!(symbols.iter().any(|s| s.name == "$email" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "$name" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "$email" && s.kind == SymbolKind::Property));
 
         // Methods
-        assert!(symbols.iter().any(|s| s.name == "getName" && s.kind == SymbolKind::Function));
-        assert!(symbols.iter().any(|s| s.name == "findByEmail" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "getName" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "findByEmail" && s.kind == SymbolKind::Function));
     }
 }

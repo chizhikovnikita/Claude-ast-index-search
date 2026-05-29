@@ -63,9 +63,9 @@ fn rebuild(conn: &mut Connection, primary: &Path, extras: &[&Path]) {
     for extra in extras {
         db::add_extra_root(conn, &extra.to_string_lossy()).unwrap();
     }
-    indexer::index_directory_with_config(conn, primary, false, false, None, None).unwrap();
+    indexer::index_directory_with_config(conn, primary, false, false, None).unwrap();
     for extra in extras {
-        indexer::index_directory_with_config(conn, extra, false, false, None, None).unwrap();
+        indexer::index_directory_with_config(conn, extra, false, false, None).unwrap();
     }
 }
 
@@ -88,7 +88,10 @@ fn update_preserves_extra_root_files() {
     rebuild(&mut conn, primary, &[extra]);
 
     let files_before = count_files(&conn);
-    assert_eq!(files_before, 2, "expected both primary and extra files indexed");
+    assert_eq!(
+        files_before, 2,
+        "expected both primary and extra files indexed"
+    );
     assert!(has_file(&conn, "App.swift"));
     assert!(has_file(&conn, "pkgs/Lib.swift"));
 
@@ -99,7 +102,10 @@ fn update_preserves_extra_root_files() {
     assert_eq!(updated, 0);
     assert_eq!(changed, 0);
     assert_eq!(count_files(&conn), files_before);
-    assert!(has_file(&conn, "pkgs/Lib.swift"), "extra-root file disappeared after update");
+    assert!(
+        has_file(&conn, "pkgs/Lib.swift"),
+        "extra-root file disappeared after update"
+    );
 }
 
 /// Update must still detect a genuine deletion under an extra root.
@@ -181,7 +187,10 @@ fn update_skips_missing_extra_root() {
     let (_, _, deleted) =
         indexer::update_directory_incremental(&mut conn, primary, false, None, None).unwrap();
 
-    assert_eq!(deleted, 1, "files under the missing extra root should be marked deleted");
+    assert_eq!(
+        deleted, 1,
+        "files under the missing extra root should be marked deleted"
+    );
     assert!(has_file(&conn, "App.swift"));
     assert!(!has_file(&conn, "Lib.swift"));
 }
@@ -201,22 +210,34 @@ fn update_with_include_skips_files_outside_include() {
     // Pick an extension we definitely parse to keep the walker honest.
     assert!(parsers::is_supported_extension("rs"));
 
-    write_file(&primary.join("adfox/src/a.rs"),  "fn a() {}\n");
+    write_file(&primary.join("adfox/src/a.rs"), "fn a() {}\n");
     write_file(&primary.join("yabs/adfox/b.rs"), "fn b() {}\n");
     // Files outside the include — must NOT enter the index after update.
-    write_file(&primary.join("crypta/c.rs"),     "fn c() {}\n");
-    write_file(&primary.join("sim/d.rs"),        "fn d() {}\n");
+    write_file(&primary.join("crypta/c.rs"), "fn c() {}\n");
+    write_file(&primary.join("sim/d.rs"), "fn d() {}\n");
 
     let mut conn = open_fresh_db(primary);
 
     // Seed the DB with only the in-scope files, the way `rebuild` with
     // `include` would have left it.
     indexer::index_directory_scoped(
-        &mut conn, primary, &primary.join("adfox"), false, false, None, None,
-    ).unwrap();
+        &mut conn,
+        primary,
+        &primary.join("adfox"),
+        false,
+        false,
+        None,
+    )
+    .unwrap();
     indexer::index_directory_scoped(
-        &mut conn, primary, &primary.join("yabs/adfox"), false, false, None, None,
-    ).unwrap();
+        &mut conn,
+        primary,
+        &primary.join("yabs/adfox"),
+        false,
+        false,
+        None,
+    )
+    .unwrap();
 
     let before = count_files(&conn);
     assert_eq!(before, 2, "seed: both in-scope files indexed, nothing else");
@@ -229,8 +250,21 @@ fn update_with_include_skips_files_outside_include() {
         indexer::update_directory_incremental(&mut conn, primary, false, Some(&include), None)
             .unwrap();
 
-    assert_eq!(deleted, 0, "no in-scope files were removed; nothing should be deleted");
-    assert_eq!(count_files(&conn), 2, "update must not pull in crypta/ or sim/");
-    assert!(!has_file(&conn, "crypta/c.rs"), "crypta/ is outside include — must stay out");
-    assert!(!has_file(&conn, "sim/d.rs"),    "sim/ is outside include — must stay out");
+    assert_eq!(
+        deleted, 0,
+        "no in-scope files were removed; nothing should be deleted"
+    );
+    assert_eq!(
+        count_files(&conn),
+        2,
+        "update must not pull in crypta/ or sim/"
+    );
+    assert!(
+        !has_file(&conn, "crypta/c.rs"),
+        "crypta/ is outside include — must stay out"
+    );
+    assert!(
+        !has_file(&conn, "sim/d.rs"),
+        "sim/ is outside include — must stay out"
+    );
 }

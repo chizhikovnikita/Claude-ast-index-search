@@ -88,11 +88,7 @@ fn pcss_routes_through_css_parser() {
         ".card { color: red; }\n#root { padding: 0; }\n",
     )
     .unwrap();
-    fs::write(
-        root.join("other.postcss"),
-        ".other { color: blue; }\n",
-    )
-    .unwrap();
+    fs::write(root.join("other.postcss"), ".other { color: blue; }\n").unwrap();
 
     let mut conn = open_fresh_db(root);
     indexer::index_directory(&mut conn, root, false, false).unwrap();

@@ -1,12 +1,12 @@
 //! Tree-sitter based Rust parser
 
 use anyhow::Result;
-use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 use std::sync::LazyLock;
+use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
+use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
-use super::{LanguageParser, parse_tree, node_text, node_line, line_text};
 
 static RUST_LANGUAGE: LazyLock<Language> = LazyLock::new(|| tree_sitter_rust::LANGUAGE.into());
 
@@ -22,7 +22,9 @@ pub struct RustParser;
 /// Check if a name is ALL_CAPS (constant style)
 fn is_all_caps(name: &str) -> bool {
     !name.is_empty()
-        && name.chars().all(|c| c.is_uppercase() || c.is_ascii_digit() || c == '_')
+        && name
+            .chars()
+            .all(|c| c.is_uppercase() || c.is_ascii_digit() || c == '_')
         && name.chars().any(|c| c.is_uppercase())
 }
 
@@ -30,10 +32,24 @@ fn is_all_caps(name: &str) -> bool {
 fn is_significant_attr(name: &str) -> bool {
     matches!(
         name,
-        "test" | "bench" | "cfg" | "allow" | "warn" | "deny"
-            | "macro_export" | "inline" | "cold" | "must_use"
-            | "tokio" | "async_trait" | "proc_macro" | "proc_macro_derive"
-            | "serde" | "rocket" | "actix" | "axum"
+        "test"
+            | "bench"
+            | "cfg"
+            | "allow"
+            | "warn"
+            | "deny"
+            | "macro_export"
+            | "inline"
+            | "cold"
+            | "must_use"
+            | "tokio"
+            | "async_trait"
+            | "proc_macro"
+            | "proc_macro_derive"
+            | "serde"
+            | "rocket"
+            | "actix"
+            | "axum"
     )
 }
 
@@ -47,7 +63,10 @@ impl LanguageParser for RustParser {
         // Build capture name -> index map
         let capture_names = query.capture_names();
         let idx = |name: &str| -> Option<u32> {
-            capture_names.iter().position(|n| *n == name).map(|i| i as u32)
+            capture_names
+                .iter()
+                .position(|n| *n == name)
+                .map(|i| i as u32)
         };
 
         let idx_struct_name = idx("struct_name");
@@ -119,7 +138,9 @@ impl LanguageParser for RustParser {
                     let type_name = node_text(content, &type_cap.node);
                     let line = node_line(&trait_cap.node);
                     // Use the line of the impl keyword (parent node)
-                    let impl_line = trait_cap.node.parent()
+                    let impl_line = trait_cap
+                        .node
+                        .parent()
                         .map(|p| p.start_position().row + 1)
                         .unwrap_or(line);
                     symbols.push(ParsedSymbol {
@@ -137,7 +158,9 @@ impl LanguageParser for RustParser {
             if let Some(cap) = find_capture(m, idx_impl_self_type) {
                 let type_name = node_text(content, &cap.node);
                 let line = node_line(&cap.node);
-                let impl_line = cap.node.parent()
+                let impl_line = cap
+                    .node
+                    .parent()
                     .map(|p| p.start_position().row + 1)
                     .unwrap_or(line);
                 symbols.push(ParsedSymbol {
@@ -344,29 +367,39 @@ mod tests {
     fn test_parse_struct() {
         let content = "pub struct User {\n    pub id: u64,\n    pub name: String,\n}\n\nstruct PrivateData(i32);\n";
         let symbols = RUST_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "User" && s.kind == SymbolKind::Class));
-        assert!(symbols.iter().any(|s| s.name == "PrivateData" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "User" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "PrivateData" && s.kind == SymbolKind::Class));
     }
 
     #[test]
     fn test_parse_enum() {
         let content = "pub enum Status {\n    Active,\n    Inactive,\n}\n";
         let symbols = RUST_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "Status" && s.kind == SymbolKind::Enum));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Status" && s.kind == SymbolKind::Enum));
     }
 
     #[test]
     fn test_parse_trait() {
         let content = "pub trait Repository {\n    fn find(&self, id: u64) -> Option<User>;\n}\n";
         let symbols = RUST_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "Repository" && s.kind == SymbolKind::Interface));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Repository" && s.kind == SymbolKind::Interface));
     }
 
     #[test]
     fn test_parse_impl() {
         let content = "impl Repository for SqlUserRepository {\n    fn find(&self, id: u64) -> Option<User> {\n        None\n    }\n}\n\nimpl User {\n    pub fn new(name: String) -> Self {\n        Self { id: 0, name }\n    }\n}\n";
         let symbols = RUST_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "impl Repository for SqlUserRepository"));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "impl Repository for SqlUserRepository"));
         assert!(symbols.iter().any(|s| s.name == "impl User"));
     }
 
@@ -390,29 +423,42 @@ mod tests {
     fn test_parse_type_alias() {
         let content = "pub type UserId = u64;\ntype Result<T> = std::result::Result<T, Error>;\n";
         let symbols = RUST_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "UserId" && s.kind == SymbolKind::TypeAlias));
-        assert!(symbols.iter().any(|s| s.name == "Result" && s.kind == SymbolKind::TypeAlias));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "UserId" && s.kind == SymbolKind::TypeAlias));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Result" && s.kind == SymbolKind::TypeAlias));
     }
 
     #[test]
     fn test_parse_const_static() {
         let content = "pub const MAX_SIZE: usize = 1024;\nstatic GLOBAL_COUNTER: AtomicUsize = AtomicUsize::new(0);\n";
         let symbols = RUST_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "MAX_SIZE" && s.kind == SymbolKind::Constant));
-        assert!(symbols.iter().any(|s| s.name == "GLOBAL_COUNTER" && s.kind == SymbolKind::Constant));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "MAX_SIZE" && s.kind == SymbolKind::Constant));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "GLOBAL_COUNTER" && s.kind == SymbolKind::Constant));
     }
 
     #[test]
     fn test_parse_modules() {
         let content = "mod tests;\npub mod utils;\n";
         let symbols = RUST_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "tests" && s.kind == SymbolKind::Package));
-        assert!(symbols.iter().any(|s| s.name == "utils" && s.kind == SymbolKind::Package));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "tests" && s.kind == SymbolKind::Package));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "utils" && s.kind == SymbolKind::Package));
     }
 
     #[test]
     fn test_parse_derive() {
-        let content = "#[derive(Debug, Clone, Serialize)]\npub struct Config {\n    pub name: String,\n}\n";
+        let content =
+            "#[derive(Debug, Clone, Serialize)]\npub struct Config {\n    pub name: String,\n}\n";
         let symbols = RUST_PARSER.parse_symbols(content).unwrap();
         assert!(symbols.iter().any(|s| s.name == "#[derive(Debug)]"));
         assert!(symbols.iter().any(|s| s.name == "#[derive(Clone)]"));

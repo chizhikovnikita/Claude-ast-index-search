@@ -1,12 +1,12 @@
 //! Tree-sitter based Matlab parser
 
 use anyhow::Result;
-use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 use std::sync::LazyLock;
+use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
+use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
-use super::{LanguageParser, parse_tree, node_text, node_line, line_text};
 
 static MATLAB_LANGUAGE: LazyLock<Language> = LazyLock::new(|| tree_sitter_matlab::LANGUAGE.into());
 
@@ -28,7 +28,10 @@ impl LanguageParser for MatlabParser {
 
         let capture_names = query.capture_names();
         let idx = |name: &str| -> Option<u32> {
-            capture_names.iter().position(|n| *n == name).map(|i| i as u32)
+            capture_names
+                .iter()
+                .position(|n| *n == name)
+                .map(|i| i as u32)
         };
 
         let idx_class_name = idx("class_name");
@@ -166,7 +169,9 @@ mod tests {
     fn test_parse_function() {
         let content = "function result = myFunction(x, y)\n    result = x + y;\nend\n";
         let symbols = MATLAB_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "myFunction" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "myFunction" && s.kind == SymbolKind::Function));
     }
 
     #[test]
@@ -183,9 +188,15 @@ mod tests {
 end
 "#;
         let symbols = MATLAB_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "MyClass" && s.kind == SymbolKind::Class));
-        assert!(symbols.iter().any(|s| s.name == "Value" && s.kind == SymbolKind::Property));
-        assert!(symbols.iter().any(|s| s.name == "MyClass" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "MyClass" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Value" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "MyClass" && s.kind == SymbolKind::Function));
     }
 
     #[test]
@@ -204,8 +215,14 @@ end
 end
 "#;
         let symbols = MATLAB_PARSER.parse_symbols(content).unwrap();
-        let class = symbols.iter().find(|s| s.name == "Vehicle" && s.kind == SymbolKind::Class).unwrap();
-        assert!(class.parents.iter().any(|(name, kind)| name == "handle" && kind == "extends"));
+        let class = symbols
+            .iter()
+            .find(|s| s.name == "Vehicle" && s.kind == SymbolKind::Class)
+            .unwrap();
+        assert!(class
+            .parents
+            .iter()
+            .any(|(name, kind)| name == "handle" && kind == "extends"));
     }
 
     #[test]
@@ -217,9 +234,15 @@ end
 end
 "#;
         let symbols = MATLAB_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "Red" && s.kind == SymbolKind::Constant));
-        assert!(symbols.iter().any(|s| s.name == "Green" && s.kind == SymbolKind::Constant));
-        assert!(symbols.iter().any(|s| s.name == "Blue" && s.kind == SymbolKind::Constant));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Red" && s.kind == SymbolKind::Constant));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Green" && s.kind == SymbolKind::Constant));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Blue" && s.kind == SymbolKind::Constant));
     }
 
     #[test]
@@ -232,8 +255,12 @@ end
 end
 "#;
         let symbols = MATLAB_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "ButtonPressed" && s.kind == SymbolKind::Property));
-        assert!(symbols.iter().any(|s| s.name == "ButtonReleased" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "ButtonPressed" && s.kind == SymbolKind::Property));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "ButtonReleased" && s.kind == SymbolKind::Property));
     }
 
     #[test]
@@ -247,15 +274,24 @@ end
 end
 "#;
         let symbols = MATLAB_PARSER.parse_symbols(content).unwrap();
-        let method = symbols.iter().find(|s| s.name == "add" && s.kind == SymbolKind::Function).unwrap();
-        assert!(method.parents.iter().any(|(name, kind)| name == "Calculator" && kind == "member_of"));
+        let method = symbols
+            .iter()
+            .find(|s| s.name == "add" && s.kind == SymbolKind::Function)
+            .unwrap();
+        assert!(method
+            .parents
+            .iter()
+            .any(|(name, kind)| name == "Calculator" && kind == "member_of"));
     }
 
     #[test]
     fn test_standalone_function() {
         let content = "function y = helper(x)\n    y = x * 2;\nend\n";
         let symbols = MATLAB_PARSER.parse_symbols(content).unwrap();
-        let func = symbols.iter().find(|s| s.name == "helper" && s.kind == SymbolKind::Function).unwrap();
+        let func = symbols
+            .iter()
+            .find(|s| s.name == "helper" && s.kind == SymbolKind::Function)
+            .unwrap();
         assert!(func.parents.is_empty());
     }
 }

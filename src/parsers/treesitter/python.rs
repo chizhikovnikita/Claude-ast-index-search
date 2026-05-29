@@ -1,12 +1,12 @@
 //! Tree-sitter based Python parser
 
 use anyhow::Result;
-use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 use std::sync::LazyLock;
+use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
+use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
-use super::{LanguageParser, parse_tree, node_text, node_line, line_text};
 
 static PY_LANGUAGE: LazyLock<Language> = LazyLock::new(|| tree_sitter_python::LANGUAGE.into());
 
@@ -28,7 +28,10 @@ impl LanguageParser for PythonParser {
 
         let capture_names = query.capture_names();
         let idx = |name: &str| -> Option<u32> {
-            capture_names.iter().position(|n| *n == name).map(|i| i as u32)
+            capture_names
+                .iter()
+                .position(|n| *n == name)
+                .map(|i| i as u32)
         };
 
         let idx_import_name = idx("import_name");
@@ -110,7 +113,11 @@ impl LanguageParser for PythonParser {
                     parents: vec![],
                 });
 
-                for cap in m.captures.iter().filter(|c| Some(c.index) == idx_import_from_name) {
+                for cap in m
+                    .captures
+                    .iter()
+                    .filter(|c| Some(c.index) == idx_import_from_name)
+                {
                     let item = node_text(content, &cap.node);
                     if item != "*" {
                         symbols.push(ParsedSymbol {
@@ -282,7 +289,13 @@ impl LanguageParser for PythonParser {
 
                 if let Some(val_cap) = find_capture(m, idx_assignment_value) {
                     let val = node_text(content, &val_cap.node);
-                    if is_type_alias_value(val) && name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                    if is_type_alias_value(val)
+                        && name
+                            .chars()
+                            .next()
+                            .map(|c| c.is_uppercase())
+                            .unwrap_or(false)
+                    {
                         symbols.push(ParsedSymbol {
                             name: name.to_string(),
                             kind: SymbolKind::TypeAlias,
@@ -332,8 +345,14 @@ fn parse_python_parents(content: &str, node: &tree_sitter::Node) -> Vec<(String,
 
 fn is_constant_name(name: &str) -> bool {
     !name.is_empty()
-        && name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
-        && name.chars().all(|c| c.is_uppercase() || c.is_ascii_digit() || c == '_')
+        && name
+            .chars()
+            .next()
+            .map(|c| c.is_uppercase())
+            .unwrap_or(false)
+        && name
+            .chars()
+            .all(|c| c.is_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
 fn is_type_alias_value(val: &str) -> bool {
@@ -371,34 +390,54 @@ mod tests {
     fn test_parse_class() {
         let content = "class MyClass:\n    pass\n\nclass ChildClass(ParentClass):\n    pass\n";
         let symbols = PYTHON_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "MyClass" && s.kind == SymbolKind::Class));
-        assert!(symbols.iter().any(|s| s.name == "ChildClass" && s.parents.iter().any(|(p, _)| p == "ParentClass")));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "MyClass" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "ChildClass" && s.parents.iter().any(|(p, _)| p == "ParentClass")));
     }
 
     #[test]
     fn test_parse_functions() {
         let content = "def handle(request, context):\n    pass\n\nasync def async_handler(request):\n    pass\n";
         let symbols = PYTHON_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "handle" && s.kind == SymbolKind::Function));
-        assert!(symbols.iter().any(|s| s.name == "async_handler" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "handle" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "async_handler" && s.kind == SymbolKind::Function));
     }
 
     #[test]
     fn test_parse_imports() {
         let content = "import logging\nfrom driver_referrals.common import db\nfrom typing import Optional, List\n";
         let symbols = PYTHON_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "logging" && s.kind == SymbolKind::Import));
-        assert!(symbols.iter().any(|s| s.name == "driver_referrals.common" && s.kind == SymbolKind::Import));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "logging" && s.kind == SymbolKind::Import));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "driver_referrals.common" && s.kind == SymbolKind::Import));
     }
 
     #[test]
     fn test_parse_import_alias() {
         let content = "import sqlalchemy as sa\nimport numpy as np\n";
         let symbols = PYTHON_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "sqlalchemy" && s.kind == SymbolKind::Import));
-        assert!(symbols.iter().any(|s| s.name == "sa" && s.kind == SymbolKind::Import));
-        assert!(symbols.iter().any(|s| s.name == "numpy" && s.kind == SymbolKind::Import));
-        assert!(symbols.iter().any(|s| s.name == "np" && s.kind == SymbolKind::Import));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "sqlalchemy" && s.kind == SymbolKind::Import));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "sa" && s.kind == SymbolKind::Import));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "numpy" && s.kind == SymbolKind::Import));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "np" && s.kind == SymbolKind::Import));
     }
 
     #[test]
@@ -414,17 +453,27 @@ mod tests {
     fn test_parse_constants() {
         let content = "MAX_RETRIES = 5\nDEFAULT_TIMEOUT = 30\nAPI_KEY = \"secret\"\n";
         let symbols = PYTHON_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "MAX_RETRIES" && s.kind == SymbolKind::Constant));
-        assert!(symbols.iter().any(|s| s.name == "DEFAULT_TIMEOUT" && s.kind == SymbolKind::Constant));
-        assert!(symbols.iter().any(|s| s.name == "API_KEY" && s.kind == SymbolKind::Constant));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "MAX_RETRIES" && s.kind == SymbolKind::Constant));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "DEFAULT_TIMEOUT" && s.kind == SymbolKind::Constant));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "API_KEY" && s.kind == SymbolKind::Constant));
     }
 
     #[test]
     fn test_parse_type_aliases() {
         let content = "UserList = List[User]\nCallback = Callable[[str], None]\n";
         let symbols = PYTHON_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "UserList" && s.kind == SymbolKind::TypeAlias));
-        assert!(symbols.iter().any(|s| s.name == "Callback" && s.kind == SymbolKind::TypeAlias));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "UserList" && s.kind == SymbolKind::TypeAlias));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Callback" && s.kind == SymbolKind::TypeAlias));
     }
 
     #[test]
@@ -456,7 +505,11 @@ mod tests {
     fn test_async_functions() {
         let content = "async def fetch_data(url) -> str:\n    pass\n\nasync def process_event(event):\n    pass\n";
         let symbols = PYTHON_PARSER.parse_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "fetch_data" && s.kind == SymbolKind::Function));
-        assert!(symbols.iter().any(|s| s.name == "process_event" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "fetch_data" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "process_event" && s.kind == SymbolKind::Function));
     }
 }
