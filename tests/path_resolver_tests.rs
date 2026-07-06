@@ -111,7 +111,11 @@ fn resolve_with_root_disambiguates_colliding_paths() {
     fs::write(primary.path().join(rel), "primary").unwrap();
     fs::write(extra.path().join(rel), "extra").unwrap();
 
-    let resolver = PathResolver::from_conn(primary.path(), &conn);
+    // Decoration off: this test checks *which* copy the root hint resolves
+    // to, not display formatting. Broken upstream too: add_extra_root now
+    // auto-registers a named subtree, and default text-mode decoration
+    // prefixes the path with `[name] `.
+    let resolver = PathResolver::from_conn(primary.path(), &conn).with_decoration(false);
     let resolved =
         resolver.resolve_with_root(rel, Some(&db::normalize_root_for_storage(extra.path())));
 
