@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use colored::Colorize;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -25,6 +26,7 @@ Index Management:
   watch                  Watch for file changes and auto-update
 
 Search & Navigation:
+  explore                Ranked relevant symbols' source + neighbours + tests (one-shot; --rwr for graph)
   search                 Universal search (files + symbols)
   file                   Find files by name
   symbol                 Find symbols (classes, interfaces, functions)
@@ -115,6 +117,19 @@ struct Cli {
     /// AST_INDEX_WALK_UP=1.
     #[arg(long, global = true)]
     walk_up: bool,
+
+    /// Restrict search/listing commands to a single named subtree.
+    /// Use `subtree list` to discover names. Conflicts with `--local`.
+    /// May trim the result below `--limit` because the cap is applied to
+    /// the unfiltered SQL query.
+    #[arg(long, global = true)]
+    subtree: Option<String>,
+
+    /// Restrict search/listing commands to the primary project root
+    /// (files indexed from the current directory; ignore all named
+    /// subtrees for this run). Conflicts with `--subtree`.
+    #[arg(long, global = true)]
+    local: bool,
 }
 
 #[derive(Subcommand)]
@@ -253,7 +268,7 @@ enum Commands {
         /// Verbose logging with timing for each step
         #[arg(long, short)]
         verbose: bool,
-        /// Experimental: use more aggressive rebuild heuristics (parallel side-index phases, higher update parallelism, and large-monorepo shortcuts)
+        /// Compatibility flag; fast rebuild heuristics are now enabled by default
         #[arg(long)]
         experimental_fast_rebuild: bool,
         /// Number of parallel threads (default: CPU cores, max 8; increase for network filesystems)
@@ -270,6 +285,20 @@ enum Commands {
         /// Additional paths to index (can be specified multiple times).
         #[arg(long = "path")]
         paths: Vec<String>,
+        /// Bypass the candidate-file cap (AST_INDEX_MAX_FILES) for this run.
+        /// Use when you really want to index a monorepo / VCS root that
+        /// would otherwise be aborted with an oversize warning.
+        #[arg(long)]
+        force: bool,
+        /// Persist the cap bypass for this project, so future
+        /// `ast-index rebuild` runs on the same root no longer abort.
+        /// Requires `--force` to take effect.
+        #[arg(long)]
+        remember: bool,
+        /// Override the candidate-file cap for this run only.
+        /// Default 2_000_000; set to 0 to disable. See AST_INDEX_MAX_FILES.
+        #[arg(long = "max-files")]
+        max_files: Option<usize>,
     },
     /// Update index (incremental)
     Update {
@@ -479,6 +508,18 @@ enum Commands {
         #[arg(short, long, default_value = "20")]
         limit: usize,
     },
+    /// Explore an area: ranked relevant symbols' source + tests, in one shot
+    Explore {
+        /// Query: natural-language question or a bag of symbol/file names
+        #[arg(required = true, num_args = 1..)]
+        query: Vec<String>,
+        /// Max source files to include
+        #[arg(short = 'f', long, default_value = "6")]
+        max_files: usize,
+        /// Stage B: re-rank by RWR over an in-memory call/inheritance graph
+        #[arg(long)]
+        rwr: bool,
+    },
     /// Find usages of a symbol
     Usages {
         /// Symbol name
@@ -641,7 +682,7 @@ enum Commands {
         #[arg(short, long, default_value = "50")]
         limit: usize,
     },
-    /// Add additional source root to project
+    /// Add additional source root to project (legacy; prefer `subtree add`)
     AddRoot {
         /// Path to add as source root
         path: String,
@@ -649,13 +690,18 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
-    /// Remove source root from project
+    /// Remove source root from project (legacy; prefer `subtree remove`)
     RemoveRoot {
         /// Path to remove
         path: String,
     },
-    /// List configured source roots
+    /// List configured source roots (legacy; prefer `subtree list`)
     ListRoots,
+    /// Manage named workspace subtrees attached to this project
+    Subtree {
+        #[command(subcommand)]
+        action: SubtreeAction,
+    },
     /// Watch for file changes and auto-update index
     Watch,
     /// Clear index database for current project
@@ -667,6 +713,17 @@ enum Commands {
     /// Register ast-index MCP server in Codex
     InstallCodexMcp {
         /// Print the Codex command and config fallback without changing Codex config
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Detect every stack present in the current project root by marker files
+    DetectStacks,
+    /// Install git hooks that auto-update the index on checkout / merge / rewrite
+    InstallGitHooks {
+        /// Overwrite existing ast-index hook scripts
+        #[arg(long)]
+        force: bool,
+        /// Print the hook script paths and contents without writing anything
         #[arg(long)]
         dry_run: bool,
     },
@@ -696,8 +753,48 @@ enum Commands {
     Schema,
 }
 
+#[derive(Subcommand)]
+enum SubtreeAction {
+    /// Attach a named subtree to this project (the path may be relative or absolute)
+    Add {
+        /// Short human-friendly name shown in CLI output and used with `--subtree`
+        name: String,
+        /// Path to attach (relative to the current directory or absolute)
+        path: String,
+        /// Allow attaching a subtree that overlaps with the project root
+        #[arg(long)]
+        force: bool,
+    },
+    /// Detach a subtree by name
+    Remove {
+        /// Subtree name (use `subtree list` to discover existing names)
+        name: String,
+    },
+    /// List every subtree attached to this project
+    List,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // Export the chosen output format so deeply-nested helpers (PathResolver,
+    // formatters in subagents) can branch on text vs JSON without us
+    // threading `format` through every signature.
+    std::env::set_var("AST_INDEX_FORMAT", cli.format.as_str());
+    // Conflict guard: --subtree and --local both narrow the workspace, but
+    // they narrow it differently, so combining them is meaningless.
+    if cli.subtree.is_some() && cli.local {
+        eprintln!(
+            "{}",
+            "Error: --subtree and --local are mutually exclusive."
+        );
+        std::process::exit(2);
+    }
+    if let Some(name) = &cli.subtree {
+        std::env::set_var("AST_INDEX_SUBTREE", name);
+    }
+    if cli.local {
+        std::env::set_var("AST_INDEX_LOCAL_SCOPE", "1");
+    }
     // Walk-up is opt-in via CLI flag OR AST_INDEX_WALK_UP env var. CLI wins.
     let walk_up = cli.walk_up
         || std::env::var("AST_INDEX_WALK_UP")
@@ -788,9 +885,26 @@ fn main() -> Result<()> {
             include,
             exclude,
             paths,
+            force,
+            remember,
+            max_files,
         } => {
             if let Some(t) = threads {
                 std::env::set_var("AST_INDEX_THREADS", t.to_string());
+            }
+            // Convert per-run flags → env vars so they reach the walker
+            // without threading them through six function signatures.
+            if force {
+                std::env::set_var("AST_INDEX_MAX_FILES", "0");
+            } else if let Some(n) = max_files {
+                std::env::set_var("AST_INDEX_MAX_FILES", n.to_string());
+            }
+            if remember && force {
+                std::env::set_var("AST_INDEX_REMEMBER_BYPASS", "1");
+            } else if remember && !force {
+                eprintln!(
+                    "[ast-index] --remember has no effect without --force; ignoring"
+                );
             }
             commands::management::cmd_rebuild(
                 &root,
@@ -896,6 +1010,11 @@ fn main() -> Result<()> {
         Commands::Refs { symbol, limit } => {
             commands::index::cmd_refs(&root, &symbol, limit, format)
         }
+        Commands::Explore {
+            query,
+            max_files,
+            rwr,
+        } => commands::explore::cmd_explore(&root, &query, max_files, rwr, format),
         Commands::Hierarchy {
             name,
             in_file,
@@ -964,7 +1083,7 @@ fn main() -> Result<()> {
             pattern,
             exact,
             limit,
-        } => commands::files::cmd_file(&root, &pattern, exact, limit),
+        } => commands::files::cmd_file(&root, &pattern, exact, limit, format),
         Commands::Outline { file } => commands::files::cmd_outline(&root, &file),
         Commands::Imports { file } => commands::files::cmd_imports(&root, &file),
         Commands::Api { module_path, limit } => {
@@ -1062,7 +1181,16 @@ fn main() -> Result<()> {
             commands::management::cmd_add_root(&root, &path, force)
         }
         Commands::RemoveRoot { path } => commands::management::cmd_remove_root(&root, &path),
-        Commands::ListRoots => commands::management::cmd_list_roots(&root),
+        Commands::ListRoots => commands::management::cmd_list_roots(&root, format),
+        Commands::Subtree { action } => match action {
+            SubtreeAction::Add { name, path, force } => {
+                commands::management::cmd_subtree_add(&root, &name, &path, force, format)
+            }
+            SubtreeAction::Remove { name } => {
+                commands::management::cmd_subtree_remove(&root, &name, format)
+            }
+            SubtreeAction::List => commands::management::cmd_subtree_list(&root, format),
+        },
         Commands::Watch => commands::watch::cmd_watch(&root),
         Commands::Clear => commands::management::cmd_clear(&root),
         Commands::Version => {
@@ -1071,6 +1199,10 @@ fn main() -> Result<()> {
         }
         Commands::InstallClaudePlugin => cmd_install_claude_plugin(),
         Commands::InstallCodexMcp { dry_run } => cmd_install_codex_mcp(&root, dry_run),
+        Commands::DetectStacks => cmd_detect_stacks(&root, format),
+        Commands::InstallGitHooks { force, dry_run } => {
+            cmd_install_git_hooks(&root, force, dry_run)
+        }
         // Programmatic access
         Commands::Agrep {
             pattern,
@@ -1158,9 +1290,7 @@ impl CodexMcpInstall {
                 resolve_ast_index_mcp_bin_from(&current_exe, path_env.as_ref()).map_err(|_| err)
             }
         })?;
-        let project_root = project_root
-            .canonicalize()
-            .unwrap_or_else(|_| project_root.to_path_buf());
+        let project_root = db::safe_canonicalize(project_root);
 
         Ok(Self {
             project_root,
@@ -1238,6 +1368,158 @@ fn cmd_install_codex_mcp(root: &Path, dry_run: bool) -> Result<()> {
 fn print_codex_fallback(install: &CodexMcpInstall) {
     eprintln!("\nAdd this to ~/.codex/config.toml manually:");
     eprintln!("{}", install.fallback_config_toml());
+}
+
+fn cmd_detect_stacks(root: &Path, format: &str) -> Result<()> {
+    let detection = ast_index::indexer::detect_stacks(root);
+
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&detection)?);
+        return Ok(());
+    }
+
+    if detection.stacks.is_empty() {
+        println!("{}", "No known project stacks detected at this root.".yellow());
+        println!(
+            "Markers checked: settings.gradle*, package.json, Cargo.toml, Package.swift, \
+             go.mod, pyproject.toml, Gemfile, composer.json, *.csproj, build.sbt, build.zig, \
+             CMakeLists.txt, Makefile.PL, pubspec.yaml."
+        );
+        return Ok(());
+    }
+
+    let kind = if detection.is_kmp {
+        "Kotlin Multiplatform"
+    } else if detection.is_polyglot {
+        "Polyglot / monorepo"
+    } else {
+        "Single-stack"
+    };
+    println!("Detected setup: {}", kind.bold());
+    println!();
+    for stack in &detection.stacks {
+        println!("  {} ({})", stack.label.cyan(), stack.kind);
+        for marker in &stack.markers {
+            println!("    - {}", marker.dimmed());
+        }
+    }
+    Ok(())
+}
+
+fn cmd_install_git_hooks(root: &Path, force: bool, dry_run: bool) -> Result<()> {
+    let git_dir = resolve_git_hooks_dir(root)?;
+    let events = ["post-checkout", "post-merge", "post-rewrite"];
+    let script_body = git_hook_script();
+
+    if dry_run {
+        println!("Would write the following hooks under {}:", git_dir.display());
+        for event in events {
+            println!("\n=== {} ===", event);
+            println!("{}", script_body);
+        }
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(&git_dir)?;
+    let mut wrote = 0;
+    let mut skipped: Vec<String> = Vec::new();
+    for event in events {
+        let path = git_dir.join(event);
+        if path.exists() && !force {
+            if let Ok(existing) = std::fs::read_to_string(&path) {
+                if existing.contains(GIT_HOOK_MARKER) {
+                    skipped.push(event.to_string());
+                    continue;
+                }
+            }
+            eprintln!(
+                "Hook {} already exists; rerun with --force to overwrite.",
+                path.display()
+            );
+            continue;
+        }
+        std::fs::write(&path, &script_body)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms)?;
+        }
+        wrote += 1;
+    }
+
+    println!(
+        "{}",
+        format!(
+            "Installed {} hook(s) into {}.",
+            wrote,
+            git_dir.display()
+        )
+        .green()
+    );
+    if !skipped.is_empty() {
+        println!(
+            "{}",
+            format!(
+                "Already installed (skipped): {}",
+                skipped.join(", ")
+            )
+            .dimmed()
+        );
+    }
+    println!("Each hook runs `ast-index update` in the background after the git operation.");
+    Ok(())
+}
+
+const GIT_HOOK_MARKER: &str = "# ast-index git hook";
+
+fn git_hook_script() -> String {
+    format!(
+        "#!/usr/bin/env bash\n\
+         {}\n\
+         # Auto-installed by `ast-index install-git-hooks`.\n\
+         # Re-run that command with --force to update this script.\n\
+         set -u\n\
+         if ! command -v ast-index >/dev/null 2>&1; then\n\
+           exit 0\n\
+         fi\n\
+         # Skip if a watcher is already running for this tree.\n\
+         if pgrep -f \"ast-index watch\" >/dev/null 2>&1; then\n\
+           exit 0\n\
+         fi\n\
+         (ast-index update >/dev/null 2>&1 &) >/dev/null 2>&1\n\
+         exit 0\n",
+        GIT_HOOK_MARKER
+    )
+}
+
+fn resolve_git_hooks_dir(root: &Path) -> Result<PathBuf> {
+    let git_path = root.join(".git");
+    if git_path.is_dir() {
+        return Ok(git_path.join("hooks"));
+    }
+    if git_path.is_file() {
+        // Worktree / submodule: .git is a file containing `gitdir: <path>`.
+        let content = std::fs::read_to_string(&git_path)
+            .with_context(|| format!("could not read {}", git_path.display()))?;
+        for line in content.lines() {
+            if let Some(rest) = line.strip_prefix("gitdir:") {
+                let raw = rest.trim();
+                let candidate = Path::new(raw);
+                let real = if candidate.is_absolute() {
+                    candidate.to_path_buf()
+                } else {
+                    root.join(candidate)
+                };
+                return Ok(real.join("hooks"));
+            }
+        }
+    }
+    Err(anyhow::anyhow!(
+        "{} is not a git repository — `.git` not found.",
+        root.display()
+    ))
 }
 
 fn resolve_ast_index_bin_from(

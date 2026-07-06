@@ -5,6 +5,7 @@
 //! - update: Incrementally update the index
 //! - stats: Show index statistics
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -37,9 +38,9 @@ fn report_encoding_summary() {
 
 /// File count threshold for auto-switching to sub-projects mode
 const AUTO_SUB_PROJECTS_THRESHOLD: usize = 65_000;
-/// In experimental fast rebuild mode, a root with this many sub-projects is
-/// treated as a monorepo immediately and skips the expensive quick file count.
-const EXPERIMENTAL_SUB_PROJECTS_SHORTCUT_THRESHOLD: usize = 20;
+/// A root with this many sub-projects is treated as a monorepo immediately and
+/// skips the expensive quick file count.
+const SUB_PROJECTS_SHORTCUT_THRESHOLD: usize = 20;
 
 pub(crate) struct ScopedEnvVar {
     key: &'static str,
@@ -107,6 +108,71 @@ fn build_exclude_matcher(
     gb.build().ok()
 }
 
+fn snapshot_subtrees(root: &Path, verbose: bool) -> Result<Vec<db::Subtree>> {
+    if !db::db_exists(root) {
+        return Ok(Vec::new());
+    }
+    if verbose {
+        eprintln!("[verbose] reading subtrees from existing DB...");
+    }
+    let old_conn = db::open_db(root)?;
+    // Side-effect: migrates any pre-3.47 `metadata.extra_roots` JSON into
+    // the subtrees table so list_subtrees below sees everything.
+    db::get_extra_roots(&old_conn).ok();
+    db::list_subtrees(&old_conn)
+}
+
+fn attach_rebuild_subtrees(
+    conn: &rusqlite::Connection,
+    root: &Path,
+    saved_subtrees: &[db::Subtree],
+    config_roots: Option<&[String]>,
+    extra_paths: &[String],
+    verbose: bool,
+) -> Result<()> {
+    let mut taken_canonicals: HashSet<String> = HashSet::new();
+    for sub in saved_subtrees {
+        db::insert_subtree(conn, &sub.name, &sub.canonical_path, &sub.original_path)?;
+        taken_canonicals.insert(sub.canonical_path.clone());
+    }
+
+    // Append config-supplied roots and CLI `--path` args. Each new path
+    // gets an auto-allocated subtree name (basename, with `-N` suffix on
+    // collision). Paths that already match an existing subtree by their
+    // canonical form are deduplicated.
+    let mut attach_extra = |raw: &str, label: &str| -> Result<()> {
+        let candidate = if std::path::Path::new(raw).is_absolute() {
+            std::path::PathBuf::from(raw)
+        } else {
+            root.join(raw)
+        };
+        let canonical = db::safe_canonicalize(&candidate)
+            .to_string_lossy()
+            .into_owned();
+        if taken_canonicals.contains(&canonical) {
+            return Ok(());
+        }
+        let preferred = db::default_subtree_name(&canonical);
+        let name = db::allocate_subtree_name(conn, &preferred)?;
+        db::insert_subtree(conn, &name, &canonical, raw)?;
+        taken_canonicals.insert(canonical);
+        if verbose {
+            eprintln!("[verbose] attached {}: {}", label, raw);
+        }
+        Ok(())
+    };
+
+    if let Some(config_roots) = config_roots {
+        for cr in config_roots {
+            attach_extra(cr, "config root")?;
+        }
+    }
+    for p in extra_paths {
+        attach_extra(p, "--path")?;
+    }
+    Ok(())
+}
+
 /// Rebuild the index (full or partial)
 pub fn cmd_rebuild(
     root: &Path,
@@ -132,7 +198,14 @@ pub fn cmd_rebuild(
             "[verbose] index_type={}, index_deps={}, no_ignore={}, sub_projects={}",
             index_type, index_deps, no_ignore, sub_projects
         );
-        eprintln!("[verbose] db path: {:?}", db::get_db_path(root).ok());
+        // Each line below is a separate verbose checkpoint so that a future
+        // "hangs after X" report points to the exact failing syscall.
+        eprintln!("[verbose] resolving db path...");
+    }
+    let db_path_lookup = db::get_db_path(root).ok();
+    if verbose {
+        eprintln!("[verbose] db path: {:?}", db_path_lookup);
+        eprintln!("[verbose] loading .ast-index.yaml...");
     }
 
     // Load project config (.ast-index.yaml)
@@ -197,6 +270,8 @@ pub fn cmd_rebuild(
             experimental_fast_rebuild,
             config_exclude.as_deref(),
             config_include.as_deref(),
+            config_roots.as_deref(),
+            extra_paths,
             exclude_matcher.as_ref(),
         );
     }
@@ -236,18 +311,18 @@ pub fn cmd_rebuild(
                 experimental_fast_rebuild,
                 config_exclude.as_deref(),
                 config_include.as_deref(),
+                config_roots.as_deref(),
+                extra_paths,
                 exclude_matcher.as_ref(),
             );
         }
 
         if subs.len() >= 2 {
-            if experimental_fast_rebuild
-                && subs.len() >= EXPERIMENTAL_SUB_PROJECTS_SHORTCUT_THRESHOLD
-            {
+            if subs.len() >= SUB_PROJECTS_SHORTCUT_THRESHOLD {
                 eprintln!(
                     "{}",
                     format!(
-                        "Experimental fast rebuild: detected {} sub-projects — skipping quick file count and switching to sub-projects mode",
+                        "Detected {} sub-projects — skipping quick file count and switching to sub-projects mode",
                         subs.len()
                     ).yellow()
                 );
@@ -260,6 +335,8 @@ pub fn cmd_rebuild(
                     experimental_fast_rebuild,
                     config_exclude.as_deref(),
                     config_include.as_deref(),
+                    config_roots.as_deref(),
+                    extra_paths,
                     exclude_matcher.as_ref(),
                 );
             }
@@ -296,6 +373,8 @@ pub fn cmd_rebuild(
                     experimental_fast_rebuild,
                     config_exclude.as_deref(),
                     config_include.as_deref(),
+                    config_roots.as_deref(),
+                    extra_paths,
                     exclude_matcher.as_ref(),
                 );
             }
@@ -314,38 +393,40 @@ pub fn cmd_rebuild(
         eprintln!("[verbose] lock acquired in {:?}", t.elapsed());
     }
 
-    // Save extra roots before deleting DB
-    let saved_extra_roots = if db::db_exists(root) {
-        if verbose {
-            eprintln!("[verbose] reading extra roots from existing DB...");
-        }
-        let old_conn = db::open_db(root)?;
-        db::get_extra_roots(&old_conn).unwrap_or_default()
-    } else {
-        vec![]
-    };
+    // Save subtree triples (name + canonical_path + original_path) before
+    // swapping the old DB aside. Going through `get_extra_roots` (legacy
+    // shim) would collapse each row to a bare canonical path string and
+    // lose the user-chosen name + original (relative) path form on every
+    // rebuild — re-importing them as `<basename>` and `original=canonical`.
+    let saved_subtrees = snapshot_subtrees(root, verbose)?;
 
-    // Delete DB file entirely to avoid WAL hangs
+    // Swap the live DB aside instead of deleting it outright. The guard
+    // restores the swap if rebuild fails (walker cap aborted, IO error,
+    // anything that propagates an Err) so the user never loses a working
+    // index because of a failed rebuild attempt.
     if verbose {
-        eprintln!("[verbose] deleting old DB...");
+        eprintln!("[verbose] swapping old DB aside...");
     }
     let t = Instant::now();
-    if let Err(e) = db::delete_db(root) {
-        eprintln!(
-            "{}",
-            format!("Warning: could not delete old index: {}", e).yellow()
-        );
-        if let Ok(db_path) = db::get_db_path(root) {
+    let swap_guard = match db::RebuildSwap::begin(root) {
+        Ok(g) => g,
+        Err(e) => {
             eprintln!(
-                "Cache path: {}",
-                db_path.parent().unwrap_or(db_path.as_path()).display()
+                "{}",
+                format!("Warning: could not move old index aside: {}", e).yellow()
             );
-            eprintln!("Try manually removing the cache directory and re-running rebuild.");
+            if let Ok(db_path) = db::get_db_path(root) {
+                eprintln!(
+                    "Cache path: {}",
+                    db_path.parent().unwrap_or(db_path.as_path()).display()
+                );
+                eprintln!("Try manually removing the cache directory and re-running rebuild.");
+            }
+            return Err(e);
         }
-        return Err(e);
-    }
+    };
     if verbose {
-        eprintln!("[verbose] DB deleted in {:?}", t.elapsed());
+        eprintln!("[verbose] DB swapped in {:?}", t.elapsed());
     }
 
     // Remove old kotlin-index cache dir entirely
@@ -361,48 +442,16 @@ pub fn cmd_rebuild(
         eprintln!("[verbose] DB opened + schema created in {:?}", t.elapsed());
     }
 
-    // Merge config roots + saved extra roots + CLI --path args
-    let mut all_extra_roots = saved_extra_roots;
-    if let Some(ref config_roots) = config_roots {
-        for cr in config_roots {
-            let resolved = if std::path::Path::new(cr).is_absolute() {
-                cr.clone()
-            } else {
-                root.join(cr)
-                    .canonicalize()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| root.join(cr).to_string_lossy().to_string())
-            };
-            if !all_extra_roots.contains(&resolved) {
-                all_extra_roots.push(resolved);
-            }
-        }
-    }
-    for p in extra_paths {
-        let resolved = if std::path::Path::new(p).is_absolute() {
-            p.clone()
-        } else {
-            root.join(p)
-                .canonicalize()
-                .map(|pp| pp.to_string_lossy().to_string())
-                .unwrap_or_else(|_| root.join(p).to_string_lossy().to_string())
-        };
-        if !all_extra_roots.contains(&resolved) {
-            if verbose {
-                eprintln!("[verbose] adding --path: {}", resolved);
-            }
-            all_extra_roots.push(resolved);
-        }
-    }
-
-    // Restore extra roots
-    if !all_extra_roots.is_empty() {
-        let roots_json = serde_json::to_string(&all_extra_roots)?;
-        conn.execute(
-            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('extra_roots', ?1)",
-            [&roots_json],
-        )?;
-    }
+    // Reattach saved subtrees verbatim so user-chosen names and the
+    // original path form (relative vs absolute) survive the rebuild.
+    attach_rebuild_subtrees(
+        &conn,
+        root,
+        &saved_subtrees,
+        config_roots.as_deref(),
+        extra_paths,
+        verbose,
+    )?;
 
     // Store no_ignore setting in database metadata
     if no_ignore {
@@ -416,11 +465,32 @@ pub fn cmd_rebuild(
             "Including gitignored files (build/, etc.)...".yellow()
         );
     }
+    // Persist the cap bypass when the user passed `--force --remember`.
+    // Set early so the walker (called below) already sees `bypass_size_check`
+    // in metadata and doesn't trip the cap on this very run.
+    if std::env::var("AST_INDEX_REMEMBER_BYPASS").is_ok() {
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('bypass_size_check', '1')",
+            [],
+        )
+        .ok();
+        println!(
+            "{}",
+            "Persisted --force opt-in for this project. Future `rebuild` runs \
+             will not hit the candidate-file cap on this root."
+                .green()
+        );
+    }
     db::set_experimental_fast_rebuild_enabled(&conn, experimental_fast_rebuild).ok();
 
     // Check actual platform markers for mixed mobile repos.
-    let is_ios = indexer::has_ios_markers(root);
-    let is_android = indexer::has_android_markers(root);
+    //
+    // Marker check covers the canonical case (build.gradle / Package.swift
+    // at the root). Both flags are promoted below from walker output as well
+    // — a monorepo where the marker lives one level deeper still gets its
+    // resources / storyboards indexed.
+    let mut is_ios = indexer::has_ios_markers(root);
+    let mut is_android = indexer::has_android_markers(root);
 
     match index_type {
         "all" => {
@@ -443,6 +513,15 @@ pub fn cmd_rebuild(
                     file_count,
                     t.elapsed()
                 );
+            }
+
+            // Promote platform flags from collected artefacts — see comment at
+            // the marker-based detection above.
+            if !walk.res_files.is_empty() {
+                is_android = true;
+            }
+            if !walk.storyboard_files.is_empty() || !walk.xcassets_dirs.is_empty() {
+                is_ios = true;
             }
 
             // Collect module_files from primary root
@@ -730,6 +809,10 @@ pub fn cmd_rebuild(
         eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
     }
     restore_rebuild_pragmas(&conn, verbose)?;
+    // Drop conn first so WAL/SHM files are quiescent before the swap is
+    // removed.
+    drop(conn);
+    swap_guard.commit()?;
     report_encoding_summary();
     Ok(())
 }
@@ -746,6 +829,8 @@ fn cmd_rebuild_sub_projects(
     experimental_fast_rebuild: bool,
     extra_exclude: Option<&[String]>,
     config_include: Option<&[String]>,
+    config_roots: Option<&[String]>,
+    extra_paths: &[String],
     exclude_matcher: Option<&ignore::gitignore::Gitignore>,
 ) -> Result<()> {
     let start = Instant::now();
@@ -788,23 +873,37 @@ fn cmd_rebuild_sub_projects(
     }
     println!();
 
-    // Single DB for the whole root
+    let saved_subtrees = snapshot_subtrees(root, verbose)?;
+
+    // Swap aside instead of delete — see cmd_rebuild for rationale.
     if verbose {
-        eprintln!("[verbose] deleting old DB...");
+        eprintln!("[verbose] swapping old DB aside...");
     }
     let t = Instant::now();
-    if let Err(e) = db::delete_db(root) {
-        eprintln!(
-            "{}",
-            format!("Warning: could not delete old index: {}", e).yellow()
-        );
-        return Err(e);
-    }
+    let swap_guard = match db::RebuildSwap::begin(root) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!(
+                "{}",
+                format!("Warning: could not move old index aside: {}", e).yellow()
+            );
+            return Err(e);
+        }
+    };
     let mut conn = db::open_db(root)?;
     init_rebuild_schema(&conn)?;
     if verbose {
-        eprintln!("[verbose] DB created in {:?}", t.elapsed());
+        eprintln!("[verbose] DB swapped in {:?}", t.elapsed());
     }
+
+    attach_rebuild_subtrees(
+        &conn,
+        root,
+        &saved_subtrees,
+        config_roots,
+        extra_paths,
+        verbose,
+    )?;
 
     if no_ignore {
         conn.execute(
@@ -883,6 +982,16 @@ fn cmd_rebuild_sub_projects(
         {
             Ok(walk) => {
                 total_files += walk.file_count;
+                // Promote Android/iOS flags from collected artefacts as well —
+                // a sub-project may carry res/storyboard files even when the
+                // canonical marker file (build.gradle, Package.swift) lives one
+                // level deeper and `has_*_markers(path)` returned false.
+                if !walk.res_files.is_empty() {
+                    any_android = true;
+                }
+                if !walk.storyboard_files.is_empty() || !walk.xcassets_dirs.is_empty() {
+                    any_ios = true;
+                }
                 all_module_files.extend(walk.module_files);
                 all_xml_files.extend(walk.xml_layout_files);
                 all_res_files.extend(walk.res_files);
@@ -910,6 +1019,52 @@ fn cmd_rebuild_sub_projects(
                 fail_count += 1;
             }
         }
+    }
+
+    let extra_roots = db::get_extra_roots(&conn)?;
+    for extra_root in &extra_roots {
+        let extra_path = std::path::Path::new(extra_root);
+        if !extra_path.exists() {
+            continue;
+        }
+        if verbose {
+            eprintln!("[verbose] indexing extra root: {}", extra_root);
+        }
+        let t = Instant::now();
+        let extra_walk = indexer::index_directory_with_config(
+            &mut conn,
+            extra_path,
+            true,
+            no_ignore,
+            extra_exclude,
+        )?;
+        total_files += extra_walk.file_count;
+        if !extra_walk.res_files.is_empty() {
+            any_android = true;
+        }
+        if !extra_walk.storyboard_files.is_empty() || !extra_walk.xcassets_dirs.is_empty() {
+            any_ios = true;
+        }
+        all_module_files.extend(extra_walk.module_files);
+        all_xml_files.extend(extra_walk.xml_layout_files);
+        all_res_files.extend(extra_walk.res_files);
+        all_storyboard_files.extend(extra_walk.storyboard_files);
+        all_xcassets_dirs.extend(extra_walk.xcassets_dirs);
+        if verbose {
+            eprintln!(
+                "[verbose] extra root: {} files in {:?}",
+                extra_walk.file_count,
+                t.elapsed()
+            );
+        }
+        println!(
+            "{}",
+            format!(
+                "Indexed {} files from extra root: {}",
+                extra_walk.file_count, extra_root
+            )
+            .dimmed()
+        );
     }
 
     // Index modules and dependencies from collected build files
@@ -943,17 +1098,24 @@ fn cmd_rebuild_sub_projects(
         }
     }
 
-    // Android-specific: XML layouts and resources
-    if any_android && !all_xml_files.is_empty() {
-        let t = Instant::now();
-        let xml_count = indexer::index_xml_usages(&mut conn, root, &all_xml_files, verbose)?;
-        if verbose {
-            eprintln!("[verbose] xml_usages: {} in {:?}", xml_count, t.elapsed());
+    // Android-specific: XML layouts and resources.
+    // Split: a sub-project with values/drawables/colors but no layout/menu/
+    // navigation XML still needs resources indexed.
+    if any_android {
+        if !all_xml_files.is_empty() {
+            let t = Instant::now();
+            let xml_count = indexer::index_xml_usages(&mut conn, root, &all_xml_files, verbose)?;
+            if verbose {
+                eprintln!("[verbose] xml_usages: {} in {:?}", xml_count, t.elapsed());
+            }
         }
-        let t = Instant::now();
-        let (res_count, _) = indexer::index_resources(&mut conn, root, &all_res_files, verbose)?;
-        if verbose {
-            eprintln!("[verbose] resources: {} in {:?}", res_count, t.elapsed());
+        if !all_res_files.is_empty() {
+            let t = Instant::now();
+            let (res_count, _) =
+                indexer::index_resources(&mut conn, root, &all_res_files, verbose)?;
+            if verbose {
+                eprintln!("[verbose] resources: {} in {:?}", res_count, t.elapsed());
+            }
         }
     }
 
@@ -995,6 +1157,8 @@ fn cmd_rebuild_sub_projects(
         eprintln!("{}", format!("Total time: {:?}", start.elapsed()).dimmed());
     }
     restore_rebuild_pragmas(&conn, verbose)?;
+    drop(conn);
+    swap_guard.commit()?;
     report_encoding_summary();
     Ok(())
 }
@@ -1266,25 +1430,214 @@ pub fn cmd_remove_root(root: &Path, path: &str) -> Result<()> {
     Ok(())
 }
 
-/// List configured source roots
-pub fn cmd_list_roots(root: &Path) -> Result<()> {
+/// Legacy `list-roots` — lists subtrees by their canonical path only.
+/// New code should prefer `subtree list`, which also shows names.
+pub fn cmd_list_roots(root: &Path, format: &str) -> Result<()> {
+    cmd_subtree_list(root, format)
+}
+
+fn ensure_index_exists(root: &Path) -> bool {
     if !db::db_exists(root) {
         println!(
             "{}",
             "Index not found. Run 'ast-index rebuild' first.".red()
         );
+        return false;
+    }
+    true
+}
+
+/// Resolve a user-supplied path into (canonical_path, original_path).
+///
+/// `canonical_path` is the absolute form used as `files.root_path` during
+/// indexing. `original_path` preserves the user's input verbatim so a
+/// project committed with relative paths stays portable across machines.
+fn resolve_subtree_path(path: &str) -> (String, String) {
+    let original = path.to_string();
+    let candidate = if std::path::Path::new(path).is_absolute() {
+        std::path::PathBuf::from(path)
+    } else {
+        std::env::current_dir()
+            .unwrap_or_default()
+            .join(path)
+    };
+    let canonical = db::safe_canonicalize(&candidate)
+        .to_string_lossy()
+        .into_owned();
+    (canonical, original)
+}
+
+/// Reject obvious overlaps with the primary project root unless --force.
+fn reject_overlap_with_root(
+    root: &Path,
+    canonical_new: &str,
+    force: bool,
+) -> Result<bool> {
+    if force {
+        return Ok(true);
+    }
+    let canonical_root = db::safe_canonicalize(root)
+        .to_string_lossy()
+        .into_owned();
+    let canonical_new_pb = std::path::Path::new(canonical_new);
+    let canonical_root_pb = std::path::Path::new(&canonical_root);
+
+    if canonical_new_pb.starts_with(canonical_root_pb) {
+        println!(
+            "{}",
+            format!(
+                "Warning: '{}' is inside the project root '{}'. \
+                 Files would be indexed twice.",
+                canonical_new,
+                root.display()
+            )
+            .yellow()
+        );
+        println!("Use --force to attach anyway, or scope via .ast-index.yaml `include`.");
+        return Ok(false);
+    }
+    if canonical_root_pb.starts_with(canonical_new_pb) {
+        println!(
+            "{}",
+            format!(
+                "Warning: '{}' is a parent of the project root. \
+                 This would cause massive duplication.",
+                canonical_new
+            )
+            .yellow()
+        );
+        println!("Use --force to attach anyway.");
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+pub fn cmd_subtree_add(
+    root: &Path,
+    name: &str,
+    path: &str,
+    force: bool,
+    format: &str,
+) -> Result<()> {
+    if !ensure_index_exists(root) {
+        return Ok(());
+    }
+    let (canonical, original) = resolve_subtree_path(path);
+    if !reject_overlap_with_root(root, &canonical, force)? {
         return Ok(());
     }
 
     let conn = db::open_db(root)?;
-    let extra_roots = db::get_extra_roots(&conn)?;
+    if let Some(existing) = db::find_subtree_by_name(&conn, name)? {
+        println!(
+            "{}",
+            format!(
+                "Subtree name '{}' already attached to {}",
+                name, existing.canonical_path
+            )
+            .yellow()
+        );
+        println!("Pick a different name, or remove the existing entry first.");
+        return Ok(());
+    }
+    if let Some(existing) = db::find_subtree_by_root_path(&conn, &canonical)? {
+        println!(
+            "{}",
+            format!(
+                "This path is already attached as subtree '{}'",
+                existing.name
+            )
+            .yellow()
+        );
+        return Ok(());
+    }
+    db::insert_subtree(&conn, name, &canonical, &original)?;
 
-    println!("{}", "Source roots:".bold());
-    println!("  {} (primary)", root.display());
-    for r in &extra_roots {
-        println!("  {}", r);
+    if format == "json" {
+        let payload = db::Subtree {
+            name: name.to_string(),
+            canonical_path: canonical.clone(),
+            original_path: original.clone(),
+        };
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        println!(
+            "{}",
+            format!("Attached subtree {} → {}", name, canonical).green()
+        );
+        if original != canonical {
+            println!("  source: {}", original);
+        }
+    }
+    Ok(())
+}
+
+pub fn cmd_subtree_remove(root: &Path, name: &str, format: &str) -> Result<()> {
+    if !ensure_index_exists(root) {
+        return Ok(());
+    }
+    let conn = db::open_db(root)?;
+    let existing = db::find_subtree_by_name(&conn, name)?;
+    let removed = db::remove_subtree_by_name(&conn, name)?;
+
+    if format == "json" {
+        println!(
+            "{}",
+            serde_json::json!({ "removed": removed, "name": name }).to_string()
+        );
+        return Ok(());
     }
 
+    if removed {
+        if let Some(s) = existing {
+            println!(
+                "{}",
+                format!("Detached subtree {} ({}).", name, s.canonical_path).green()
+            );
+        } else {
+            println!("{}", format!("Detached subtree {}.", name).green());
+        }
+        println!("Run `ast-index rebuild` to drop its files from the index.");
+    } else {
+        println!(
+            "{}",
+            format!("Subtree '{}' not found.", name).yellow()
+        );
+    }
+    Ok(())
+}
+
+pub fn cmd_subtree_list(root: &Path, format: &str) -> Result<()> {
+    if !ensure_index_exists(root) {
+        return Ok(());
+    }
+    let conn = db::open_db(root)?;
+    let subtrees = db::list_subtrees(&conn)?;
+
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&subtrees)?);
+        return Ok(());
+    }
+
+    println!("{}", "Subtrees attached to this project:".bold());
+    println!("  {} (primary)", root.display());
+    if subtrees.is_empty() {
+        println!(
+            "  {}",
+            "No extra subtrees attached. Use `ast-index subtree add <name> <path>` to add one."
+                .dimmed()
+        );
+        return Ok(());
+    }
+    let name_w = subtrees.iter().map(|s| s.name.len()).max().unwrap_or(4);
+    for s in &subtrees {
+        let display = if s.original_path == s.canonical_path {
+            s.canonical_path.clone()
+        } else {
+            format!("{} ({})", s.original_path, s.canonical_path)
+        };
+        println!("  {:<width$}  {}", s.name.cyan(), display, width = name_w);
+    }
     Ok(())
 }
 

@@ -6,14 +6,58 @@ use serde::Serialize;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+/// Canonicalize a path with a hard timeout.
+///
+/// `Path::canonicalize` is a blocking syscall and on macOS it can hang
+/// indefinitely when the path lives on a FUSE mount that has gone away
+/// (arc unmount during a session, stale worktree, dead sshfs). That
+/// turns `ast-index rebuild` into a silent hang.
+///
+/// We run the canonicalize on a side thread and wait for at most
+/// `AST_INDEX_CANONICALIZE_TIMEOUT_MS` (default 5s). On timeout or any
+/// canonicalize error we warn to stderr and fall back to the path as-is
+/// — the orphan thread is left to live; the OS reaps it on process exit.
+///
+/// Set `AST_INDEX_NO_CANONICALIZE=1` to skip canonicalize entirely (useful
+/// when you already know the mount is dead and don't want the 5s wait).
+pub fn safe_canonicalize(path: &Path) -> PathBuf {
+    if std::env::var("AST_INDEX_NO_CANONICALIZE")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+    {
+        return path.to_path_buf();
+    }
+
+    let timeout_ms = std::env::var("AST_INDEX_CANONICALIZE_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(5_000);
+
+    let p = path.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(p.canonicalize());
+    });
+
+    match rx.recv_timeout(std::time::Duration::from_millis(timeout_ms)) {
+        Ok(Ok(canonical)) => canonical,
+        Ok(Err(_)) => path.to_path_buf(),
+        Err(_) => {
+            eprintln!(
+                "[ast-index] filesystem unresponsive at {} — proceeding with raw path \
+                 (set AST_INDEX_NO_CANONICALIZE=1 to skip the {}ms wait next time)",
+                path.display(),
+                timeout_ms
+            );
+            path.to_path_buf()
+        }
+    }
+}
+
 /// Normalize project root path: canonicalize if possible, fallback to original.
-/// This ensures the same DB is found after VFS remount (e.g. arc mount in Arcadia).
+/// This ensures the same DB is found after VFS remount (e.g. arc mount).
 fn normalize_root(project_root: &Path) -> String {
-    project_root
-        .canonicalize()
-        .unwrap_or_else(|_| project_root.to_path_buf())
-        .to_string_lossy()
-        .into_owned()
+    safe_canonicalize(project_root).to_string_lossy().into_owned()
 }
 
 /// Stable storage key for a root that owns indexed relative paths.
@@ -78,11 +122,11 @@ pub fn get_db_path(project_root: &Path) -> Result<PathBuf> {
                                 |row| row.get(0),
                             );
                             if let Ok(root_val) = root_str {
-                                // Match against both raw and normalized paths
-                                let stored_normalized = normalize_root(Path::new(&root_val));
-                                if stored_normalized == normalized
-                                    || root_val == project_root.to_string_lossy().as_ref()
-                                {
+                                // Match by string equality only — do NOT canonicalize
+                                // `root_val`. That foreign path may live on a dead FUSE
+                                // mount (stale arc worktree etc.) and hang the syscall.
+                                let raw = project_root.to_string_lossy();
+                                if root_val == normalized || root_val == raw.as_ref() {
                                     // Found old DB for this project — migrate
                                     let _ = std::fs::create_dir_all(&db_dir);
                                     for suffix in ["index.db", "index.db-wal", "index.db-shm"] {
@@ -180,6 +224,126 @@ pub fn delete_db(project_root: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+const SWAP_SUFFIXES: &[&str] = &["", "-wal", "-shm"];
+
+fn swap_extension(suffix: &str) -> String {
+    format!("db.swap{}", suffix)
+}
+
+fn live_extension(suffix: &str) -> String {
+    format!("db{}", suffix)
+}
+
+/// Atomically move the current DB aside (rename to `index.db.swap*`).
+///
+/// Returns `true` when there was an old DB to move. The caller is expected
+/// to wrap the rebuild in a `RebuildSwap` guard so the swap is either
+/// committed (deleted) on success or restored on failure.
+///
+/// Any pre-existing swap files (left behind by a previous crashed rebuild)
+/// are deleted first — keeping them around would prevent rename and risk
+/// resurrecting a stale half-finished index.
+pub fn move_db_to_swap(project_root: &Path) -> Result<bool> {
+    let db_path = get_db_path(project_root)?;
+    let mut moved = false;
+    for suffix in SWAP_SUFFIXES {
+        let live = db_path.with_extension(live_extension(suffix));
+        let swap = db_path.with_extension(swap_extension(suffix));
+        if swap.exists() {
+            let _ = std::fs::remove_file(&swap);
+        }
+        if live.exists() {
+            std::fs::rename(&live, &swap)?;
+            moved = true;
+        }
+    }
+    Ok(moved)
+}
+
+/// Restore the previously-swapped DB. Used when a rebuild aborts.
+/// Removes any partial new DB the failed rebuild wrote before renaming
+/// the swap back into place.
+pub fn restore_db_from_swap(project_root: &Path) -> Result<()> {
+    let db_path = get_db_path(project_root)?;
+    for suffix in SWAP_SUFFIXES {
+        let live = db_path.with_extension(live_extension(suffix));
+        let swap = db_path.with_extension(swap_extension(suffix));
+        if swap.exists() {
+            if live.exists() {
+                let _ = std::fs::remove_file(&live);
+            }
+            std::fs::rename(&swap, &live)?;
+        }
+    }
+    Ok(())
+}
+
+/// Remove the swap aside (called after a successful rebuild commits).
+pub fn remove_swap(project_root: &Path) -> Result<()> {
+    let db_path = get_db_path(project_root)?;
+    for suffix in SWAP_SUFFIXES {
+        let swap = db_path.with_extension(swap_extension(suffix));
+        if swap.exists() {
+            let _ = std::fs::remove_file(&swap);
+        }
+    }
+    Ok(())
+}
+
+/// RAII guard for atomic rebuild.
+///
+/// `begin()` swaps the live DB to `.db.swap` so the rebuild starts from a
+/// clean state without losing the previous index. If the guard is dropped
+/// without `commit()` (an error bubbled up, walker aborted on cap, etc.),
+/// `restore_db_from_swap` runs in the destructor and the previous index
+/// is back in place. On `commit()` the swap is deleted.
+pub struct RebuildSwap {
+    project_root: PathBuf,
+    had_old_db: bool,
+    committed: bool,
+}
+
+impl RebuildSwap {
+    pub fn begin(project_root: &Path) -> Result<Self> {
+        let had_old_db = move_db_to_swap(project_root)?;
+        Ok(Self {
+            project_root: project_root.to_path_buf(),
+            had_old_db,
+            committed: false,
+        })
+    }
+
+    pub fn commit(mut self) -> Result<()> {
+        remove_swap(&self.project_root).ok();
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for RebuildSwap {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if self.had_old_db {
+            eprintln!(
+                "[ast-index] rebuild failed — restoring previous index from swap"
+            );
+            if let Err(e) = restore_db_from_swap(&self.project_root) {
+                eprintln!(
+                    "[ast-index] failed to restore previous index: {e}. \
+                     A backup may remain at .db.swap*"
+                );
+            }
+        } else {
+            // No old DB to restore — drop the half-written new one (if any)
+            // and clean up the (likely absent) swap files.
+            let _ = delete_db(&self.project_root);
+            let _ = remove_swap(&self.project_root);
+        }
+    }
 }
 
 fn create_base_schema(conn: &Connection) -> Result<()> {
@@ -325,6 +489,19 @@ fn create_base_schema(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS metadata (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
+        );
+
+        -- Named workspace subtrees (#31). Each row represents an extra source
+        -- root attached to this project: the user gives it a short `name`
+        -- (used in CLI filters and in output prefixes), `original_path` is
+        -- what the user typed (relative or absolute, kept for portability),
+        -- and `canonical_path` is the normalized absolute form actually
+        -- written into `files.root_path` during indexing.
+        CREATE TABLE IF NOT EXISTS subtrees (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            canonical_path TEXT NOT NULL UNIQUE,
+            original_path TEXT NOT NULL
         );
         "#,
     )?;
@@ -668,7 +845,7 @@ pub fn search_symbols(conn: &Connection, query: &str, limit: usize) -> Result<Ve
 }
 
 /// Search result
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SearchResult {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1445,6 +1622,26 @@ pub fn find_references(conn: &Connection, name: &str, limit: usize) -> Result<Ve
     Ok(results)
 }
 
+/// All symbols defined in a file, ordered by line. Used by `explore --rwr`
+/// to attribute a reference (file + line) to its owning symbol — the last
+/// symbol whose start line is <= the reference line. Approximate without
+/// `end_line`, but good enough to build a caller→callee graph in memory.
+pub fn get_file_symbols(conn: &Connection, path: &str) -> Result<Vec<SearchResult>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+        FROM symbols s
+        JOIN files f ON s.file_id = f.id
+        WHERE f.path = ?1
+        ORDER BY s.line
+        "#,
+    )?;
+    let results = stmt
+        .query_map(params![path], row_to_search_result)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(results)
+}
+
 /// Search references by name (prefix match, grouped by unique name)
 pub fn search_refs(conn: &Connection, query: &str, limit: usize) -> Result<Vec<(String, i64)>> {
     let pattern = format!("{}%", query);
@@ -2014,20 +2211,174 @@ pub fn find_references_scoped(
     Ok(results)
 }
 
-/// Get extra source roots stored in metadata
-pub fn get_extra_roots(conn: &Connection) -> Result<Vec<String>> {
-    let result: Result<String, _> = conn.query_row(
+/// A named workspace subtree attached to the current project (#31).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Subtree {
+    pub name: String,
+    /// Canonical absolute path used as `files.root_path` during indexing.
+    pub canonical_path: String,
+    /// Path as the user originally provided it (kept verbatim so a project
+    /// committed with relative paths stays portable across machines).
+    pub original_path: String,
+}
+
+/// List every subtree attached to this project, ordered by name.
+pub fn list_subtrees(conn: &Connection) -> Result<Vec<Subtree>> {
+    let mut stmt = conn.prepare(
+        "SELECT name, canonical_path, original_path FROM subtrees ORDER BY name",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(Subtree {
+            name: row.get(0)?,
+            canonical_path: row.get(1)?,
+            original_path: row.get(2)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn find_subtree_by_name(conn: &Connection, name: &str) -> Result<Option<Subtree>> {
+    let result: rusqlite::Result<Subtree> = conn.query_row(
+        "SELECT name, canonical_path, original_path FROM subtrees WHERE name = ?1",
+        params![name],
+        |row| {
+            Ok(Subtree {
+                name: row.get(0)?,
+                canonical_path: row.get(1)?,
+                original_path: row.get(2)?,
+            })
+        },
+    );
+    match result {
+        Ok(s) => Ok(Some(s)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub fn find_subtree_by_root_path(
+    conn: &Connection,
+    canonical_path: &str,
+) -> Result<Option<Subtree>> {
+    let result: rusqlite::Result<Subtree> = conn.query_row(
+        "SELECT name, canonical_path, original_path FROM subtrees WHERE canonical_path = ?1",
+        params![canonical_path],
+        |row| {
+            Ok(Subtree {
+                name: row.get(0)?,
+                canonical_path: row.get(1)?,
+                original_path: row.get(2)?,
+            })
+        },
+    );
+    match result {
+        Ok(s) => Ok(Some(s)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Insert a new subtree row. Errors when the name or canonical_path are
+/// already taken (UNIQUE constraint).
+pub fn insert_subtree(
+    conn: &Connection,
+    name: &str,
+    canonical_path: &str,
+    original_path: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO subtrees (name, canonical_path, original_path) VALUES (?1, ?2, ?3)",
+        params![name, canonical_path, original_path],
+    )?;
+    Ok(())
+}
+
+pub fn remove_subtree_by_name(conn: &Connection, name: &str) -> Result<bool> {
+    let n = conn.execute("DELETE FROM subtrees WHERE name = ?1", params![name])?;
+    Ok(n > 0)
+}
+
+/// Derive a short, filesystem-friendly default subtree name from a path.
+/// Strips trailing slashes, takes the last meaningful component, and falls
+/// back to `subtree` when the path has no usable basename (e.g. just `/`).
+pub fn default_subtree_name(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    let base = Path::new(trimmed)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let clean = base
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect::<String>();
+    let clean = clean.trim_matches('-').to_string();
+    if clean.is_empty() {
+        "subtree".to_string()
+    } else {
+        clean
+    }
+}
+
+/// Pick a name that's not yet taken in the subtrees table. Starts with the
+/// caller's preferred name and appends `-2`, `-3`, ... on collision.
+pub fn allocate_subtree_name(conn: &Connection, preferred: &str) -> Result<String> {
+    if find_subtree_by_name(conn, preferred)?.is_none() {
+        return Ok(preferred.to_string());
+    }
+    for n in 2..1000 {
+        let candidate = format!("{}-{}", preferred, n);
+        if find_subtree_by_name(conn, &candidate)?.is_none() {
+            return Ok(candidate);
+        }
+    }
+    Err(anyhow::anyhow!(
+        "could not allocate a free subtree name based on '{}'",
+        preferred
+    ))
+}
+
+/// One-time migration of pre-3.47 `metadata.extra_roots` JSON into the
+/// new `subtrees` table. Idempotent: deletes the metadata row after a
+/// successful migration so we don't run this twice.
+fn migrate_extra_roots_to_subtrees(conn: &Connection) -> Result<()> {
+    let json: rusqlite::Result<String> = conn.query_row(
         "SELECT value FROM metadata WHERE key = 'extra_roots'",
         [],
         |row| row.get(0),
     );
-    match result {
-        Ok(json) => {
-            let roots: Vec<String> = serde_json::from_str(&json).unwrap_or_default();
-            Ok(roots)
+    let json = match json {
+        Ok(j) => j,
+        Err(_) => return Ok(()),
+    };
+    let roots: Vec<String> = serde_json::from_str(&json).unwrap_or_default();
+    for raw in roots {
+        if find_subtree_by_root_path(conn, &raw)?.is_some() {
+            continue;
         }
-        Err(_) => Ok(vec![]),
+        let preferred = default_subtree_name(&raw);
+        let name = allocate_subtree_name(conn, &preferred)?;
+        // Original_path falls back to canonical_path for migrated rows —
+        // we no longer know what the user originally typed.
+        insert_subtree(conn, &name, &raw, &raw)?;
     }
+    // Clear the legacy row so the migration is a no-op on next open.
+    conn.execute("DELETE FROM metadata WHERE key = 'extra_roots'", [])?;
+    Ok(())
+}
+
+/// Get extra source roots — backwards-compatible shim over the new
+/// `subtrees` table. Returns the canonical_path of each subtree, ignoring
+/// the name (existing callers do not yet care about subtree names).
+pub fn get_extra_roots(conn: &Connection) -> Result<Vec<String>> {
+    migrate_extra_roots_to_subtrees(conn).ok();
+    Ok(list_subtrees(conn)?
+        .into_iter()
+        .map(|s| s.canonical_path)
+        .collect())
 }
 
 pub fn is_experimental_fast_rebuild_enabled_in_db(conn: &Connection) -> bool {
@@ -2048,34 +2399,31 @@ pub fn set_experimental_fast_rebuild_enabled(conn: &Connection, enabled: bool) -
     Ok(())
 }
 
-/// Add an extra source root
+/// Add an extra source root with an auto-generated subtree name.
+///
+/// Backwards-compatible shim for the pre-3.47 `add-root` CLI command.
+/// Picks a default name from the path basename and falls back to
+/// `<base>-2`, `<base>-3`, ... on collision. Stores `path` verbatim in
+/// `original_path` so the user's preference (relative vs absolute) is
+/// preserved.
 pub fn add_extra_root(conn: &Connection, path: &str) -> Result<()> {
-    let mut roots = get_extra_roots(conn)?;
-    if !roots.contains(&path.to_string()) {
-        roots.push(path.to_string());
+    migrate_extra_roots_to_subtrees(conn).ok();
+    if find_subtree_by_root_path(conn, path)?.is_some() {
+        return Ok(());
     }
-    let json = serde_json::to_string(&roots)?;
-    conn.execute(
-        "INSERT OR REPLACE INTO metadata (key, value) VALUES ('extra_roots', ?1)",
-        params![json],
-    )?;
-    Ok(())
+    let preferred = default_subtree_name(path);
+    let name = allocate_subtree_name(conn, &preferred)?;
+    insert_subtree(conn, &name, path, path)
 }
 
-/// Remove an extra source root
+/// Remove an extra source root identified by its canonical path.
 pub fn remove_extra_root(conn: &Connection, path: &str) -> Result<bool> {
-    let mut roots = get_extra_roots(conn)?;
-    let len_before = roots.len();
-    roots.retain(|r| r != path);
-    if roots.len() == len_before {
-        return Ok(false);
-    }
-    let json = serde_json::to_string(&roots)?;
-    conn.execute(
-        "INSERT OR REPLACE INTO metadata (key, value) VALUES ('extra_roots', ?1)",
-        params![json],
+    migrate_extra_roots_to_subtrees(conn).ok();
+    let n = conn.execute(
+        "DELETE FROM subtrees WHERE canonical_path = ?1",
+        params![path],
     )?;
-    Ok(true)
+    Ok(n > 0)
 }
 
 /// Normalize a module name input so that `:core:utils`, `core/utils`, and

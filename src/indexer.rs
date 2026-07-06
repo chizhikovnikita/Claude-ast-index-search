@@ -13,6 +13,59 @@ use std::time::SystemTime;
 use crate::db;
 use crate::parsers::{self, ParsedRef, ParsedSymbol};
 
+/// File-size cap for parsing. Larger files are recorded in the `files`
+/// table (so `update` still tracks their mtime) but never parsed — their
+/// symbol contribution is 0. This prevents pathological RAM peaks on
+/// minified bundles / generated proto bundles / vendor blobs.
+///
+/// Configurable via `AST_INDEX_MAX_FILE_SIZE` (bytes). Default: 1 MB.
+fn max_file_size_bytes() -> u64 {
+    std::env::var("AST_INDEX_MAX_FILE_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(1_000_000)
+}
+
+/// Soft cap on the number of candidate files the walker accepts before
+/// aborting. Protects against accidental `rebuild` on a VCS / monorepo
+/// root that would index hundreds of millions of files.
+///
+/// Configurable via `AST_INDEX_MAX_FILES`. Default: 2_000_000. Set to 0
+/// to disable entirely.
+fn max_files_cap() -> usize {
+    std::env::var("AST_INDEX_MAX_FILES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(2_000_000)
+}
+
+/// Soft threshold at which the walker prints a one-shot warning to stderr
+/// but keeps going. Lets the user notice "I'm rebuilding something huge"
+/// without aborting projects that legitimately have ~1M files.
+///
+/// Configurable via `AST_INDEX_WARN_FILES`. Default: 500_000. Set to 0 to
+/// silence entirely.
+fn warn_files_threshold() -> usize {
+    std::env::var("AST_INDEX_WARN_FILES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(500_000)
+}
+
+/// Read the per-project `bypass_size_check` opt-in flag.
+///
+/// Set by `ast-index rebuild --force --remember` for projects where the
+/// user has explicitly accepted the cost of indexing a very large root.
+/// Future `rebuild`/`update` runs on that project skip the cap silently.
+fn cap_disabled_for_root(conn: &Connection) -> bool {
+    let row: rusqlite::Result<String> = conn.query_row(
+        "SELECT value FROM metadata WHERE key = 'bypass_size_check'",
+        [],
+        |row| row.get(0),
+    );
+    matches!(row.as_deref(), Ok("1") | Ok("true") | Ok("yes"))
+}
+
 /// Per-worker stack size for the rayon parsing pool.
 ///
 /// Tree-sitter parsers recurse on each node of the AST; pathological inputs
@@ -21,10 +74,6 @@ use crate::parsers::{self, ParsedRef, ParsedSymbol};
 /// of headroom without committing the pages eagerly.
 const RAYON_WORKER_STACK_SIZE: usize = 32 * 1024 * 1024;
 const DEFAULT_PARALLELISM_CAP: usize = 8;
-
-fn is_experimental_fast_rebuild_enabled() -> bool {
-    std::env::var("AST_INDEX_EXPERIMENTAL_FAST_REBUILD").is_ok()
-}
 
 fn effective_num_threads() -> usize {
     std::env::var("AST_INDEX_THREADS")
@@ -39,9 +88,6 @@ fn effective_num_threads() -> usize {
 }
 
 fn effective_chunk_size(total_files: usize) -> usize {
-    if !is_experimental_fast_rebuild_enabled() {
-        return 500;
-    }
     if total_files >= 20_000 {
         1_000
     } else {
@@ -540,6 +586,345 @@ pub fn detect_project_type(root: &Path) -> ProjectType {
     }
 }
 
+/// One stack detected in the project root by marker files.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DetectedStack {
+    /// Short id: "android", "ios", "kmp", "web", "rust", ...
+    pub kind: String,
+    /// Human-readable label suitable for CLI output.
+    pub label: String,
+    /// Specific marker files that triggered the detection (relative to root).
+    pub markers: Vec<String>,
+}
+
+/// Result of `detect_stacks()`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct StackDetection {
+    pub stacks: Vec<DetectedStack>,
+    /// Kotlin Multiplatform: Kotlin plugin + commonMain/<platform>Main source sets.
+    pub is_kmp: bool,
+    /// True when more than one independent stack is present and it is not a KMP repo.
+    pub is_polyglot: bool,
+}
+
+fn collect_markers(root: &Path, candidates: &[&str]) -> Vec<String> {
+    candidates
+        .iter()
+        .filter(|name| root.join(name).exists())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn any_ext_in_root(root: &Path, ext: &str) -> bool {
+    fs::read_dir(root)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .any(|e| e.path().extension().map(|x| x == ext).unwrap_or(false))
+        })
+        .unwrap_or(false)
+}
+
+fn collect_ext_markers(root: &Path, ext: &str, limit: usize) -> Vec<String> {
+    fs::read_dir(root)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().map(|x| x == ext).unwrap_or(false))
+                .take(limit)
+                .filter_map(|e| {
+                    e.path()
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn has_kmp_markers(root: &Path) -> (bool, Vec<String>) {
+    // KMP requires two independent signals:
+    //   * a Kotlin multiplatform source set directory (commonMain / *Main),
+    //   * a Gradle plugin reference (`kotlin("multiplatform")` or
+    //     `org.jetbrains.kotlin.multiplatform`).
+    // Either alone is too weak — non-KMP Android repos sometimes have stray
+    // `commonMain` folders, and some Gradle catalogs declare the plugin without
+    // applying it.
+    let mut markers = Vec::new();
+
+    let kmp_source_sets = [
+        "commonMain",
+        "commonTest",
+        "androidMain",
+        "iosMain",
+        "iosArm64Main",
+        "iosSimulatorArm64Main",
+        "iosX64Main",
+        "jsMain",
+        "wasmJsMain",
+        "jvmMain",
+        "nativeMain",
+    ];
+    'sources: for top in ["src", "shared", "common", "core", "kmp", "composeApp", "androidApp"] {
+        let top_path = root.join(top);
+        if !top_path.is_dir() {
+            continue;
+        }
+        if let Ok(entries) = fs::read_dir(&top_path) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if kmp_source_sets.contains(&name.as_str()) {
+                    markers.push(format!("{}/{}", top, name));
+                    break 'sources;
+                }
+            }
+        }
+    }
+    let has_source_set = !markers.is_empty();
+
+    let plugin_files = [
+        "build.gradle.kts",
+        "build.gradle",
+        "settings.gradle.kts",
+        "settings.gradle",
+    ];
+    let mut has_plugin = false;
+    'gradle: for file in plugin_files {
+        let subdirs: Vec<PathBuf> = fs::read_dir(root)
+            .map(|it| {
+                it.filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .filter(|p| p.is_dir())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for base in std::iter::once(root.to_path_buf()).chain(subdirs) {
+            let path = base.join(file);
+            if !path.is_file() {
+                continue;
+            }
+            if let Ok(content) = fs::read_to_string(&path) {
+                if content.contains("kotlin(\"multiplatform\")")
+                    || content.contains("org.jetbrains.kotlin.multiplatform")
+                {
+                    let rel = path
+                        .strip_prefix(root)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .into_owned();
+                    markers.push(rel);
+                    has_plugin = true;
+                    break 'gradle;
+                }
+            }
+        }
+    }
+
+    (has_source_set && has_plugin, markers)
+}
+
+/// Detect every stack present in `root` by inspecting marker files.
+///
+/// Unlike `detect_project_type` (which collapses multiple stacks to
+/// `ProjectType::Mixed`), this returns the full list with the specific
+/// marker files that triggered each detection. The smart `initialize`
+/// command consumes this to compose Android+iOS rules for KMP repos and
+/// per-stack rules for polyglot monorepos.
+pub fn detect_stacks(root: &Path) -> StackDetection {
+    let mut stacks: Vec<DetectedStack> = Vec::new();
+
+    let android_markers = collect_markers(
+        root,
+        &[
+            "settings.gradle.kts",
+            "settings.gradle",
+            "build.gradle.kts",
+            "build.gradle",
+            "libs.versions.toml",
+            "pom.xml",
+        ],
+    );
+    if !android_markers.is_empty() {
+        stacks.push(DetectedStack {
+            kind: "android".to_string(),
+            label: "Android (Kotlin/Java/JVM)".to_string(),
+            markers: android_markers,
+        });
+    }
+
+    let mut ios_markers = collect_markers(root, &["Package.swift", "Podfile"]);
+    ios_markers.extend(collect_ext_markers(root, "xcodeproj", 3));
+    ios_markers.extend(collect_ext_markers(root, "xcworkspace", 3));
+    if !ios_markers.is_empty() {
+        stacks.push(DetectedStack {
+            kind: "ios".to_string(),
+            label: "iOS (Swift/ObjC)".to_string(),
+            markers: ios_markers,
+        });
+    }
+
+    let (kmp_found, kmp_markers) = has_kmp_markers(root);
+    if kmp_found {
+        stacks.push(DetectedStack {
+            kind: "kmp".to_string(),
+            label: "Kotlin Multiplatform".to_string(),
+            markers: kmp_markers,
+        });
+    }
+
+    let web_markers = collect_markers(
+        root,
+        &[
+            "package.json",
+            "tsconfig.json",
+            "vite.config.ts",
+            "vite.config.js",
+            "next.config.js",
+            "next.config.mjs",
+            "nuxt.config.ts",
+            "angular.json",
+        ],
+    );
+    if !web_markers.is_empty() {
+        stacks.push(DetectedStack {
+            kind: "web".to_string(),
+            label: "Web (TypeScript/JavaScript)".to_string(),
+            markers: web_markers,
+        });
+    }
+
+    let rust_markers = collect_markers(root, &["Cargo.toml"]);
+    if !rust_markers.is_empty() {
+        stacks.push(DetectedStack {
+            kind: "rust".to_string(),
+            label: "Rust".to_string(),
+            markers: rust_markers,
+        });
+    }
+
+    let mut csharp_markers = collect_markers(root, &["Directory.Build.props"]);
+    csharp_markers.extend(collect_ext_markers(root, "sln", 3));
+    csharp_markers.extend(collect_ext_markers(root, "csproj", 3));
+    if !csharp_markers.is_empty() {
+        stacks.push(DetectedStack {
+            kind: "csharp".to_string(),
+            label: "C# / .NET".to_string(),
+            markers: csharp_markers,
+        });
+    }
+
+    let mut ruby_markers = collect_markers(root, &["Gemfile"]);
+    ruby_markers.extend(collect_ext_markers(root, "gemspec", 3));
+    if !ruby_markers.is_empty() {
+        stacks.push(DetectedStack {
+            kind: "ruby".to_string(),
+            label: "Ruby".to_string(),
+            markers: ruby_markers,
+        });
+    }
+
+    let python_markers = collect_markers(root, &["pyproject.toml", "setup.py", "setup.cfg"]);
+    if !python_markers.is_empty() {
+        stacks.push(DetectedStack {
+            kind: "python".to_string(),
+            label: "Python".to_string(),
+            markers: python_markers,
+        });
+    }
+
+    let go_markers = collect_markers(root, &["go.mod"]);
+    if !go_markers.is_empty() {
+        stacks.push(DetectedStack {
+            kind: "go".to_string(),
+            label: "Go".to_string(),
+            markers: go_markers,
+        });
+    }
+
+    let dart_markers = collect_markers(root, &["pubspec.yaml"]);
+    if !dart_markers.is_empty() {
+        stacks.push(DetectedStack {
+            kind: "dart".to_string(),
+            label: "Dart / Flutter".to_string(),
+            markers: dart_markers,
+        });
+    }
+
+    let php_markers = collect_markers(root, &["composer.json"]);
+    if !php_markers.is_empty() {
+        stacks.push(DetectedStack {
+            kind: "php".to_string(),
+            label: "PHP".to_string(),
+            markers: php_markers,
+        });
+    }
+
+    let scala_markers = collect_markers(root, &["build.sbt"]);
+    if !scala_markers.is_empty() {
+        stacks.push(DetectedStack {
+            kind: "scala".to_string(),
+            label: "Scala".to_string(),
+            markers: scala_markers,
+        });
+    }
+
+    let zig_markers = collect_markers(root, &["build.zig", "build.zig.zon"]);
+    if !zig_markers.is_empty() {
+        stacks.push(DetectedStack {
+            kind: "zig".to_string(),
+            label: "Zig".to_string(),
+            markers: zig_markers,
+        });
+    }
+
+    let cpp_markers = collect_markers(root, &["CMakeLists.txt"]);
+    if !cpp_markers.is_empty() {
+        stacks.push(DetectedStack {
+            kind: "cpp".to_string(),
+            label: "C / C++".to_string(),
+            markers: cpp_markers,
+        });
+    }
+
+    let mut perl_markers = collect_markers(root, &["Makefile.PL", "Build.PL", "cpanfile"]);
+    if any_ext_in_root(root, "pm") {
+        perl_markers.push("*.pm".to_string());
+    }
+    if !perl_markers.is_empty() {
+        stacks.push(DetectedStack {
+            kind: "perl".to_string(),
+            label: "Perl".to_string(),
+            markers: perl_markers,
+        });
+    }
+
+    let is_kmp = stacks.iter().any(|s| s.kind == "kmp");
+    // Distinct top-level stacks excluding KMP itself: android+ios pair under KMP
+    // does NOT count as polyglot.
+    let distinct_primary = stacks
+        .iter()
+        .filter(|s| {
+            if is_kmp {
+                // KMP repos legitimately have android+ios+kmp markers.
+                !matches!(s.kind.as_str(), "android" | "ios" | "kmp")
+            } else {
+                true
+            }
+        })
+        .count();
+    let is_polyglot = if is_kmp {
+        distinct_primary >= 1 // KMP + at least one extra stack
+    } else {
+        stacks.len() >= 2
+    };
+
+    StackDetection {
+        stacks,
+        is_kmp,
+        is_polyglot,
+    }
+}
+
 /// Parsed file data for parallel processing
 struct ParsedFile {
     rel_path: String,
@@ -549,6 +934,19 @@ struct ParsedFile {
     symbols: Vec<ParsedSymbol>,
     qualified_names: HashMap<(String, usize, String), String>,
     refs: Vec<ParsedRef>,
+}
+
+/// File scheduled by incremental update.
+enum PendingUpdateFile {
+    Regular {
+        root: PathBuf,
+        path: PathBuf,
+    },
+    NodeModulesDts {
+        path: PathBuf,
+        rel_path: String,
+        root_path: String,
+    },
 }
 
 /// Parse a single file without DB access (thread-safe)
@@ -567,8 +965,11 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
         .to_string_lossy()
         .to_string();
 
-    // Skip files larger than 1 MB (likely generated/minified)
-    if size > 1_000_000 {
+    // Skip files larger than the configured cap (likely generated/minified).
+    // Recorded in `files` so `update` still notices on-disk changes, but
+    // never read into memory or parsed — that's how a single 200 MB vendor
+    // bundle used to push rebuild to 20+ GB RSS.
+    if (size as u64) > max_file_size_bytes() {
         return Ok(ParsedFile {
             rel_path,
             root_path,
@@ -624,6 +1025,28 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
         }
     }
 
+    // Vue/Svelte single-file components export an anonymous `export default {}`,
+    // so the component itself has no named symbol — its identity is the file
+    // name (e.g. NavBar.vue → component `NavBar`). Emit a synthetic symbol so
+    // the component is discoverable by name (search/explore/go-to), in addition
+    // to the script-block symbols the parser already extracts.
+    if matches!(
+        file_type,
+        parsers::FileType::Vue | parsers::FileType::Svelte
+    ) {
+        if let Some(stem) = Path::new(&rel_path).file_stem().and_then(|s| s.to_str()) {
+            if !symbols.iter().any(|s| s.name == stem && s.line == 1) {
+                symbols.push(parsers::ParsedSymbol {
+                    name: stem.to_string(),
+                    kind: crate::db::SymbolKind::Class,
+                    line: 1,
+                    signature: format!("component {}", stem),
+                    parents: vec![],
+                });
+            }
+        }
+    }
+
     Ok(ParsedFile {
         rel_path,
         root_path,
@@ -635,7 +1058,9 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
     })
 }
 
-/// Directories to always exclude from indexing (regardless of .gitignore)
+/// Directories to always exclude from indexing (regardless of .gitignore).
+/// Keep this list to generated caches/build outputs only; ordinary dependency
+/// or source directories can be excluded via .gitignore or .ast-index.yaml.
 const EXCLUDED_DIRS: &[&str] = &[
     "node_modules",
     "__pycache__",
@@ -643,7 +1068,6 @@ const EXCLUDED_DIRS: &[&str] = &[
     "build",
     "dist",
     "target",
-    "vendor",
     ".gradle",
     ".idea",
     "Pods",
@@ -805,6 +1229,10 @@ pub struct WalkResult {
     // Android
     pub xml_layout_files: Vec<PathBuf>, // .xml in /res/(layout|menu|navigation)
     pub res_files: Vec<PathBuf>,        // all files under /res/
+    /// True when the walker aborted because `AST_INDEX_MAX_FILES` was hit.
+    /// The caller should surface a clear error with bypass instructions
+    /// instead of pretending the partial result is complete.
+    pub aborted_by_cap: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -887,6 +1315,49 @@ struct CollectedWalkData {
     walk_errors: WalkErrorSummary,
 }
 
+/// Canonical Android resource directory prefixes under `/res/`.
+///
+/// Used to (1) keep `res_files` Android-specific instead of grabbing any
+/// `/res/` substring (a Python project's `assets/res/` would otherwise leak
+/// in and falsely mark the tree as Android), and (2) narrow `xml_layout_files`
+/// to actual layout/menu/navigation directories without matching `values-pl/
+/// layout_attrs.xml`.
+const ANDROID_RES_SUBDIRS: &[&str] = &[
+    "values",
+    "layout",
+    "drawable",
+    "menu",
+    "navigation",
+    "mipmap",
+    "anim",
+    "animator",
+    "color",
+    "font",
+    "interpolator",
+    "raw",
+    "transition",
+    "xml",
+];
+
+/// `path_str` is under one of `<name>` or `<name>-<qualifier>` subdirs of `/res/`.
+fn android_res_subdir_match(path_str: &str, name: &str) -> bool {
+    let needle_slash = format!("/res/{}/", name);
+    let needle_dash = format!("/res/{}-", name);
+    path_str.contains(&needle_slash) || path_str.contains(&needle_dash)
+}
+
+fn is_android_res_path(path_str: &str) -> bool {
+    ANDROID_RES_SUBDIRS
+        .iter()
+        .any(|name| android_res_subdir_match(path_str, name))
+}
+
+fn is_android_layout_path(path_str: &str) -> bool {
+    ["layout", "menu", "navigation"]
+        .iter()
+        .any(|name| android_res_subdir_match(path_str, name))
+}
+
 fn collect_walk_entry(data: &mut CollectedWalkData, entry: &ignore::DirEntry) {
     let path = entry.path();
     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
@@ -905,13 +1376,9 @@ fn collect_walk_entry(data: &mut CollectedWalkData, entry: &ignore::DirEntry) {
             data.xcassets_dirs.push(path.to_path_buf());
         }
         let path_str = path.to_string_lossy();
-        if path_str.contains("/res/") {
+        if is_android_res_path(&path_str) {
             data.res_files.push(path.to_path_buf());
-            if ext == "xml"
-                && (path_str.contains("/layout")
-                    || path_str.contains("/menu")
-                    || path_str.contains("/navigation"))
-            {
+            if ext == "xml" && is_android_layout_path(&path_str) {
                 data.xml_layout_files.push(path.to_path_buf());
             }
         }
@@ -923,6 +1390,10 @@ struct ParallelWalkCollectorBuilder {
     entries_seen: Arc<AtomicUsize>,
     verbose: bool,
     walk_start: std::time::Instant,
+    max_files: usize,
+    warn_threshold: usize,
+    aborted: Arc<std::sync::atomic::AtomicBool>,
+    warned: Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct ParallelWalkCollector {
@@ -930,6 +1401,10 @@ struct ParallelWalkCollector {
     entries_seen: Arc<AtomicUsize>,
     verbose: bool,
     walk_start: std::time::Instant,
+    max_files: usize,
+    warn_threshold: usize,
+    aborted: Arc<std::sync::atomic::AtomicBool>,
+    warned: Arc<std::sync::atomic::AtomicBool>,
     local: CollectedWalkData,
 }
 
@@ -940,13 +1415,34 @@ impl<'s> ignore::ParallelVisitorBuilder<'s> for ParallelWalkCollectorBuilder {
             entries_seen: self.entries_seen.clone(),
             verbose: self.verbose,
             walk_start: self.walk_start,
+            max_files: self.max_files,
+            warn_threshold: self.warn_threshold,
+            aborted: self.aborted.clone(),
+            warned: self.warned.clone(),
             local: CollectedWalkData::default(),
         })
     }
 }
 
+fn emit_soft_warning(seen: usize, walk_start: std::time::Instant) {
+    eprintln!(
+        "[ast-index] warning: scanning a very large root ({}+ candidate files in {:?}). \
+         Indexing will continue, but rebuild may take a while and consume substantial \
+         memory. Consider scoping via .ast-index.yaml `include` or running from a deeper \
+         subdirectory. The hard abort cap is AST_INDEX_MAX_FILES (default 2,000,000).",
+        seen,
+        walk_start.elapsed()
+    );
+}
+
 impl ignore::ParallelVisitor for ParallelWalkCollector {
     fn visit(&mut self, entry: Result<ignore::DirEntry, ignore::Error>) -> ignore::WalkState {
+        // Cooperative early-stop when another worker has tripped the cap.
+        if self.max_files > 0
+            && self.aborted.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return ignore::WalkState::Quit;
+        }
         match entry {
             Ok(entry) => {
                 let seen = self.entries_seen.fetch_add(1, Ordering::Relaxed) + 1;
@@ -956,6 +1452,19 @@ impl ignore::ParallelVisitor for ParallelWalkCollector {
                         seen,
                         self.walk_start.elapsed()
                     );
+                }
+                if self.warn_threshold > 0
+                    && seen > self.warn_threshold
+                    && !self
+                        .warned
+                        .swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    emit_soft_warning(seen, self.walk_start);
+                }
+                if self.max_files > 0 && seen > self.max_files {
+                    self.aborted
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    return ignore::WalkState::Quit;
                 }
                 collect_walk_entry(&mut self.local, &entry);
             }
@@ -1165,6 +1674,17 @@ fn index_directory_scoped_with_max_depth(
     let walk_start = Instant::now();
     let mut collected = CollectedWalkData::default();
 
+    let max_files = if cap_disabled_for_root(conn) {
+        0
+    } else {
+        max_files_cap()
+    };
+    // The soft warning fires regardless of the hard cap bypass — even users
+    // who opt into indexing the whole monorepo deserve a heads-up that the
+    // run is going to be heavy.
+    let warn_threshold = warn_files_threshold();
+    let aborted_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let warned_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let walk_entries = if experimental_parallel_walk {
         builder.threads(num_threads);
         let shared = Arc::new(Mutex::new(CollectedWalkData::default()));
@@ -1174,6 +1694,10 @@ fn index_directory_scoped_with_max_depth(
             entries_seen: entries_seen.clone(),
             verbose,
             walk_start,
+            max_files,
+            warn_threshold,
+            aborted: aborted_flag.clone(),
+            warned: warned_flag.clone(),
         };
         builder.build_parallel().visit(&mut collector);
         let mut shared = shared.lock().unwrap();
@@ -1198,10 +1722,40 @@ fn index_directory_scoped_with_max_depth(
                     walk_start.elapsed()
                 );
             }
+            if warn_threshold > 0
+                && walk_entries > warn_threshold
+                && !warned_flag.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                emit_soft_warning(walk_entries, walk_start);
+            }
+            if max_files > 0 && walk_entries > max_files {
+                aborted_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                break;
+            }
             collect_walk_entry(&mut collected, &entry);
         }
         walk_entries
     };
+    let aborted_by_cap = aborted_flag.load(std::sync::atomic::Ordering::Relaxed);
+
+    if aborted_by_cap {
+        return Err(anyhow::anyhow!(
+            "walker stopped after {} candidate files (configurable cap).\n\
+             \n\
+             ast-index is tuned for a project subtree, not for a monorepo /\n\
+             VCS root. Re-run from a narrower subdirectory, or override:\n\
+             \n  ast-index rebuild --force\n\
+                 index this root anyway for one run (slow, may use a lot of memory)\n\
+             \n  ast-index rebuild --force --remember\n\
+                 same, but persist the opt-in for this project — subsequent\n\
+                 `ast-index rebuild` runs no longer hit the cap\n\
+             \n  ast-index rebuild --max-files 5000000\n\
+                 raise the cap explicitly for one run\n\
+             \n\
+             The cap also respects AST_INDEX_MAX_FILES (set to 0 to disable).",
+            max_files
+        ));
+    }
 
     let files = collected.files;
     let module_files = collected.module_files;
@@ -1333,6 +1887,7 @@ fn index_directory_scoped_with_max_depth(
         xcassets_dirs,
         xml_layout_files,
         res_files,
+        aborted_by_cap: false,
     })
 }
 
@@ -1394,7 +1949,7 @@ fn write_batch_to_db(
                     qualified_name,
                     sym.kind.as_str(),
                     sym.line as i64,
-                    sym.signature
+                    parsers::truncate_signature(&sym.signature)
                 ])?;
                 let symbol_id = tx.last_insert_rowid();
 
@@ -1498,7 +2053,7 @@ pub fn update_directory_incremental(
 
     // 3. Walk each (walk_dir, anchor) pair and categorize its files. Paths are
     //    stored relative to `anchor`, matching `index_directory_scoped`'s scheme.
-    let mut files_to_parse: Vec<(PathBuf, PathBuf)> = Vec::new(); // (anchor, file_path)
+    let mut files_to_parse: Vec<PendingUpdateFile> = Vec::new();
     let mut current_paths: std::collections::HashSet<(String, String)> =
         std::collections::HashSet::new();
 
@@ -1564,10 +2119,37 @@ pub fn update_directory_incremental(
             };
 
             if need_parse {
-                files_to_parse.push((anchor.clone(), file_path));
+                files_to_parse.push(PendingUpdateFile::Regular {
+                    root: anchor.clone(),
+                    path: file_path,
+                });
             }
             current_paths.insert((root_key, rel_path));
         }
+    }
+
+    let root_key = db::normalize_root_for_storage(root);
+    for (file_path, rel_path) in collect_node_modules_dts_files(root) {
+        let file_mtime = fs::metadata(&file_path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        let need_parse = match existing_files.get(&(root_key.clone(), rel_path.clone())) {
+            Some((_, db_mtime)) => file_mtime > *db_mtime,
+            None => true,
+        };
+
+        if need_parse {
+            files_to_parse.push(PendingUpdateFile::NodeModulesDts {
+                path: file_path,
+                rel_path: rel_path.clone(),
+                root_path: root_key.clone(),
+            });
+        }
+        current_paths.insert((root_key.clone(), rel_path));
     }
 
     // 4. Find deleted files
@@ -1612,13 +2194,7 @@ pub fn update_directory_incremental(
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|&n| n > 0)
-            .unwrap_or_else(|| {
-                if is_experimental_fast_rebuild_enabled() {
-                    effective_num_threads().max(16)
-                } else {
-                    32
-                }
-            });
+            .unwrap_or_else(|| effective_num_threads().max(16));
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(num_threads)
             .stack_size(RAYON_WORKER_STACK_SIZE)
@@ -1628,8 +2204,16 @@ pub fn update_directory_incremental(
         let parsed_files: Vec<ParsedFile> = pool.install(|| {
             files_to_parse
                 .par_iter()
-                .filter_map(|(file_root, path)| {
-                    let result = parse_file(file_root, path).ok();
+                .filter_map(|pending| {
+                    let result = match pending {
+                        PendingUpdateFile::Regular { root, path } => parse_file(root, path),
+                        PendingUpdateFile::NodeModulesDts {
+                            path,
+                            rel_path,
+                            root_path,
+                        } => parse_dts_file(path, rel_path, root_path),
+                    }
+                    .ok();
                     let c = parsed_count_clone.fetch_add(1, Ordering::Relaxed) + 1;
                     if progress && c % 500 == 0 {
                         eprintln!("Parsed {} / {} changed files...", c, total_files);
@@ -2109,7 +2693,6 @@ pub fn index_module_dependencies(
     gradle_files: &[PathBuf],
     progress: bool,
 ) -> Result<usize> {
-    let experimental_fast_rebuild = std::env::var("AST_INDEX_EXPERIMENTAL_FAST_REBUILD").is_ok();
     // Regex patterns for dependency declarations
     // Gradle projects DSL style: modules { api(projects.features.payments.api) }
     static PROJECTS_DEP_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -2199,7 +2782,7 @@ pub fn index_module_dependencies(
         });
         let maven_dep_re = &*MAVEN_DEP_RE;
 
-        let edges: Vec<(i64, i64, String)> = if experimental_fast_rebuild {
+        let edges: Vec<(i64, i64, String)> = {
             let num_threads = effective_num_threads();
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(num_threads)
@@ -2407,185 +2990,6 @@ pub fn index_module_dependencies(
                     })
                     .collect()
             })
-        } else {
-            let mut edges = Vec::new();
-            for path in gradle_files {
-                let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                let parent = match path.parent() {
-                    Some(p) => p,
-                    None => continue,
-                };
-
-                let source_module_name: String = match file_name {
-                    "ya.make" => {
-                        let rel = if let Some(ref mono) = mono_root {
-                            parent.strip_prefix(mono).ok()
-                        } else {
-                            None
-                        }
-                        .or_else(|| parent.strip_prefix(root).ok())
-                        .map(|p| p.to_path_buf())
-                        .unwrap_or_else(|| parent.to_path_buf());
-                        rel.to_string_lossy().replace('\\', "/")
-                    }
-                    "pyproject.toml" | "setup.py" | "setup.cfg" => {
-                        let module_path = parent
-                            .strip_prefix(root)
-                            .unwrap_or(parent)
-                            .to_string_lossy()
-                            .to_string();
-                        if module_path.is_empty() {
-                            if file_name == "pyproject.toml" {
-                                crate::encoding::read_file_to_string(path)
-                                    .ok()
-                                    .as_deref()
-                                    .and_then(extract_python_module_name)
-                                    .unwrap_or_else(|| {
-                                        root.file_name()
-                                            .and_then(|n| n.to_str())
-                                            .unwrap_or("root")
-                                            .to_string()
-                                    })
-                            } else {
-                                root.file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or("root")
-                                    .to_string()
-                            }
-                        } else {
-                            module_path.replace('/', ".")
-                        }
-                    }
-                    _ => parent
-                        .strip_prefix(root)
-                        .unwrap_or(parent)
-                        .to_string_lossy()
-                        .replace('/', "."),
-                };
-
-                let module_id = match module_ids.get(&source_module_name) {
-                    Some(&id) => id,
-                    None => continue,
-                };
-
-                let content = match crate::encoding::read_file_to_string(path) {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-
-                match file_name {
-                    "pom.xml" => {
-                        for caps in maven_dep_re.captures_iter(&content) {
-                            let artifact_id = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                            for (mod_name, &mod_id) in &module_ids {
-                                let last_segment = mod_name.rsplit('.').next().unwrap_or(mod_name);
-                                if last_segment == artifact_id {
-                                    edges.push((module_id, mod_id, "compile".to_string()));
-                                }
-                            }
-                        }
-                    }
-                    "ya.make" => {
-                        for caps in peerdir_re.captures_iter(&content) {
-                            let raw = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                            for token in raw.split_ascii_whitespace() {
-                                let dep_name = token.trim_end_matches(',').trim();
-                                if dep_name.is_empty() || dep_name.starts_with('#') {
-                                    continue;
-                                }
-                                let dep_name = dep_name.replace('\\', "/");
-                                if let Some(&dep_id) = module_ids.get(&dep_name) {
-                                    edges.push((module_id, dep_id, "peerdir".to_string()));
-                                }
-                            }
-                        }
-                    }
-                    "pyproject.toml" => {
-                        for caps in py_project_deps_re.captures_iter(&content) {
-                            let body = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                            for raw in extract_py_list_strings(body) {
-                                let dep_name = strip_py_version(&raw);
-                                if let Some(&dep_id) = module_ids.get(&dep_name) {
-                                    edges.push((module_id, dep_id, "compile".to_string()));
-                                }
-                            }
-                        }
-                        if let Some(caps) = py_poetry_section_re.captures(&content) {
-                            let section = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                            for line in section.lines() {
-                                let line = line.trim();
-                                if line.is_empty() || line.starts_with('#') || line.starts_with('[')
-                                {
-                                    continue;
-                                }
-                                if let Some(eq_pos) = line.find('=') {
-                                    let dep_name =
-                                        line[..eq_pos].trim().trim_matches('"').trim_matches('\'');
-                                    if dep_name == "python" || dep_name.is_empty() {
-                                        continue;
-                                    }
-                                    if let Some(&dep_id) = module_ids.get(dep_name) {
-                                        edges.push((module_id, dep_id, "compile".to_string()));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    "setup.py" | "setup.cfg" => {
-                        for caps in py_setup_deps_re.captures_iter(&content) {
-                            let body = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                            for raw in extract_py_list_strings(body) {
-                                let dep_name = strip_py_version(&raw);
-                                if let Some(&dep_id) = module_ids.get(&dep_name) {
-                                    edges.push((module_id, dep_id, "compile".to_string()));
-                                }
-                            }
-                        }
-                    }
-                    _ => {
-                        let mut inserted: std::collections::HashSet<(i64, i64)> =
-                            std::collections::HashSet::new();
-                        for caps in projects_dep_re.captures_iter(&content) {
-                            let dep_kind =
-                                caps.get(1).map(|m| m.as_str()).unwrap_or("implementation");
-                            let dep_name = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-                            if let Some(&dep_id) = module_ids.get(dep_name) {
-                                if inserted.insert((module_id, dep_id)) {
-                                    edges.push((module_id, dep_id, dep_kind.to_string()));
-                                }
-                            }
-                        }
-                        for caps in gradle_project_re.captures_iter(&content) {
-                            let dep_kind =
-                                caps.get(1).map(|m| m.as_str()).unwrap_or("implementation");
-                            let dep_path = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-                            let dep_name = dep_path.trim_start_matches(':').replace(':', ".");
-                            if let Some(&dep_id) = module_ids.get(&dep_name) {
-                                if inserted.insert((module_id, dep_id)) {
-                                    edges.push((module_id, dep_id, dep_kind.to_string()));
-                                }
-                            }
-                        }
-                        for (b_start, b_end) in find_forma_deps_blocks(&content) {
-                            let block = strip_kt_line_comments(&content[b_start..b_end]);
-                            for caps in project_only_re.captures_iter(&block) {
-                                let dep_path = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                                let dep_name = dep_path.trim_start_matches(':').replace(':', ".");
-                                if let Some(&dep_id) = module_ids.get(&dep_name) {
-                                    if inserted.insert((module_id, dep_id)) {
-                                        edges.push((
-                                            module_id,
-                                            dep_id,
-                                            "implementation".to_string(),
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            edges
         };
 
         for (module_id, dep_id, dep_kind) in edges {
@@ -2668,7 +3072,6 @@ pub fn index_xml_usages(
     xml_layout_files: &[PathBuf],
     progress: bool,
 ) -> Result<usize> {
-    let experimental_fast_rebuild = std::env::var("AST_INDEX_EXPERIMENTAL_FAST_REBUILD").is_ok();
     let module_lookup = ModuleLookup::from_db(conn)?;
 
     // Regex for class names in XML
@@ -2715,7 +3118,7 @@ pub fn index_xml_usages(
             String,
             &'static str,
             Option<String>,
-        )> = if experimental_fast_rebuild {
+        )> = {
             let num_threads = effective_num_threads();
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(num_threads)
@@ -2791,59 +3194,6 @@ pub fn index_xml_usages(
                     })
                     .collect()
             })
-        } else {
-            let mut rows = Vec::new();
-            for xml_path in xml_layout_files {
-                let rel_path = xml_path
-                    .strip_prefix(root)
-                    .unwrap_or(xml_path)
-                    .to_string_lossy()
-                    .to_string();
-                let module_id = module_lookup.find(&rel_path);
-
-                if let Ok(content) = crate::encoding::read_file_to_string(xml_path) {
-                    for (line_num, line) in content.lines().enumerate() {
-                        let line_num = line_num as i64 + 1;
-
-                        let element_id = id_re
-                            .captures(line)
-                            .map(|c| c.get(1).unwrap().as_str().to_string());
-
-                        if line.contains('<') && line.contains('.') {
-                            for caps in full_class_re.captures_iter(line) {
-                                rows.push((
-                                    module_id,
-                                    rel_path.clone(),
-                                    line_num,
-                                    caps.get(1).unwrap().as_str().to_string(),
-                                    "view_tag",
-                                    element_id.clone(),
-                                ));
-                            }
-                        }
-
-                        if line.contains("class") || line.contains("android:name") {
-                            let usage_type =
-                                if line.contains("<fragment") || line.contains("android:name") {
-                                    "fragment"
-                                } else {
-                                    "view_class_attr"
-                                };
-                            for caps in class_attr_re.captures_iter(line) {
-                                rows.push((
-                                    module_id,
-                                    rel_path.clone(),
-                                    line_num,
-                                    caps.get(1).unwrap().as_str().to_string(),
-                                    usage_type,
-                                    element_id.clone(),
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-            rows
         };
 
         for (module_id, rel_path, line_num, class_name, usage_type, element_id) in usage_rows {
@@ -2910,7 +3260,6 @@ pub fn index_resources(
     res_files: &[PathBuf],
     progress: bool,
 ) -> Result<(usize, usize)> {
-    let experimental_fast_rebuild = std::env::var("AST_INDEX_EXPERIMENTAL_FAST_REBUILD").is_ok();
     let module_lookup = ModuleLookup::from_db(conn)?;
 
     if progress {
@@ -3085,101 +3434,36 @@ pub fn index_resources(
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
             rows.filter_map(|r| r.ok()).collect()
         };
-        if experimental_fast_rebuild {
-            if progress {
-                eprintln!("Experimental fast rebuild: scanning resource usages in parallel...");
-            }
+        if progress {
+            eprintln!("Scanning resource usages in parallel...");
+        }
 
-            let num_threads = effective_num_threads();
+        let num_threads = effective_num_threads();
 
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(num_threads)
-                .stack_size(RAYON_WORKER_STACK_SIZE)
-                .build()
-                .map_err(|e| anyhow::anyhow!("Failed to build thread pool: {}", e))?;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .stack_size(RAYON_WORKER_STACK_SIZE)
+            .build()
+            .map_err(|e| anyhow::anyhow!("Failed to build thread pool: {}", e))?;
 
-            let root_buf = root.to_path_buf();
-            let resource_ids = Arc::new(resource_ids);
-            let usage_batches: Vec<Vec<(i64, String, i64, &'static str)>> = pool.install(|| {
-                code_rel_paths
-                    .par_iter()
-                    .map(|rel_path| {
-                        let file_path = root_buf.join(rel_path);
-                        let content = match crate::encoding::read_file_to_string(file_path) {
-                            Ok(content) => content,
-                            Err(_) => return Vec::new(),
-                        };
+        let root_buf = root.to_path_buf();
+        let resource_ids = Arc::new(resource_ids);
+        let usage_batches: Vec<Vec<(i64, String, i64, &'static str)>> = pool.install(|| {
+            code_rel_paths
+                .par_iter()
+                .map(|rel_path| {
+                    let file_path = root_buf.join(rel_path);
+                    let content = match crate::encoding::read_file_to_string(file_path) {
+                        Ok(content) => content,
+                        Err(_) => return Vec::new(),
+                    };
 
-                        let is_xml = rel_path.ends_with(".xml");
-                        let mut usages = Vec::new();
-
-                        for (line_idx, line) in content.lines().enumerate() {
-                            let line_num = line_idx as i64 + 1;
-
-                            if !is_xml && line.contains("R.") {
-                                for caps in r_ref_re.captures_iter(line) {
-                                    let res_type = caps.get(1).unwrap().as_str();
-                                    let res_name = caps.get(2).unwrap().as_str();
-
-                                    if let Some(&resource_id) =
-                                        resource_ids.get(res_type).and_then(|m| m.get(res_name))
-                                    {
-                                        usages.push((
-                                            resource_id,
-                                            rel_path.clone(),
-                                            line_num,
-                                            "code",
-                                        ));
-                                    }
-                                }
-                            }
-
-                            if line.contains('@') {
-                                for caps in xml_ref_re.captures_iter(line) {
-                                    let res_type = caps.get(1).unwrap().as_str();
-                                    let res_name = caps.get(2).unwrap().as_str();
-
-                                    if let Some(&resource_id) =
-                                        resource_ids.get(res_type).and_then(|m| m.get(res_name))
-                                    {
-                                        usages.push((
-                                            resource_id,
-                                            rel_path.clone(),
-                                            line_num,
-                                            "xml",
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-
-                        usages
-                    })
-                    .collect()
-            });
-
-            for batch in usage_batches {
-                for (resource_id, rel_path, line_num, usage_type) in batch {
-                    usage_stmt.execute(rusqlite::params![
-                        resource_id,
-                        rel_path,
-                        line_num,
-                        usage_type
-                    ])?;
-                    usage_count += 1;
-                }
-            }
-        } else {
-            for rel_path in &code_rel_paths {
-                let file_path = root.join(rel_path);
-
-                if let Ok(content) = crate::encoding::read_file_to_string(file_path) {
                     let is_xml = rel_path.ends_with(".xml");
+                    let mut usages = Vec::new();
 
-                    for (line_num, line) in content.lines().enumerate() {
-                        let line_num = line_num + 1;
+                    for (line_idx, line) in content.lines().enumerate() {
+                        let line_num = line_idx as i64 + 1;
 
-                        // R.type.name references (Kotlin/Java)
                         if !is_xml && line.contains("R.") {
                             for caps in r_ref_re.captures_iter(line) {
                                 let res_type = caps.get(1).unwrap().as_str();
@@ -3188,18 +3472,11 @@ pub fn index_resources(
                                 if let Some(&resource_id) =
                                     resource_ids.get(res_type).and_then(|m| m.get(res_name))
                                 {
-                                    usage_stmt.execute(rusqlite::params![
-                                        resource_id,
-                                        rel_path,
-                                        line_num as i64,
-                                        "code"
-                                    ])?;
-                                    usage_count += 1;
+                                    usages.push((resource_id, rel_path.clone(), line_num, "code"));
                                 }
                             }
                         }
 
-                        // @type/name references (XML)
                         if line.contains('@') {
                             for caps in xml_ref_re.captures_iter(line) {
                                 let res_type = caps.get(1).unwrap().as_str();
@@ -3208,18 +3485,26 @@ pub fn index_resources(
                                 if let Some(&resource_id) =
                                     resource_ids.get(res_type).and_then(|m| m.get(res_name))
                                 {
-                                    usage_stmt.execute(rusqlite::params![
-                                        resource_id,
-                                        rel_path,
-                                        line_num as i64,
-                                        "xml"
-                                    ])?;
-                                    usage_count += 1;
+                                    usages.push((resource_id, rel_path.clone(), line_num, "xml"));
                                 }
                             }
                         }
                     }
-                }
+
+                    usages
+                })
+                .collect()
+        });
+
+        for batch in usage_batches {
+            for (resource_id, rel_path, line_num, usage_type) in batch {
+                usage_stmt.execute(rusqlite::params![
+                    resource_id,
+                    rel_path,
+                    line_num,
+                    usage_type
+                ])?;
+                usage_count += 1;
             }
         }
     }
@@ -3754,30 +4039,15 @@ pub fn index_ios_package_managers(conn: &Connection, root: &Path, progress: bool
     Ok(count)
 }
 
-/// Index .d.ts files from node_modules (type declarations for external libraries).
-/// These provide symbol definitions for imported libraries (e.g., React, lodash).
-/// Only .d.ts files are indexed — not full JS/TS source from node_modules.
-///
-/// Handles pnpm (symlinks to store) by resolving top-level package symlinks
-/// and mapping paths back to node_modules/... for storage.
-/// Does NOT use follow_links to avoid loops on FUSE mounts (Arcadia).
-pub fn index_node_modules_dts(conn: &mut Connection, root: &Path, progress: bool) -> Result<usize> {
+fn collect_node_modules_dts_files(root: &Path) -> Vec<(PathBuf, String)> {
     use ignore::WalkBuilder;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Instant;
 
     let node_modules = root.join("node_modules");
     if !node_modules.exists() || !node_modules.is_dir() {
-        return Ok(0);
+        return Vec::new();
     }
 
     let verbose = std::env::var("AST_INDEX_VERBOSE").is_ok();
-
-    if progress {
-        eprintln!("Scanning node_modules for .d.ts type declarations...");
-    }
-
-    let walk_start = Instant::now();
 
     // Collect (resolved_dir, node_modules_prefix) pairs.
     // Resolves symlinks only at the package level (safe for pnpm).
@@ -3865,6 +4135,33 @@ pub fn index_node_modules_dts(conn: &mut Connection, root: &Path, progress: bool
         }
     }
 
+    dts_files
+}
+
+/// Index .d.ts files from node_modules (type declarations for external libraries).
+/// These provide symbol definitions for imported libraries (e.g., React, lodash).
+/// Only .d.ts files are indexed — not full JS/TS source from node_modules.
+///
+/// Handles pnpm (symlinks to store) by resolving top-level package symlinks
+/// and mapping paths back to node_modules/... for storage.
+/// Does NOT use follow_links to avoid loops on FUSE mounts (Arcadia).
+pub fn index_node_modules_dts(conn: &mut Connection, root: &Path, progress: bool) -> Result<usize> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
+
+    let node_modules = root.join("node_modules");
+    if !node_modules.exists() || !node_modules.is_dir() {
+        return Ok(0);
+    }
+
+    if progress {
+        eprintln!("Scanning node_modules for .d.ts type declarations...");
+    }
+
+    let walk_start = Instant::now();
+    let verbose = std::env::var("AST_INDEX_VERBOSE").is_ok();
+    let dts_files = collect_node_modules_dts_files(root);
+
     if dts_files.is_empty() {
         if verbose {
             eprintln!("[verbose] no .d.ts files found in node_modules");
@@ -3943,8 +4240,7 @@ fn parse_dts_file(file_path: &Path, rel_path: &str, root_path: &str) -> Result<P
         .as_secs() as i64;
     let size = metadata.len() as i64;
 
-    // Skip files larger than 1 MB
-    if size > 1_000_000 {
+    if (size as u64) > max_file_size_bytes() {
         return Ok(ParsedFile {
             rel_path: rel_path.to_string(),
             root_path: root_path.to_string(),

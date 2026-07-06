@@ -207,7 +207,7 @@ fn list_roots_works_without_extras() {
     let primary = TempDir::new().unwrap();
     let _ = open_fresh_db(primary.path());
 
-    cmd_list_roots(primary.path()).expect("list_roots with no extras must succeed");
+    cmd_list_roots(primary.path(), "text").expect("list_roots with no extras must succeed");
 }
 
 #[test]
@@ -280,4 +280,187 @@ fn rebuild_sub_projects_keeps_root_direct_entries() {
     assert!(db_has_file(&conn, "app/main.sh"));
     assert!(db_has_module(&conn, "workspace", ""));
     assert!(db_has_module(&conn, "workspace/app", "app"));
+}
+
+/// Regression: `cmd_rebuild` used to round-trip subtrees through the legacy
+/// `metadata.extra_roots` JSON column (just canonical paths), wiping the
+/// user-chosen name and the original (relative) path form on every rebuild.
+/// After the fix, both fields survive verbatim.
+#[test]
+fn rebuild_preserves_subtree_names_and_original_paths() {
+    let primary = TempDir::new().unwrap();
+    let extra1 = TempDir::new().unwrap();
+    let extra2 = TempDir::new().unwrap();
+
+    fs::write(primary.path().join("main.rs"), "fn main() {}\n").unwrap();
+    fs::write(extra1.path().join("a.rs"), "fn a() {}\n").unwrap();
+    fs::write(extra2.path().join("b.rs"), "fn b() {}\n").unwrap();
+
+    // Initial rebuild + manually attach two named subtrees with distinct
+    // original_path forms (one absolute, one relative-style).
+    cmd_rebuild(
+        primary.path(),
+        "all",
+        false,
+        false,
+        false,
+        false,
+        true,
+        &[],
+        &[],
+        &[],
+    )
+    .expect("initial rebuild must succeed");
+
+    {
+        let conn = db::open_db(primary.path()).unwrap();
+        let extra1_canonical = db::safe_canonicalize(extra1.path())
+            .to_string_lossy()
+            .into_owned();
+        let extra2_canonical = db::safe_canonicalize(extra2.path())
+            .to_string_lossy()
+            .into_owned();
+        db::insert_subtree(
+            &conn,
+            "my-extra1",
+            &extra1_canonical,
+            &extra1.path().to_string_lossy(),
+        )
+        .unwrap();
+        db::insert_subtree(&conn, "my-extra2", &extra2_canonical, "../extra2-relative").unwrap();
+    }
+
+    // Rebuild again. Pre-fix, this collapsed `(name, canonical, original)`
+    // to bare canonical-only and re-imported as `(basename, canonical,
+    // canonical)`.
+    cmd_rebuild(
+        primary.path(),
+        "all",
+        false,
+        false,
+        false,
+        false,
+        true,
+        &[],
+        &[],
+        &[],
+    )
+    .expect("second rebuild must succeed");
+
+    let conn = db::open_db(primary.path()).unwrap();
+    let subtrees = db::list_subtrees(&conn).unwrap();
+    assert_eq!(
+        subtrees.len(),
+        2,
+        "both subtrees must survive rebuild, got: {:?}",
+        subtrees
+    );
+
+    let s1 = subtrees
+        .iter()
+        .find(|s| s.name == "my-extra1")
+        .expect("user-chosen name 'my-extra1' must survive rebuild");
+    assert_eq!(
+        s1.original_path,
+        extra1.path().to_string_lossy(),
+        "original_path must survive verbatim, not be replaced by canonical"
+    );
+
+    let s2 = subtrees
+        .iter()
+        .find(|s| s.name == "my-extra2")
+        .expect("user-chosen name 'my-extra2' must survive rebuild");
+    assert_eq!(
+        s2.original_path, "../extra2-relative",
+        "relative original_path must survive verbatim across rebuild"
+    );
+}
+
+#[test]
+fn rebuild_sub_projects_preserves_and_indexes_subtrees() {
+    let primary = TempDir::new().unwrap();
+    let extra = TempDir::new().unwrap();
+
+    fs::create_dir_all(primary.path().join("app/src")).unwrap();
+    fs::write(
+        primary.path().join("app/Cargo.toml"),
+        "[package]\nname=\"app\"\nversion=\"0\"\n",
+    )
+    .unwrap();
+    fs::write(
+        primary.path().join("app/src/lib.rs"),
+        "pub fn primary_sub_project_fn() {}\n",
+    )
+    .unwrap();
+
+    fs::create_dir_all(extra.path().join("src")).unwrap();
+    fs::write(
+        extra.path().join("Cargo.toml"),
+        "[package]\nname=\"extra\"\nversion=\"0\"\n",
+    )
+    .unwrap();
+    fs::write(
+        extra.path().join("src/lib.rs"),
+        "pub fn extra_sub_project_fn() {}\n",
+    )
+    .unwrap();
+
+    cmd_rebuild(
+        primary.path(),
+        "all",
+        false,
+        false,
+        true,
+        false,
+        true,
+        &[],
+        &[],
+        &[],
+    )
+    .expect("initial sub-project rebuild must succeed");
+
+    {
+        let conn = db::open_db(primary.path()).unwrap();
+        let extra_canonical = db::safe_canonicalize(extra.path())
+            .to_string_lossy()
+            .into_owned();
+        db::insert_subtree(&conn, "extra", &extra_canonical, "../extra").unwrap();
+    }
+
+    cmd_rebuild(
+        primary.path(),
+        "all",
+        false,
+        false,
+        true,
+        false,
+        true,
+        &[],
+        &[],
+        &[],
+    )
+    .expect("second sub-project rebuild must preserve subtrees");
+
+    let conn = db::open_db(primary.path()).unwrap();
+    let subtrees = db::list_subtrees(&conn).unwrap();
+    assert_eq!(
+        subtrees.len(),
+        1,
+        "attached subtree must survive sub-project rebuild, got: {:?}",
+        subtrees
+    );
+    assert_eq!(subtrees[0].name, "extra");
+    assert_eq!(subtrees[0].original_path, "../extra");
+
+    let symbols = db::search_symbols(&conn, "extra_sub_project_fn", 10).unwrap();
+    assert_eq!(
+        symbols.len(),
+        1,
+        "extra-root symbols must be reindexed in sub-project mode"
+    );
+    let extra_root_key = db::normalize_root_for_storage(extra.path());
+    assert_eq!(
+        symbols[0].root_path.as_deref(),
+        Some(extra_root_key.as_str())
+    );
 }
