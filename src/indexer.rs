@@ -703,7 +703,7 @@ fn has_kmp_markers(root: &Path) -> (bool, Vec<String>) {
             if !path.is_file() {
                 continue;
             }
-            if let Ok(content) = fs::read_to_string(&path) {
+            if let Ok(content) = crate::encoding::read_file_to_string(&path) {
                 if content.contains("kotlin(\"multiplatform\")")
                     || content.contains("org.jetbrains.kotlin.multiplatform")
                 {

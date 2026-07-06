@@ -10,7 +10,6 @@
 //! RWR ranking — that is Stage B.
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -486,7 +485,7 @@ fn emit_json(
 
 fn read_snippet(root: &Path, sym: &SearchResult) -> Option<String> {
     let abs = abs_path(root, &sym.path, sym.root_path.as_deref());
-    let content = fs::read_to_string(&abs).ok()?;
+    let content = crate::encoding::read_file_to_string(&abs).ok()?;
     let lines: Vec<&str> = content.lines().collect();
     if lines.is_empty() {
         return None;
