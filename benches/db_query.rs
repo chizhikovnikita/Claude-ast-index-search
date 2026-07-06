@@ -57,7 +57,6 @@ fn indexed_repo() -> &'static IndexedRepo {
             false,
             false,
             None,
-            None,
         )
         .expect("index_directory_scoped");
 
