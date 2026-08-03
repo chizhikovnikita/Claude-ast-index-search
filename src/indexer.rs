@@ -1931,7 +1931,13 @@ fn write_batch_to_db(
                 refs,
             } = pf;
 
-            file_stmt.execute(rusqlite::params![rel_path, root_path, mtime, size])?;
+            file_stmt.execute(rusqlite::params![rel_path, root_path, mtime, size])
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "insert file failed: root_path={} rel_path={}: {}",
+                        root_path, rel_path, e
+                    )
+                })?;
             let file_id = tx.last_insert_rowid();
             // `INSERT OR REPLACE` on `files.path` drops the previous file row first, and
             // `ON DELETE CASCADE` clears old symbols/refs automatically. Explicit deletes
