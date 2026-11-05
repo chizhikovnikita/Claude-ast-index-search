@@ -1,6 +1,6 @@
 ---
 name: initialize-ios
-description: Initialize ast-index for iOS/Swift/ObjC project - configures .claude/settings.json and CLAUDE.md
+description: "Manual override: initialize ast-index for iOS/Swift/ObjC project"
 ---
 
 # Initialize ast-index for iOS Project
@@ -35,79 +35,86 @@ Then create or merge into `.claude/settings.json`. If file doesn't exist, create
 
 ```json
 {
+  "extraKnownMarketplaces": {
+    "ast-index": {
+      "source": {
+        "source": "github",
+        "repo": "defendend/Claude-ast-index-search"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "ast-index@ast-index": true
+  },
   "permissions": {
     "allow": [
+      "Bash(ya tool ast-index *)",
       "Bash(ast-index *)"
     ]
-  },
-  "rules": [
-    "When searching for classes, symbols, files, or code patterns - use `ast-index` CLI for fast indexed search instead of grep/find/Glob",
-    "For finding class/protocol definitions use `ast-index class \"ClassName\"`",
-    "For finding symbol usages use `ast-index usages \"SymbolName\"`",
-    "For finding protocol conformances use `ast-index implementations \"ProtocolName\"`",
-    "For understanding call hierarchy use `ast-index call-tree \"functionName\" --depth 3`",
-    "For exploring class inheritance use `ast-index hierarchy \"ClassName\"`",
-    "For finding SwiftUI views and property wrappers use `ast-index swiftui`",
-    "For finding async functions use `ast-index async-funcs`",
-    "For finding @MainActor usages use `ast-index main-actor`",
-    "For SPM module dependency analysis use `ast-index deps/dependents \"ModuleName\"`",
-    "Run `ast-index update` periodically to keep index fresh after code changes"
-  ]
+  }
 }
 ```
 
-**Important**: If `.claude/settings.json` already exists, MERGE the rules array (don't replace). Check for duplicates before adding.
+**Important**: If `.claude/settings.json` already exists, MERGE the keys (don't replace the whole file).
 
-### 3. Update .claude/CLAUDE.md
+### 3. Create .claude/rules/ast-index.md (CRITICAL)
 
-If `.claude/CLAUDE.md` doesn't exist, create it:
+Create the rules directory and ast-index rules file:
 
 ```bash
-touch .claude/CLAUDE.md
+mkdir -p .claude/rules
 ```
 
-Then append this section at the end of the file:
+Create file `.claude/rules/ast-index.md` with this content:
 
 ```markdown
+# ast-index Rules
 
-## ast-index - Code Search Tool
+## Mandatory Search Rules
 
-Fast native CLI for structural code search in iOS/Swift/Objective-C projects.
+1. **ALWAYS use ast-index FIRST** for any code search task
+2. **NEVER duplicate results** — if ast-index found usages/implementations, that IS the complete answer
+3. **DO NOT run grep "for completeness"** after ast-index returns results
+4. **Use grep/Search ONLY when:**
+   - ast-index returns empty results
+   - Searching for regex patterns (ast-index uses literal match)
+   - Searching for string literals inside code (`"some text"`)
+   - Searching in comments content
 
-### Quick Reference
+## Why ast-index
+
+ast-index is 17-69x faster than grep (1-10ms vs 200ms-3s) and returns structured, accurate results.
+
+## Command Reference
+
+| Task | Command | Time |
+|------|---------|------|
+| Universal search | `ast-index search "query"` | ~10ms |
+| Find class/protocol | `ast-index class "ClassName"` | ~1ms |
+| Find usages | `ast-index usages "SymbolName"` | ~8ms |
+| Find conformances | `ast-index implementations "Protocol"` | ~5ms |
+| Call hierarchy | `ast-index call-tree "function" --depth 3` | ~1s |
+| Class hierarchy | `ast-index hierarchy "ClassName"` | ~5ms |
+| Find callers | `ast-index callers "functionName"` | ~1s |
+| Module deps | `ast-index deps "ModuleName"` | ~10ms |
+| File outline | `ast-index outline "File.swift"` | ~1ms |
+
+## iOS-Specific Commands
 
 | Task | Command |
 |------|---------|
-| Universal search | `ast-index search "query"` |
-| Find class/protocol | `ast-index class "ClassName"` |
-| Find usages | `ast-index usages "SymbolName"` |
-| Find conformances | `ast-index implementations "Protocol"` |
-| Call hierarchy | `ast-index call-tree "function" --depth 3` |
-| Class hierarchy | `ast-index hierarchy "ClassName"` |
-| Find callers | `ast-index callers "functionName"` |
-| Module deps | `ast-index deps "ModuleName"` |
-| File outline | `ast-index outline "File.swift"` |
-
-### iOS-Specific Commands
-
-| Task | Command |
-|------|---------|
-| SwiftUI views | `ast-index swiftui "query"` |
-| Async functions | `ast-index async-funcs "query"` |
+| SwiftUI views | `ast-index swiftui` |
+| Async functions | `ast-index async-funcs` |
 | @MainActor | `ast-index main-actor` |
-| Combine publishers | `ast-index publishers "query"` |
-| Storyboard usages | `ast-index storyboard-usages "ClassName"` |
-| Asset usages | `ast-index asset-usages "asset-name"` |
+| Combine publishers | `ast-index publishers` |
+| Storyboard usages | `ast-index storyboard-usages "Class"` |
+| Asset usages | `ast-index asset-usages "name"` |
 
-### Index Management
+## Index Management
 
-```bash
-ast-index rebuild    # Full reindex (run once after clone)
-ast-index update     # Incremental update (run periodically)
-ast-index stats      # Show index statistics
-```
-
-Performance: search ~10ms, usages ~8ms, class ~1ms (indexed queries).
+- `ast-index rebuild` — Full reindex (run once after clone)
+- `ast-index update` — After git pull/merge
+- `ast-index stats` — Show index statistics
 ```
 
 ### 4. Build the Index
@@ -115,7 +122,6 @@ Performance: search ~10ms, usages ~8ms, class ~1ms (indexed queries).
 Run initial indexing:
 
 ```bash
-cd <project-root>
 ast-index rebuild
 ```
 
@@ -133,7 +139,7 @@ ast-index search "ViewController"
 ## Output
 
 After completion, inform user:
-- settings.json has been configured with ast-index rules
-- CLAUDE.md has been updated with ast-index reference
+- settings.json has been configured with ast-index permissions
+- Rules file created at .claude/rules/ast-index.md
 - Index has been built with X files and Y symbols
 - Ready to use ast-index for code search
