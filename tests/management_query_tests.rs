@@ -139,13 +139,7 @@ fn add_root_persists_to_db() {
 
     let conn = db::open_db(primary.path()).unwrap();
     let roots = db::get_extra_roots(&conn).unwrap();
-    assert!(
-        roots
-            .iter()
-            .any(|r| r.contains(extra.path().to_string_lossy().as_ref())),
-        "extra root must be persisted: {:?}",
-        roots
-    );
+    assert_eq!(roots, vec![db::normalize_root_for_storage(extra.path())]);
 }
 
 #[test]

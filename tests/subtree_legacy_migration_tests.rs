@@ -408,7 +408,12 @@ fn open_db_migrates_legacy_schemas_atomically_and_idempotently() {
     let cli_project = tmp.path().join("cli-project");
     std::fs::create_dir(&cli_project).unwrap();
     let cli_db = tmp.path().join("cli.sqlite");
-    create_legacy_db(&cli_db, r#"["/legacy/alpha","/legacy/beta"]"#);
+    // Fully qualified paths keep this fixture independent of the parent's
+    // and CLI's current drives on Windows (for example D: versus C: in CI).
+    let legacy_alpha = tmp.path().join("legacy/alpha");
+    let legacy_beta = tmp.path().join("legacy/beta");
+    let legacy_roots = serde_json::to_string(&[&legacy_alpha, &legacy_beta]).unwrap();
+    create_legacy_db(&cli_db, &legacy_roots);
 
     let output = Command::new(env!("CARGO_BIN_EXE_ast-index"))
         .current_dir(&cli_project)
@@ -433,13 +438,13 @@ fn open_db_migrates_legacy_schemas_atomically_and_idempotently() {
         serde_json::json!([
             {
                 "name": "alpha",
-                "canonical_path": db::normalize_root_for_storage(Path::new("/legacy/alpha")),
-                "original_path": "/legacy/alpha"
+                "canonical_path": db::normalize_root_for_storage(&legacy_alpha),
+                "original_path": legacy_alpha.to_string_lossy()
             },
             {
                 "name": "beta",
-                "canonical_path": db::normalize_root_for_storage(Path::new("/legacy/beta")),
-                "original_path": "/legacy/beta"
+                "canonical_path": db::normalize_root_for_storage(&legacy_beta),
+                "original_path": legacy_beta.to_string_lossy()
             }
         ])
     );
