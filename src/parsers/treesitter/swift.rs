@@ -5,7 +5,8 @@ use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
 use super::{
-    line_text, node_line, node_text, parse_tree, walk_tree_preorder, LanguageParser, WalkControl,
+    line_text, node_line, node_text, parse_tree, signature_line, text_end_line, walk_tree_preorder,
+    LanguageParser, WalkControl,
 };
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
@@ -21,7 +22,26 @@ pub static SWIFT_PARSER: SwiftParser = SwiftParser;
 
 pub struct SwiftParser;
 
+/// Comments, string and regex literals; the interpolations of a string are code.
+static NON_CODE: super::NonCode = super::NonCode {
+    language: &SWIFT_LANGUAGE,
+    prose: &["comment", "multiline_comment"],
+    strings: &[
+        "line_string_literal",
+        "multi_line_string_literal",
+        "raw_string_literal",
+        "regex_literal",
+    ],
+    code: &["interpolated_expression", "raw_str_interpolation"],
+    keep: super::keep_no_string,
+    declared: super::declares_nothing,
+};
+
 impl LanguageParser for SwiftParser {
+    fn non_code(&self) -> Option<&'static super::NonCode> {
+        Some(&NON_CODE)
+    }
+
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &SWIFT_LANGUAGE)?;
         let mut symbols = Vec::new();
@@ -46,10 +66,28 @@ impl LanguageParser for SwiftParser {
         let idx_init_name = idx("init_name");
         let idx_prop_name = idx("prop_name");
         let idx_typealias_name = idx("typealias_name");
+        let idx_import_name = idx("import_name");
+        let idx_definition = idx("definition");
 
         let mut matches = cursor.matches(query, tree.root_node(), content.as_bytes());
 
         while let Some(m) = matches.next() {
+            let end_line = find_capture(m, idx_definition).map(|c| text_end_line(content, &c.node));
+
+            // Import: the imported module name (a Swift module is its target name)
+            if let Some(cap) = find_capture(m, idx_import_name) {
+                let line = node_line(&cap.node);
+                symbols.push(ParsedSymbol {
+                    name: node_text(content, &cap.node).to_string(),
+                    kind: SymbolKind::Import,
+                    line,
+                    end_line,
+                    signature: signature_line(content, line),
+                    parents: vec![],
+                });
+                continue;
+            }
+
             // Class / Struct / Actor
             if let Some(name_cap) = find_capture(m, idx_class_name) {
                 let name = node_text(content, &name_cap.node);
@@ -75,8 +113,9 @@ impl LanguageParser for SwiftParser {
                     name: name.to_string(),
                     kind,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents,
+                    end_line,
                 });
                 continue;
             }
@@ -96,8 +135,9 @@ impl LanguageParser for SwiftParser {
                     name: name.to_string(),
                     kind: SymbolKind::Enum,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents,
+                    end_line,
                 });
                 continue;
             }
@@ -107,6 +147,9 @@ impl LanguageParser for SwiftParser {
                 let type_name = node_text(content, &ext_cap.node);
                 // Strip generic parameters if present
                 let base_name = type_name.split('<').next().unwrap_or(type_name).trim();
+                // `extension Outer.Inner` extends Inner; keep the simple name so
+                // hierarchy/implementations lookups by type name find it.
+                let base_name = base_name.rsplit('.').next().unwrap_or(base_name).trim();
                 let extended_name = format!("{}+Extension", base_name);
                 let line = node_line(&ext_cap.node);
 
@@ -121,8 +164,9 @@ impl LanguageParser for SwiftParser {
                     name: extended_name,
                     kind: SymbolKind::Object,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents,
+                    end_line,
                 });
                 continue;
             }
@@ -142,8 +186,9 @@ impl LanguageParser for SwiftParser {
                     name: name.to_string(),
                     kind: SymbolKind::Interface,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents,
+                    end_line,
                 });
                 continue;
             }
@@ -164,6 +209,7 @@ impl LanguageParser for SwiftParser {
                     line,
                     signature,
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -175,22 +221,27 @@ impl LanguageParser for SwiftParser {
                     name: "init".to_string(),
                     kind: SymbolKind::Function,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
 
-            // Property
+            // Property (members and globals only, like Kotlin: locals are not symbols)
             if let Some(cap) = find_capture(m, idx_prop_name) {
+                if is_local_declaration(&cap.node) {
+                    continue;
+                }
                 let name = node_text(content, &cap.node);
                 let line = node_line(&cap.node);
                 symbols.push(ParsedSymbol {
                     name: name.to_string(),
                     kind: SymbolKind::Property,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -203,8 +254,9 @@ impl LanguageParser for SwiftParser {
                     name: name.to_string(),
                     kind: SymbolKind::TypeAlias,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -278,6 +330,19 @@ fn extract_func_signature(content: &str, func_node: &tree_sitter::Node) -> Strin
 fn find_type_identifier_in(node: &tree_sitter::Node, content: &str) -> Option<String> {
     let mut found = None;
     walk_tree_preorder(node, |child| {
+        // A module-qualified type (`Module.Proto`) is a user_type with several
+        // type_identifier children; the last one is the type itself.
+        if child.kind() == "user_type" {
+            let mut cursor = child.walk();
+            let last = child
+                .children(&mut cursor)
+                .filter(|c| c.kind() == "type_identifier")
+                .last();
+            if let Some(last) = last {
+                found = Some(node_text(content, &last).trim().to_string());
+                return WalkControl::Stop;
+            }
+        }
         if child.kind() == "type_identifier" {
             let name = node_text(content, &child);
             let name = name.split('<').next().unwrap_or(name).trim();
@@ -289,6 +354,27 @@ fn find_type_identifier_in(node: &tree_sitter::Node, content: &str) -> Option<St
         WalkControl::Continue
     });
     found
+}
+
+/// Whether a declaration sits inside executable code (function or initializer
+/// body, closure, accessor) rather than a type body or at file scope.
+fn is_local_declaration(node: &tree_sitter::Node) -> bool {
+    let mut current = node.parent();
+    while let Some(n) = current {
+        match n.kind() {
+            "function_body"
+            | "lambda_literal"
+            | "computed_property"
+            | "computed_getter"
+            | "computed_setter"
+            | "computed_modify"
+            | "willset_didset_block"
+            | "statements" => return true,
+            "class_body" | "protocol_body" | "enum_class_body" | "source_file" => return false,
+            _ => current = n.parent(),
+        }
+    }
+    false
 }
 
 /// Find a capture by index in a match
@@ -569,6 +655,52 @@ mod tests {
         assert!(!symbols.iter().any(|s| s.name == "FakeClass"));
         assert!(symbols.iter().any(|s| s.name == "realFunc"));
         assert!(!symbols.iter().any(|s| s.name == "fakeFunc"));
+    }
+
+    #[test]
+    fn test_local_variables_are_not_symbols() {
+        let content = "let global = 0\nclass A {\n  let field = 1\n  var computed: Int { let tmp = 2; return tmp }\n  func f() {\n    let local = 3\n    run { var inClosure = 4 }\n  }\n  init() { let inInit = 5 }\n}\n";
+        let symbols = SWIFT_PARSER.parse_symbols(content).unwrap();
+        let properties: Vec<&str> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Property)
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(properties, ["global", "field", "computed"]);
+    }
+
+    #[test]
+    fn test_imports_record_module_names() {
+        let content = "import UIKit\n@testable import Foo.Bar\nimport struct Baz.Qux\n#if canImport(X)\nimport X\n#endif\n";
+        let symbols = SWIFT_PARSER.parse_symbols(content).unwrap();
+        let imports: Vec<(&str, usize)> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Import)
+            .map(|s| (s.name.as_str(), s.line))
+            .collect();
+        assert_eq!(imports, [("UIKit", 1), ("Foo", 2), ("Baz", 3), ("X", 5)]);
+    }
+
+    #[test]
+    fn test_module_qualified_conformances_resolve_to_simple_names() {
+        let content =
+            "class A: UIKit.UIView, Sdk.Listener<Int> {}\nextension Outer.Inner: Sdk.Proto {}\n";
+        let symbols = SWIFT_PARSER.parse_symbols(content).unwrap();
+        let a = symbols.iter().find(|s| s.name == "A").unwrap();
+        assert_eq!(
+            a.parents,
+            [
+                ("UIView".to_string(), "extends".to_string()),
+                ("Listener".to_string(), "implements".to_string()),
+            ]
+        );
+        let ext = symbols
+            .iter()
+            .find(|s| s.name == "Inner+Extension")
+            .unwrap();
+        assert!(ext
+            .parents
+            .contains(&("Proto".to_string(), "implements".to_string())));
     }
 
     #[test]

@@ -10,6 +10,7 @@
 //! follows the project requirement of "maximum fault-tolerance" — a partially
 //! decoded file still yields useful symbols, whereas a skipped file yields none.
 
+use std::borrow::Cow;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -39,10 +40,13 @@ pub fn read_file_to_string<P: AsRef<Path>>(path: P) -> std::io::Result<String> {
 ///
 /// Never errors. `origin` is used only for the per-file verbose log.
 pub fn decode_bytes(bytes: &[u8], origin: Option<&Path>) -> String {
-    if std::str::from_utf8(bytes).is_ok() {
-        // Safety: validity just confirmed by `from_utf8`. Skipping the second
-        // validation inside `String::from_utf8` keeps the UTF-8 fast path free.
-        return unsafe { String::from_utf8_unchecked(bytes.to_vec()) };
+    decode_bytes_cow(bytes, origin).into_owned()
+}
+
+/// Borrows valid UTF-8 so source searches need no additional content allocation.
+pub fn decode_bytes_cow<'a>(bytes: &'a [u8], origin: Option<&Path>) -> Cow<'a, str> {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return Cow::Borrowed(text);
     }
 
     let mut det = chardetng::EncodingDetector::new();
@@ -58,7 +62,7 @@ pub fn decode_bytes(bytes: &[u8], origin: Option<&Path>) -> String {
             .unwrap_or_else(|| "<bytes>".to_string());
         eprintln!("[encoding] decoded {} as {}", p, encoding.name());
     }
-    cow.into_owned()
+    cow
 }
 
 /// Atomically reads and resets `FALLBACK_DECODE_COUNT`.
@@ -72,13 +76,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn utf8_passthrough_does_not_touch_counter() {
-        let before = FALLBACK_DECODE_COUNT.load(Ordering::Relaxed);
+    fn utf8_passthrough_borrows_original_content() {
         let s = "hello, мир";
-        let out = decode_bytes(s.as_bytes(), None);
-        let after = FALLBACK_DECODE_COUNT.load(Ordering::Relaxed);
+        let out = decode_bytes_cow(s.as_bytes(), None);
+        assert!(matches!(out, Cow::Borrowed(_)));
         assert_eq!(out, s);
-        assert_eq!(before, after, "UTF-8 fast path must not touch counter");
     }
 
     #[test]

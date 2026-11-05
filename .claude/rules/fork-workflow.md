@@ -1,81 +1,57 @@
 # Fork workflow
 
-This repository is a **fork** of
-[defendend/Claude-ast-index-search](https://github.com/defendend/Claude-ast-index-search).
-The fork lives at
+The working repository is
 [chizhikovnikita/Claude-ast-index-search](https://github.com/chizhikovnikita/Claude-ast-index-search).
+[defendend/Claude-ast-index-search](https://github.com/defendend/Claude-ast-index-search)
+is a read-only source of updates. Never push commits, branches, or tags to
+the original repository, including through a direct URL or another remote.
+Create local commits on fork branches and publish only to the fork.
 
-## Remotes
+## Git protection
 
-```
-origin    →  https://github.com/chizhikovnikita/Claude-ast-index-search.git  (your fork)
-upstream  →  https://github.com/defendend/Claude-ast-index-search.git        (original)
-```
+Expected remotes:
 
-Verify with `git remote -v`. If `upstream` is missing:
-
-```bash
-git remote add upstream https://github.com/defendend/Claude-ast-index-search.git
-```
-
-## Never push to upstream
-
-**Nothing is ever pushed to `upstream` — not commits, not branches, not tags,
-not now, not in the future.** `upstream` is fetch-only. Every push goes
-exclusively to `origin` (the fork). Syncing means `git fetch upstream` then
-merge into `main`; publishing means `git push origin <branch>`.
-
-A git-level guardrail enforces this: `upstream`'s push URL is set to a bogus
-value so an accidental push fails to resolve instead of reaching the parent:
-
-```bash
-git remote set-url --push upstream DISABLED_no_push_to_upstream
-git remote -v   # upstream (push) should read DISABLED_no_push_to_upstream
+```text
+origin    -> https://github.com/chizhikovnikita/Claude-ast-index-search.git
+upstream  -> https://github.com/defendend/Claude-ast-index-search.git (fetch)
+upstream  -> DISABLED_no_push_to_upstream (push)
 ```
 
-Do not restore or "fix" that push URL.
+Set `remote.pushDefault` to `origin` and retain the disabled upstream push
+URL. Install the destination guard with `scripts/install-push-guard.ps1`.
+It checks the push URL, so a direct push to the original is also rejected.
+The installer preserves an existing pre-push hook and does not change
+`core.hooksPath`. Reinstall it in each fresh clone; tracked scripts alone
+do not activate Git hooks. Never bypass the guard with `--no-verify`.
 
-## Before starting any work — sync with upstream
+Verify URLs before every publication. Do not test the guard by attempting a
+push to the original; call the guard with sample destinations instead.
+Do not publish to upstream-owned package registries, Homebrew, or Winget.
+Release workflow publishing jobs are restricted to the original repository;
+fork release artifacts stay in the fork's own GitHub Releases.
 
-Stale forks accumulate conflicts. **Always** fetch upstream before writing
-code, even for a one-line fix:
+## Updating the fork
 
-```bash
-git fetch upstream
-git log --oneline origin/main..upstream/main    # see what's new
-git checkout main
-git merge --ff-only upstream/main               # fast-forward only — fails if main diverged
-git push origin main                            # publish to the fork
-```
+1. Inspect status, local changes, and fork-only commits. Preserve uncommitted
+   changes, local skills, and `.sds`; create a backup ref before integration.
+2. Fetch upstream and origin explicitly. Select a stable upstream release
+   and record its tag and commit. Fetching is allowed; publishing upstream
+   is never allowed.
+3. Start a `sync/<release>` branch from the fork's main branch and merge the
+   selected upstream revision with `--no-ff`. Resolve conflicts by retaining
+   the fork's encoding support and Windows behavior alongside upstream
+   functionality. Inspect new file-reading paths for UTF-8-only assumptions.
+4. Build and test the release workspace on Windows and Ubuntu. Exercise
+   Windows-1251 and mixed-encoding rebuild, update, search, and content output.
+   Keep the Windows index publication fix unless upstream already implements
+   equivalent behavior. Record failures and compare with the baseline.
+5. Commit the reviewed integration on the fork branch. Publish that branch
+   explicitly to origin; advance main only after validation. Reinstall the
+   CLI from the resulting fork checkout and rebuild its project index.
 
-If `--ff-only` fails because `main` has fork-only commits, either rebase
-the fork-only commits onto `upstream/main`, or move them to a feature
-branch and reset `main` back to `upstream/main`.
-
-For feature branches already in progress off an older base:
-
-```bash
-git checkout your-feature-branch
-git rebase upstream/main
-# resolve conflicts; then:
-git push --force-with-lease origin your-feature-branch
-```
-
-## Why
-
-The original ships new languages, fixes, and version bumps frequently. A
-fork weeks behind is painful to merge — small frequent fetches stay quiet.
-Sync on entry, not at PR time.
-
-## Anti-patterns
-
-- **Starting work without `git fetch upstream`.** Code lands on a stale
-  base; conflicts surface at PR time.
-- **`git pull upstream main`.** Use explicit `fetch` + `merge`/`rebase`;
-  `pull` hides which side you're integrating from.
-- **Force-pushing to `main` on the fork.** Even on a personal fork. Use
-  `--force-with-lease` and only on feature branches.
-- **Local commits to the fork's `main`.** Keep `main` mirrored to
-  `upstream/main`; do work on feature branches.
-- **Pushing to `upstream`.** Never. `upstream` is fetch-only; all pushes go
-  to `origin`. The disabled push URL is a guardrail, not an inconvenience.
+Main contains fork functionality; it is not a byte-for-byte upstream mirror.
+Never reset main to upstream or drop fork-only commits to make a fast-forward
+possible. Do not rebase published history, force-push, or move release tags
+as part of routine synchronization. Do not use `git pull upstream main`.
+The version already supplied by an upstream release does not require running
+the publishing `scripts/bump.sh` script.

@@ -107,3 +107,37 @@ fn cp1251_file_increments_fallback_counter() {
         "fallback decode must increment FALLBACK_DECODE_COUNT"
     );
 }
+
+#[test]
+fn batched_search_matches_decoded_literals_and_keeps_per_pattern_limits() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("calls.kt");
+    let source = "first.обработать(1) // Обработка заявки пользователя\n\
+        second.обработать(2) // Повторная обработка заявки\n\
+        third.сохранить(3) // Сохранение заявки пользователя\n";
+    let (bytes, _, errors) = encoding_rs::WINDOWS_1251.encode(source);
+    assert!(!errors);
+    fs::write(&path, bytes.as_ref()).unwrap();
+    let patterns = [
+        (r"\.обработать\(".to_string(), "обработать".to_string()),
+        (r"\.сохранить\(".to_string(), "сохранить".to_string()),
+    ];
+    let candidates = r"\.обработать\(|\.сохранить\(";
+    let mut hits = Vec::new();
+    ast_index::commands::search_files_limited_each(
+        &[path],
+        candidates,
+        &patterns,
+        1,
+        |_, _, text| !text.starts_with("first."),
+        |pattern, _, line, text| hits.push((pattern, line, text.to_string())),
+    )
+    .unwrap();
+    assert_eq!(hits.len(), 2, "{hits:?}");
+    assert!(hits.iter().any(|(pattern, line, text)| {
+        *pattern == 0 && *line == 2 && text.contains("Повторная обработка")
+    }));
+    assert!(hits.iter().any(|(pattern, line, text)| {
+        *pattern == 1 && *line == 3 && text.contains("Сохранение заявки")
+    }));
+}

@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use crate::db;
+use crate::minified;
 use crate::parsers::{self, ParsedRef, ParsedSymbol};
 
 /// File-size cap for parsing. Larger files are recorded in the `files`
@@ -19,6 +20,8 @@ use crate::parsers::{self, ParsedRef, ParsedSymbol};
 /// minified bundles / generated proto bundles / vendor blobs.
 ///
 /// Configurable via `AST_INDEX_MAX_FILE_SIZE` (bytes). Default: 1 MB.
+mod swift_manifest;
+
 fn max_file_size_bytes() -> u64 {
     std::env::var("AST_INDEX_MAX_FILE_SIZE")
         .ok()
@@ -254,9 +257,17 @@ pub fn has_android_markers(root: &Path) -> bool {
         || root.join("pom.xml").exists()
 }
 
-/// Check if project has iOS markers (Xcode/SPM)
+/// Root files that mark a SwiftPM or Tuist project.
+const SWIFT_ROOT_MARKERS: &[&str] = &[
+    "Package.swift",
+    "Project.swift",
+    "Workspace.swift",
+    "Tuist.swift",
+];
+
+/// Check if project has iOS markers (Xcode/SPM/Tuist)
 pub fn has_ios_markers(root: &Path) -> bool {
-    if root.join("Package.swift").exists() {
+    if SWIFT_ROOT_MARKERS.iter().any(|m| root.join(m).exists()) {
         return true;
     }
     // Check for .xcodeproj
@@ -354,7 +365,7 @@ pub fn detect_project_type(root: &Path) -> ProjectType {
         || root.join("build.gradle").exists()
         || root.join("pom.xml").exists();
 
-    let has_swift = root.join("Package.swift").exists()
+    let has_swift = SWIFT_ROOT_MARKERS.iter().any(|m| root.join(m).exists())
         || fs::read_dir(root)
             .map(|entries| {
                 entries.filter_map(|e| e.ok()).any(|e| {
@@ -605,44 +616,229 @@ pub struct StackDetection {
     pub is_kmp: bool,
     /// True when more than one independent stack is present and it is not a KMP repo.
     pub is_polyglot: bool,
+    /// True when filesystem or Gradle-file inspection reached a resource limit.
+    /// Detected stacks are still valid, but the list may be incomplete.
+    pub scan_truncated: bool,
 }
 
-fn collect_markers(root: &Path, candidates: &[&str]) -> Vec<String> {
-    candidates
+const STACK_SCAN_MAX_DEPTH: usize = 8;
+const STACK_SCAN_MAX_ENTRIES: usize = 20_000;
+const STACK_MARKERS_PER_KIND: usize = 32;
+const STACK_GRADLE_MAX_FILES: usize = 64;
+const STACK_GRADLE_MAX_BYTES: usize = 4 * 1024 * 1024;
+/// A build marker under a test or fixture directory describes the sample
+/// project a test indexes, not the repository: `tests/fixtures/java/pom.xml`
+/// made this Rust repository an Android project.
+const STACK_FIXTURE_DIR_SEGMENTS: &[&str] = &[
+    "test",
+    "tests",
+    "__tests__",
+    "fixtures",
+    "__fixtures__",
+    "test-fixtures",
+    "testdata",
+];
+
+fn is_under_fixture_dir(relative: &str) -> bool {
+    let mut segments: Vec<&str> = relative.split('/').collect();
+    segments.pop();
+    segments
         .iter()
-        .filter(|name| root.join(name).exists())
-        .map(|s| s.to_string())
+        .any(|segment| STACK_FIXTURE_DIR_SEGMENTS.contains(segment))
+}
+
+const ROOT_STACK_MARKER_NAMES: &[&str] = &[
+    "settings.gradle.kts",
+    "settings.gradle",
+    "build.gradle.kts",
+    "build.gradle",
+    "libs.versions.toml",
+    "pom.xml",
+    "Package.swift",
+    "Project.swift",
+    "Workspace.swift",
+    "Tuist.swift",
+    "Podfile",
+    "package.json",
+    "tsconfig.json",
+    "vite.config.ts",
+    "vite.config.js",
+    "next.config.js",
+    "next.config.mjs",
+    "nuxt.config.ts",
+    "angular.json",
+    "Cargo.toml",
+    "Directory.Build.props",
+    "Gemfile",
+    "pyproject.toml",
+    "setup.py",
+    "setup.cfg",
+    "go.mod",
+    "pubspec.yaml",
+    "composer.json",
+    "build.sbt",
+    "build.zig",
+    "build.zig.zon",
+    "CMakeLists.txt",
+    "Makefile.PL",
+    "Build.PL",
+    "cpanfile",
+];
+
+#[derive(Debug)]
+struct StackScanEntry {
+    path: PathBuf,
+    relative: String,
+    is_dir: bool,
+}
+
+#[derive(Debug)]
+struct StackMarkerScan {
+    entries: Vec<StackScanEntry>,
+    truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StackScanLimits {
+    max_depth: usize,
+    max_entries: usize,
+    max_gradle_files: usize,
+    max_gradle_bytes: usize,
+}
+
+impl Default for StackScanLimits {
+    fn default() -> Self {
+        Self {
+            max_depth: STACK_SCAN_MAX_DEPTH,
+            max_entries: STACK_SCAN_MAX_ENTRIES,
+            max_gradle_files: STACK_GRADLE_MAX_FILES,
+            max_gradle_bytes: STACK_GRADLE_MAX_BYTES,
+        }
+    }
+}
+
+/// Collect the small amount of filesystem metadata needed by stack detection
+/// in one bounded traversal. Sorting the walk makes both the entry budget and
+/// the reported marker order deterministic across filesystems.
+fn scan_stack_markers(root: &Path, limits: StackScanLimits) -> StackMarkerScan {
+    use ignore::WalkBuilder;
+
+    // Preserve root-only detection even when a very large, lexically earlier
+    // subtree consumes the recursive entry budget.
+    let mut entries: Vec<StackScanEntry> = ROOT_STACK_MARKER_NAMES
+        .iter()
+        .filter_map(|name| {
+            let path = root.join(name);
+            path.is_file().then(|| StackScanEntry {
+                path,
+                relative: (*name).to_string(),
+                is_dir: false,
+            })
+        })
+        .collect();
+    let mut seen: std::collections::HashSet<String> =
+        entries.iter().map(|entry| entry.relative.clone()).collect();
+
+    let use_git_ignore = has_git_repo(root);
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(true)
+        .follow_links(false)
+        .max_depth(Some(limits.max_depth))
+        .git_ignore(use_git_ignore)
+        .git_global(use_git_ignore)
+        .git_exclude(use_git_ignore)
+        .filter_entry(|entry| !is_excluded_dir(entry));
+
+    // Do not sort the walker itself: ignore's sorted walk must enumerate and
+    // buffer a whole directory before yielding its first child. Take at most
+    // `cap + 1` raw results, then sort only that bounded sample.
+    let mut raw_items = 0usize;
+    let mut walked: Vec<(StackScanEntry, usize)> = builder
+        .build()
+        .skip(1)
+        .take(limits.max_entries.saturating_add(1))
+        .filter_map(|entry| {
+            raw_items += 1;
+            let entry = entry.ok()?;
+            let depth = entry.depth();
+            let is_dir = entry
+                .file_type()
+                .map(|file_type| file_type.is_dir())
+                .unwrap_or(false);
+            let path = entry.into_path();
+            let relative = path
+                .strip_prefix(root)
+                .ok()?
+                .to_string_lossy()
+                .replace('\\', "/");
+            Some((
+                StackScanEntry {
+                    path,
+                    relative,
+                    is_dir,
+                },
+                depth,
+            ))
+        })
+        .collect();
+    let entry_limit_reached = raw_items > limits.max_entries;
+    walked.truncate(limits.max_entries);
+    let depth_limit_reached = walked
+        .iter()
+        .any(|(entry, depth)| entry.is_dir && *depth == limits.max_depth);
+    walked.sort_unstable_by(|left, right| left.0.relative.cmp(&right.0.relative));
+    entries.extend(
+        walked
+            .into_iter()
+            .map(|(entry, _)| entry)
+            .filter(|entry| !is_under_fixture_dir(&entry.relative))
+            .filter(|entry| seen.insert(entry.relative.clone())),
+    );
+
+    StackMarkerScan {
+        entries,
+        truncated: entry_limit_reached || depth_limit_reached,
+    }
+}
+
+fn collect_markers(scan: &[StackScanEntry], candidates: &[&str]) -> Vec<String> {
+    let mut markers = Vec::new();
+    for candidate in candidates {
+        markers.extend(
+            scan.iter()
+                .filter(|entry| {
+                    !entry.is_dir
+                        && entry.path.file_name().and_then(|name| name.to_str()) == Some(*candidate)
+                })
+                .map(|entry| entry.relative.clone())
+                .take(STACK_MARKERS_PER_KIND.saturating_sub(markers.len())),
+        );
+        if markers.len() == STACK_MARKERS_PER_KIND {
+            break;
+        }
+    }
+    markers
+}
+
+fn collect_ext_markers(scan: &[StackScanEntry], ext: &str, limit: usize) -> Vec<String> {
+    scan.iter()
+        .filter(|entry| {
+            entry.path.extension().and_then(|value| value.to_str()) == Some(ext)
+                && (entry.is_dir || entry.path.is_file())
+        })
+        .map(|entry| entry.relative.clone())
+        .take(limit)
         .collect()
 }
 
-fn any_ext_in_root(root: &Path, ext: &str) -> bool {
-    fs::read_dir(root)
-        .map(|entries| {
-            entries
-                .filter_map(|e| e.ok())
-                .any(|e| e.path().extension().map(|x| x == ext).unwrap_or(false))
-        })
-        .unwrap_or(false)
-}
+fn has_kmp_markers(
+    root: &Path,
+    scan: &[StackScanEntry],
+    limits: StackScanLimits,
+) -> (bool, Vec<String>, bool) {
+    use std::io::Read;
 
-fn collect_ext_markers(root: &Path, ext: &str, limit: usize) -> Vec<String> {
-    fs::read_dir(root)
-        .map(|entries| {
-            entries
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().map(|x| x == ext).unwrap_or(false))
-                .take(limit)
-                .filter_map(|e| {
-                    e.path()
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn has_kmp_markers(root: &Path) -> (bool, Vec<String>) {
     // KMP requires two independent signals:
     //   * a Kotlin multiplatform source set directory (commonMain / *Main),
     //   * a Gradle plugin reference (`kotlin("multiplatform")` or
@@ -650,8 +846,6 @@ fn has_kmp_markers(root: &Path) -> (bool, Vec<String>) {
     // Either alone is too weak — non-KMP Android repos sometimes have stray
     // `commonMain` folders, and some Gradle catalogs declare the plugin without
     // applying it.
-    let mut markers = Vec::new();
-
     let kmp_source_sets = [
         "commonMain",
         "commonTest",
@@ -665,70 +859,85 @@ fn has_kmp_markers(root: &Path) -> (bool, Vec<String>) {
         "jvmMain",
         "nativeMain",
     ];
-    'sources: for top in [
-        "src",
-        "shared",
-        "common",
-        "core",
-        "kmp",
-        "composeApp",
-        "androidApp",
-    ] {
-        let top_path = root.join(top);
-        if !top_path.is_dir() {
+
+    let mut files_read = 0usize;
+    let mut bytes_read = 0usize;
+    let mut budget_truncated = false;
+    for plugin in scan.iter().filter(|entry| {
+        !entry.is_dir
+            && matches!(
+                entry.path.file_name().and_then(|name| name.to_str()),
+                Some("build.gradle.kts" | "build.gradle")
+            )
+    }) {
+        if files_read == limits.max_gradle_files {
+            budget_truncated = true;
+            break;
+        }
+        let Ok(metadata) = fs::metadata(&plugin.path) else {
+            continue;
+        };
+        if metadata.len() > max_file_size_bytes() {
+            budget_truncated = true;
             continue;
         }
-        if let Ok(entries) = fs::read_dir(&top_path) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if kmp_source_sets.contains(&name.as_str()) {
-                    markers.push(format!("{}/{}", top, name));
-                    break 'sources;
-                }
+        let Ok(file_size) = usize::try_from(metadata.len()) else {
+            budget_truncated = true;
+            continue;
+        };
+        if file_size > limits.max_gradle_bytes.saturating_sub(bytes_read) {
+            budget_truncated = true;
+            break;
+        }
+
+        let Ok(file) = fs::File::open(&plugin.path) else {
+            continue;
+        };
+        let mut content = Vec::with_capacity(file_size);
+        let Ok(read) = file.take(file_size as u64).read_to_end(&mut content) else {
+            continue;
+        };
+        files_read += 1;
+        bytes_read = bytes_read.saturating_add(read);
+        let content = crate::encoding::decode_bytes_cow(&content, Some(&plugin.path));
+        if !content.contains("kotlin(\"multiplatform\")")
+            && !content.contains("org.jetbrains.kotlin.multiplatform")
+        {
+            continue;
+        }
+
+        let Some(module_dir) = plugin.path.parent() else {
+            continue;
+        };
+        let source_marker = scan.iter().find(|entry| {
+            if !entry.is_dir {
+                return false;
             }
+            let Ok(relative_to_module) = entry.path.strip_prefix(module_dir) else {
+                return false;
+            };
+            let components: Vec<&str> = relative_to_module
+                .components()
+                .filter_map(|component| component.as_os_str().to_str())
+                .collect();
+            match components.as_slice() {
+                [source_set] => kmp_source_sets.contains(source_set),
+                ["src", source_set] => kmp_source_sets.contains(source_set),
+                _ => false,
+            }
+        });
+
+        if let Some(source_marker) = source_marker {
+            let plugin_marker = crate::relative_path(root, &plugin.path);
+            return (
+                true,
+                vec![source_marker.relative.clone(), plugin_marker],
+                budget_truncated,
+            );
         }
     }
-    let has_source_set = !markers.is_empty();
 
-    let plugin_files = [
-        "build.gradle.kts",
-        "build.gradle",
-        "settings.gradle.kts",
-        "settings.gradle",
-    ];
-    let mut has_plugin = false;
-    'gradle: for file in plugin_files {
-        let subdirs: Vec<PathBuf> = fs::read_dir(root)
-            .map(|it| {
-                it.filter_map(|e| e.ok())
-                    .map(|e| e.path())
-                    .filter(|p| p.is_dir())
-                    .collect()
-            })
-            .unwrap_or_default();
-        for base in std::iter::once(root.to_path_buf()).chain(subdirs) {
-            let path = base.join(file);
-            if !path.is_file() {
-                continue;
-            }
-            if let Ok(content) = crate::encoding::read_file_to_string(&path) {
-                if content.contains("kotlin(\"multiplatform\")")
-                    || content.contains("org.jetbrains.kotlin.multiplatform")
-                {
-                    let rel = path
-                        .strip_prefix(root)
-                        .unwrap_or(&path)
-                        .to_string_lossy()
-                        .into_owned();
-                    markers.push(rel);
-                    has_plugin = true;
-                    break 'gradle;
-                }
-            }
-        }
-    }
-
-    (has_source_set && has_plugin, markers)
+    (false, Vec::new(), budget_truncated)
 }
 
 /// Detect every stack present in `root` by inspecting marker files.
@@ -739,10 +948,48 @@ fn has_kmp_markers(root: &Path) -> (bool, Vec<String>) {
 /// command consumes this to compose Android+iOS rules for KMP repos and
 /// per-stack rules for polyglot monorepos.
 pub fn detect_stacks(root: &Path) -> StackDetection {
+    detect_stacks_with_limits(root, StackScanLimits::default(), true)
+}
+
+/// Metadata key holding [`project_label`] as of the last full rebuild of the
+/// primary root; the stack scan takes seconds on a large tree, too long for
+/// `stats`.
+pub const PROJECT_LABEL_KEY: &str = "project_label";
+
+/// Record [`project_label`] of the primary `root` for `stats` and `map`.
+/// Called by `rebuild` for the primary root only, never for an extra root
+/// or subtree indexed into the same database.
+pub fn record_project_label(conn: &Connection, root: &Path) -> Result<()> {
+    db::set_metadata_value(conn, PROJECT_LABEL_KEY, &project_label(root))
+}
+
+/// What `stats` and `map` call the project: the stacks [`detect_stacks`]
+/// finds, joined (`Ruby + Web (TypeScript/JavaScript)`), or the
+/// [`detect_project_type`] label when no stack marker is present.
+pub fn project_label(root: &Path) -> String {
+    let detection = detect_stacks_with_limits(root, StackScanLimits::default(), false);
+    if detection.stacks.is_empty() {
+        return detect_project_type(root).as_str().to_string();
+    }
+    detection
+        .stacks
+        .iter()
+        .map(|stack| stack.label.as_str())
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
+
+fn detect_stacks_with_limits(
+    root: &Path,
+    limits: StackScanLimits,
+    emit_diagnostic: bool,
+) -> StackDetection {
     let mut stacks: Vec<DetectedStack> = Vec::new();
+    let scan = scan_stack_markers(root, limits);
+    let entries = &scan.entries;
 
     let android_markers = collect_markers(
-        root,
+        entries,
         &[
             "settings.gradle.kts",
             "settings.gradle",
@@ -760,9 +1007,18 @@ pub fn detect_stacks(root: &Path) -> StackDetection {
         });
     }
 
-    let mut ios_markers = collect_markers(root, &["Package.swift", "Podfile"]);
-    ios_markers.extend(collect_ext_markers(root, "xcodeproj", 3));
-    ios_markers.extend(collect_ext_markers(root, "xcworkspace", 3));
+    let mut ios_markers = collect_markers(
+        entries,
+        &[
+            "Package.swift",
+            "Project.swift",
+            "Workspace.swift",
+            "Tuist.swift",
+            "Podfile",
+        ],
+    );
+    ios_markers.extend(collect_ext_markers(entries, "xcodeproj", 3));
+    ios_markers.extend(collect_ext_markers(entries, "xcworkspace", 3));
     if !ios_markers.is_empty() {
         stacks.push(DetectedStack {
             kind: "ios".to_string(),
@@ -771,7 +1027,7 @@ pub fn detect_stacks(root: &Path) -> StackDetection {
         });
     }
 
-    let (kmp_found, kmp_markers) = has_kmp_markers(root);
+    let (kmp_found, kmp_markers, gradle_scan_truncated) = has_kmp_markers(root, entries, limits);
     if kmp_found {
         stacks.push(DetectedStack {
             kind: "kmp".to_string(),
@@ -781,7 +1037,7 @@ pub fn detect_stacks(root: &Path) -> StackDetection {
     }
 
     let web_markers = collect_markers(
-        root,
+        entries,
         &[
             "package.json",
             "tsconfig.json",
@@ -801,7 +1057,7 @@ pub fn detect_stacks(root: &Path) -> StackDetection {
         });
     }
 
-    let rust_markers = collect_markers(root, &["Cargo.toml"]);
+    let rust_markers = collect_markers(entries, &["Cargo.toml"]);
     if !rust_markers.is_empty() {
         stacks.push(DetectedStack {
             kind: "rust".to_string(),
@@ -810,9 +1066,9 @@ pub fn detect_stacks(root: &Path) -> StackDetection {
         });
     }
 
-    let mut csharp_markers = collect_markers(root, &["Directory.Build.props"]);
-    csharp_markers.extend(collect_ext_markers(root, "sln", 3));
-    csharp_markers.extend(collect_ext_markers(root, "csproj", 3));
+    let mut csharp_markers = collect_markers(entries, &["Directory.Build.props"]);
+    csharp_markers.extend(collect_ext_markers(entries, "sln", 3));
+    csharp_markers.extend(collect_ext_markers(entries, "csproj", 3));
     if !csharp_markers.is_empty() {
         stacks.push(DetectedStack {
             kind: "csharp".to_string(),
@@ -821,8 +1077,8 @@ pub fn detect_stacks(root: &Path) -> StackDetection {
         });
     }
 
-    let mut ruby_markers = collect_markers(root, &["Gemfile"]);
-    ruby_markers.extend(collect_ext_markers(root, "gemspec", 3));
+    let mut ruby_markers = collect_markers(entries, &["Gemfile"]);
+    ruby_markers.extend(collect_ext_markers(entries, "gemspec", 3));
     if !ruby_markers.is_empty() {
         stacks.push(DetectedStack {
             kind: "ruby".to_string(),
@@ -831,7 +1087,7 @@ pub fn detect_stacks(root: &Path) -> StackDetection {
         });
     }
 
-    let python_markers = collect_markers(root, &["pyproject.toml", "setup.py", "setup.cfg"]);
+    let python_markers = collect_markers(entries, &["pyproject.toml", "setup.py", "setup.cfg"]);
     if !python_markers.is_empty() {
         stacks.push(DetectedStack {
             kind: "python".to_string(),
@@ -840,7 +1096,7 @@ pub fn detect_stacks(root: &Path) -> StackDetection {
         });
     }
 
-    let go_markers = collect_markers(root, &["go.mod"]);
+    let go_markers = collect_markers(entries, &["go.mod"]);
     if !go_markers.is_empty() {
         stacks.push(DetectedStack {
             kind: "go".to_string(),
@@ -849,7 +1105,7 @@ pub fn detect_stacks(root: &Path) -> StackDetection {
         });
     }
 
-    let dart_markers = collect_markers(root, &["pubspec.yaml"]);
+    let dart_markers = collect_markers(entries, &["pubspec.yaml"]);
     if !dart_markers.is_empty() {
         stacks.push(DetectedStack {
             kind: "dart".to_string(),
@@ -858,7 +1114,7 @@ pub fn detect_stacks(root: &Path) -> StackDetection {
         });
     }
 
-    let php_markers = collect_markers(root, &["composer.json"]);
+    let php_markers = collect_markers(entries, &["composer.json"]);
     if !php_markers.is_empty() {
         stacks.push(DetectedStack {
             kind: "php".to_string(),
@@ -867,7 +1123,7 @@ pub fn detect_stacks(root: &Path) -> StackDetection {
         });
     }
 
-    let scala_markers = collect_markers(root, &["build.sbt"]);
+    let scala_markers = collect_markers(entries, &["build.sbt"]);
     if !scala_markers.is_empty() {
         stacks.push(DetectedStack {
             kind: "scala".to_string(),
@@ -876,7 +1132,7 @@ pub fn detect_stacks(root: &Path) -> StackDetection {
         });
     }
 
-    let zig_markers = collect_markers(root, &["build.zig", "build.zig.zon"]);
+    let zig_markers = collect_markers(entries, &["build.zig", "build.zig.zon"]);
     if !zig_markers.is_empty() {
         stacks.push(DetectedStack {
             kind: "zig".to_string(),
@@ -885,7 +1141,7 @@ pub fn detect_stacks(root: &Path) -> StackDetection {
         });
     }
 
-    let cpp_markers = collect_markers(root, &["CMakeLists.txt"]);
+    let cpp_markers = collect_markers(entries, &["CMakeLists.txt"]);
     if !cpp_markers.is_empty() {
         stacks.push(DetectedStack {
             kind: "cpp".to_string(),
@@ -894,8 +1150,8 @@ pub fn detect_stacks(root: &Path) -> StackDetection {
         });
     }
 
-    let mut perl_markers = collect_markers(root, &["Makefile.PL", "Build.PL", "cpanfile"]);
-    if any_ext_in_root(root, "pm") {
+    let mut perl_markers = collect_markers(entries, &["Makefile.PL", "Build.PL", "cpanfile"]);
+    if !collect_ext_markers(entries, "pm", 1).is_empty() {
         perl_markers.push("*.pm".to_string());
     }
     if !perl_markers.is_empty() {
@@ -926,10 +1182,18 @@ pub fn detect_stacks(root: &Path) -> StackDetection {
         stacks.len() >= 2
     };
 
+    let scan_truncated = scan.truncated || gradle_scan_truncated;
+    if scan_truncated && emit_diagnostic {
+        eprintln!(
+            "Warning: stack detection reached its scan budget; detected stacks may be incomplete"
+        );
+    }
+
     StackDetection {
         stacks,
         is_kmp,
         is_polyglot,
+        scan_truncated,
     }
 }
 
@@ -942,12 +1206,49 @@ struct ParsedFile {
     symbols: Vec<ParsedSymbol>,
     qualified_names: HashMap<(String, usize, String), String>,
     refs: Vec<ParsedRef>,
+    /// [`content_words`] of the text, when it was read.
+    words: Option<String>,
+}
+
+/// Whether `c` belongs to a word for [`content_words`] and
+/// [`literal_word_runs`]. Both sides must split text the same way.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// The distinct maximal runs of word characters in `content`, sorted and
+/// joined by `\n`.
+///
+/// Every occurrence of a literal lies in the text, so each of the literal's
+/// own word runs lies inside one of these words. A file whose words hold no
+/// word containing some run of the literal cannot contain the literal, and a
+/// grep for it can skip the file without opening it.
+pub fn content_words(content: &str) -> String {
+    let mut words: Vec<&str> = content
+        .split(|c: char| !is_word_char(c))
+        .filter(|word| !word.is_empty())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    words.sort_unstable();
+    words.join("\n")
+}
+
+/// The maximal runs of word characters in `literal`, the pieces
+/// [`content_words`] can vouch for.
+pub fn literal_word_runs(literal: &str) -> Vec<String> {
+    literal
+        .split(|c: char| !is_word_char(c))
+        .filter(|run| !run.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// File scheduled by incremental update.
 enum PendingUpdateFile {
     Regular {
         root: PathBuf,
+        root_key: String,
         path: PathBuf,
     },
     NodeModulesDts {
@@ -957,28 +1258,39 @@ enum PendingUpdateFile {
     },
 }
 
-/// Parse a single file without DB access (thread-safe)
-fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
+/// Parse a single file without DB access (thread-safe). `None` for a
+/// minified file, which stays out of the index altogether.
+#[cfg(test)]
+fn parse_file(root: &Path, file_path: &Path) -> Result<Option<ParsedFile>> {
+    parse_file_keyed(root, &db::normalize_root_for_storage(root), file_path)
+}
+
+/// [`parse_file`] with the storage key of `root` computed by the caller.
+/// The key costs a thread and a `realpath` per call, which a walk over tens
+/// of thousands of files must not pay per file.
+fn parse_file_keyed(root: &Path, root_key: &str, file_path: &Path) -> Result<Option<ParsedFile>> {
+    if minified::skip_by_name(file_path) {
+        return Ok(None);
+    }
     let metadata = fs::metadata(file_path)?;
     let mtime = metadata
         .modified()?
         .duration_since(SystemTime::UNIX_EPOCH)?
         .as_secs() as i64;
     let size = metadata.len() as i64;
-    let root_path = db::normalize_root_for_storage(root);
+    let root_path = root_key.to_string();
 
-    let rel_path = file_path
-        .strip_prefix(root)
-        .unwrap_or(file_path)
-        .to_string_lossy()
-        .to_string();
+    let rel_path = crate::relative_path(&root, &file_path);
 
     // Skip files larger than the configured cap (likely generated/minified).
     // Recorded in `files` so `update` still notices on-disk changes, but
     // never read into memory or parsed — that's how a single 200 MB vendor
     // bundle used to push rebuild to 20+ GB RSS.
     if (size as u64) > max_file_size_bytes() {
-        return Ok(ParsedFile {
+        if minified::skip(file_path, None) {
+            return Ok(None);
+        }
+        return Ok(Some(ParsedFile {
             rel_path,
             root_path,
             mtime,
@@ -986,10 +1298,15 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
             symbols: vec![],
             qualified_names: HashMap::new(),
             refs: vec![],
-        });
+            words: None,
+        }));
     }
 
     let content = crate::encoding::read_file_to_string(file_path)?;
+    if minified::skip(file_path, Some(content.as_bytes())) {
+        return Ok(None);
+    }
+    let words = Some(content_words(&content));
 
     // Detect file type by extension, with content-based sniffing for .m files
     let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -1000,7 +1317,7 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
     } {
         Some(ft) => ft,
         None => {
-            return Ok(ParsedFile {
+            return Ok(Some(ParsedFile {
                 rel_path,
                 root_path,
                 mtime,
@@ -1008,7 +1325,8 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
                 symbols: vec![],
                 qualified_names: HashMap::new(),
                 refs: vec![],
-            });
+                words,
+            }));
         }
     };
 
@@ -1017,6 +1335,10 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
 
     if file_type == parsers::FileType::Cpp {
         qualified_names = parsers::treesitter::cpp::collect_qualified_names(&content)?;
+    }
+
+    if file_type == parsers::FileType::TypeScript {
+        parsers::treesitter::typescript::name_default_export(&mut symbols, &rel_path);
     }
 
     // BSL (1C:Enterprise) — module names are encoded in directory structure,
@@ -1029,6 +1351,7 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
                 line: 1,
                 signature: format!("module {}", rel_path),
                 parents: vec![],
+                end_line: Some(content.lines().count().max(1)),
             });
         }
     }
@@ -1050,12 +1373,13 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
                     line: 1,
                     signature: format!("component {}", stem),
                     parents: vec![],
+                    end_line: None,
                 });
             }
         }
     }
 
-    Ok(ParsedFile {
+    Ok(Some(ParsedFile {
         rel_path,
         root_path,
         mtime,
@@ -1063,7 +1387,8 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
         symbols,
         qualified_names,
         refs,
-    })
+        words,
+    }))
 }
 
 /// Directories to always exclude from indexing (regardless of .gitignore).
@@ -1186,17 +1511,47 @@ pub fn is_excluded_dir(entry: &ignore::DirEntry) -> bool {
     }
 }
 
+/// Fingerprint of the build files that define the module graph: their paths,
+/// modification times and sizes. Perl `.pm` files are module files too, but
+/// they are ordinary sources edited all the time; their packages are refreshed
+/// by `rebuild`.
+pub fn build_files_fingerprint(module_files: &[PathBuf]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut entries: Vec<(String, i64, u64)> = module_files
+        .iter()
+        .filter(|path| path.extension().is_none_or(|ext| ext != "pm"))
+        .map(|path| {
+            let metadata = fs::metadata(path).ok();
+            let mtime = metadata
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs() as i64);
+            (
+                path.to_string_lossy().to_string(),
+                mtime,
+                metadata.map_or(0, |m| m.len()),
+            )
+        })
+        .collect();
+    entries.sort();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    entries.hash(&mut hasher);
+    format!("{}:{:016x}", entries.len(), hasher.finish())
+}
+
 /// Module-related file names to collect during directory walk
 fn is_module_file(name: &str) -> bool {
     name == "build.gradle"
         || name == "build.gradle.kts"
-        || name == "Package.swift"
+        || swift_manifest_kind(name).is_some()
         || name.ends_with(".pm")
         || name == "pom.xml"
         || name == "pyproject.toml"
         || name == "setup.py"
         || name == "setup.cfg"
         || name == "ya.make"
+        || name.ends_with(".gemspec")
 }
 
 fn sample_parseable_files_without_ignore(walk_dir: &Path, limit: usize) -> Vec<PathBuf> {
@@ -1349,6 +1704,10 @@ const ANDROID_RES_SUBDIRS: &[&str] = &[
 
 /// `path_str` is under one of `<name>` or `<name>-<qualifier>` subdirs of `/res/`.
 fn android_res_subdir_match(path_str: &str, name: &str) -> bool {
+    #[cfg(windows)]
+    let normalized = path_str.replace('\\', "/");
+    #[cfg(windows)]
+    let path_str = normalized.as_str();
     let needle_slash = format!("/res/{}/", name);
     let needle_dash = format!("/res/{}-", name);
     path_str.contains(&needle_slash) || path_str.contains(&needle_dash)
@@ -1629,6 +1988,7 @@ fn index_directory_scoped_with_max_depth(
             gb.build().ok()
         }
     };
+    let schema_exclude = exclude_matcher.clone();
 
     let mut builder = WalkBuilder::new(walk_dir);
     builder
@@ -1761,7 +2121,14 @@ fn index_directory_scoped_with_max_depth(
         ));
     }
 
-    let files = collected.files;
+    let mut files = collected.files;
+    if use_git || arc_root.is_some() {
+        for schema in rails_schema_files(root, walk_dir, schema_exclude.as_ref()) {
+            if !files.contains(&schema) {
+                files.push(schema);
+            }
+        }
+    }
     let module_files = collected.module_files;
     let storyboard_files = collected.storyboard_files;
     let xcassets_dirs = collected.xcassets_dirs;
@@ -1810,79 +2177,57 @@ fn index_directory_scoped_with_max_depth(
 
     let mut total_count = 0;
     let parsed_global = Arc::new(AtomicUsize::new(0));
+    let minified_skipped = AtomicUsize::new(0);
     if verbose {
         eprintln!("[verbose] using {} threads for parsing", num_threads);
     }
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(num_threads)
-        .stack_size(RAYON_WORKER_STACK_SIZE)
-        .build()
-        .map_err(|e| anyhow::anyhow!("Failed to build thread pool: {}", e))?;
-
-    let root_buf = root.to_path_buf();
-    let total_chunks = (files.len() + chunk_size - 1) / chunk_size;
-    for (chunk_idx, chunk) in files.chunks(chunk_size).enumerate() {
-        let root_clone = root_buf.clone();
-        let counter = parsed_global.clone();
-        let total = total_files;
-
-        if verbose {
-            eprintln!(
-                "[verbose] chunk {}/{}: parsing {} files...",
-                chunk_idx + 1,
-                total_chunks,
-                chunk.len()
-            );
-        }
-        let chunk_start = Instant::now();
-
-        // Parse chunk in parallel — at most `chunk_size` ParsedFiles in memory
-        let parsed_files: Vec<ParsedFile> = pool.install(|| {
-            chunk
-                .par_iter()
-                .filter_map(|path| {
-                    let result = parse_file(&root_clone, path).ok();
-                    let c = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if progress && c % 2000 == 0 {
-                        eprintln!("Parsed {} / {} files...", c, total);
-                    }
-                    result
-                })
-                .collect()
-        });
-
-        if verbose {
-            eprintln!(
-                "[verbose] chunk {}/{}: parsed in {:?}, writing {} to DB...",
-                chunk_idx + 1,
-                total_chunks,
-                chunk_start.elapsed(),
-                parsed_files.len()
-            );
-        }
-        let write_start = Instant::now();
-
-        // Write to DB and free parsed_files
-        write_batch_to_db(
-            conn,
-            parsed_files,
-            &mut total_count,
-            WriteMode::FreshRebuild,
-        )?;
-
-        if verbose {
-            eprintln!(
-                "[verbose] chunk {}/{}: written in {:?}",
-                chunk_idx + 1,
-                total_chunks,
-                write_start.elapsed()
-            );
-        }
-
-        if progress {
-            eprintln!("Written {} / {} files to DB", total_count, total_files);
-        }
+    let root_key = db::normalize_root_for_storage(root);
+    let parse_start = Instant::now();
+    parse_and_write_in_order(
+        conn,
+        &files,
+        num_threads,
+        chunk_size,
+        &|path: &PathBuf| {
+            let result = match parse_file_keyed(root, &root_key, path) {
+                Ok(Some(parsed)) => Some(parsed),
+                Ok(None) => {
+                    minified_skipped.fetch_add(1, Ordering::Relaxed);
+                    None
+                }
+                Err(_) => None,
+            };
+            let c = parsed_global.fetch_add(1, Ordering::Relaxed) + 1;
+            if progress && c % 2000 == 0 {
+                eprintln!("Parsed {} / {} files...", c, total_files);
+            }
+            result
+        },
+        &mut total_count,
+        |written| {
+            if progress {
+                eprintln!("Written {} / {} files to DB", written, total_files);
+            }
+        },
+    )?;
+    if verbose {
+        eprintln!(
+            "[verbose] parsed and wrote {} files in {:?}",
+            total_count,
+            parse_start.elapsed()
+        );
     }
+
+    let minified_skipped = minified_skipped.into_inner();
+    if progress && minified_skipped > 0 {
+        eprintln!(
+            "Skipped {} minified file{} (set {}=0 to index them)",
+            minified_skipped,
+            if minified_skipped == 1 { "" } else { "s" },
+            minified::SKIP_ENV
+        );
+    }
+    record_minified_filter(conn)?;
 
     Ok(WalkResult {
         file_count: total_count,
@@ -1895,6 +2240,108 @@ fn index_directory_scoped_with_max_depth(
     })
 }
 
+/// Metadata key present while no minified file is left in the index. An index
+/// written by an older version or with the filter off lacks it, and the next
+/// `update` then checks unchanged files too, dropping the minified ones.
+const MINIFIED_FILTER_KEY: &str = "minified_filter";
+
+fn record_minified_filter(conn: &Connection) -> Result<()> {
+    if minified::enabled() {
+        db::set_metadata_value(conn, MINIFIED_FILTER_KEY, "1")
+    } else {
+        db::delete_metadata_value(conn, MINIFIED_FILTER_KEY)
+    }
+}
+
+/// Parse `items` on `threads` workers and write the results to `conn` in
+/// input order, one transaction per `batch` items, while later items are
+/// still being parsed.
+///
+/// Parsing a chunk and then writing it left every parse thread idle during
+/// the write, and one large file held up its whole chunk. Workers now run at
+/// most two batches ahead of the writer, which bounds memory like the chunks
+/// did. Items are written in the order they are given, with the same
+/// transaction boundaries, so every file gets the id it got before.
+fn parse_and_write_in_order<T: Sync>(
+    conn: &mut Connection,
+    items: &[T],
+    threads: usize,
+    batch: usize,
+    parse: &(dyn Fn(&T) -> Option<ParsedFile> + Sync),
+    total_count: &mut usize,
+    mut after_batch: impl FnMut(usize),
+) -> Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let batch = batch.max(1);
+    let window = batch * 2;
+    let next = AtomicUsize::new(0);
+    let written = AtomicUsize::new(0);
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let (tx, rx) = crossbeam_channel::bounded::<(usize, Option<ParsedFile>)>(window);
+
+    std::thread::scope(|scope| -> Result<()> {
+        for _ in 0..threads.max(1).min(items.len()) {
+            let tx = tx.clone();
+            let (next, written, stop) = (&next, &written, &stop);
+            std::thread::Builder::new()
+                .stack_size(RAYON_WORKER_STACK_SIZE)
+                .spawn_scoped(scope, move || loop {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    if index >= items.len() {
+                        break;
+                    }
+                    while index >= written.load(Ordering::Acquire) + window
+                        && !stop.load(Ordering::Relaxed)
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    if tx.send((index, parse(&items[index]))).is_err() {
+                        break;
+                    }
+                })
+                .map_err(|e| anyhow::anyhow!("Failed to start a parse thread: {}", e))?;
+        }
+        drop(tx);
+
+        let mut pending: HashMap<usize, Option<ParsedFile>> = HashMap::new();
+        let mut frontier = 0usize;
+        let mut consumed = 0usize;
+        let mut current: Vec<ParsedFile> = Vec::with_capacity(batch);
+        let result = (|| -> Result<()> {
+            for (index, parsed) in &rx {
+                pending.insert(index, parsed);
+                while let Some(parsed) = pending.remove(&frontier) {
+                    frontier += 1;
+                    consumed += 1;
+                    current.extend(parsed);
+                    if consumed == batch || frontier == items.len() {
+                        write_batch_to_db(
+                            conn,
+                            std::mem::take(&mut current),
+                            total_count,
+                            WriteMode::FreshRebuild,
+                        )?;
+                        consumed = 0;
+                        written.store(frontier, Ordering::Release);
+                        after_batch(*total_count);
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        drop(rx);
+        result
+    })
+}
+
 /// Write a batch of parsed files to DB in a single transaction
 fn write_batch_to_db(
     conn: &mut Connection,
@@ -1903,6 +2350,9 @@ fn write_batch_to_db(
     mode: WriteMode,
 ) -> Result<()> {
     let tx = conn.transaction()?;
+    if !batch.is_empty() {
+        db::bump_index_generation(&tx)?;
+    }
 
     {
         let file_sql = match mode {
@@ -1915,13 +2365,18 @@ fn write_batch_to_db(
         };
         let mut file_stmt = tx.prepare_cached(file_sql)?;
         let mut sym_stmt = tx.prepare_cached(
-            "INSERT INTO symbols (file_id, name, qualified_name, kind, line, signature) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+            "INSERT INTO symbols (file_id, name, qualified_name, kind, line, end_line, signature) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
         )?;
         let mut inh_stmt = tx.prepare_cached(
             "INSERT INTO inheritance (child_id, parent_name, kind) VALUES (?1, ?2, ?3)",
         )?;
         let mut ref_stmt = tx.prepare_cached(
             "INSERT INTO refs (file_id, name, line, context) VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        // An index created before the table existed gains it on its next write.
+        tx.execute_batch(db::CREATE_FILE_WORDS_SQL)?;
+        let mut words_stmt = tx.prepare_cached(
+            "INSERT OR REPLACE INTO file_words (file_id, mtime, size, words) VALUES (?1, ?2, ?3, ?4)",
         )?;
 
         for pf in batch {
@@ -1933,16 +2388,23 @@ fn write_batch_to_db(
                 symbols,
                 qualified_names,
                 refs,
+                words,
             } = pf;
 
-            file_stmt.execute(rusqlite::params![rel_path, root_path, mtime, size])
+            file_stmt
+                .execute(rusqlite::params![rel_path, root_path, mtime, size])
                 .map_err(|e| {
                     anyhow::anyhow!(
                         "insert file failed: root_path={} rel_path={}: {}",
-                        root_path, rel_path, e
+                        root_path,
+                        rel_path,
+                        e
                     )
                 })?;
             let file_id = tx.last_insert_rowid();
+            if let Some(words) = words {
+                words_stmt.execute(rusqlite::params![file_id, mtime, size, words])?;
+            }
             // `INSERT OR REPLACE` on `files.path` drops the previous file row first, and
             // `ON DELETE CASCADE` clears old symbols/refs automatically. Explicit deletes
             // here only add extra work, especially during full rebuilds on a fresh DB.
@@ -1959,6 +2421,7 @@ fn write_batch_to_db(
                     qualified_name,
                     sym.kind.as_str(),
                     sym.line as i64,
+                    sym.end_line.map(|l| l as i64),
                     parsers::truncate_signature(&sym.signature)
                 ])?;
                 let symbol_id = tx.last_insert_rowid();
@@ -1978,6 +2441,29 @@ fn write_batch_to_db(
 
     tx.commit()?;
     Ok(())
+}
+
+/// `(mtime seconds, size)` of every path, in order; `(0, 0)` for a path that
+/// cannot be read. Stats run on the rayon pool: one by one they made the
+/// change scan of `update` wait on tens of thousands of serial syscalls.
+fn stat_mtime_size_parallel(paths: &[PathBuf]) -> Vec<(i64, i64)> {
+    paths
+        .par_iter()
+        .map(|path| {
+            fs::metadata(path)
+                .ok()
+                .map(|metadata| {
+                    let mtime = metadata
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    (mtime, metadata.len() as i64)
+                })
+                .unwrap_or((0, 0))
+        })
+        .collect()
 }
 
 /// Incremental update: only re-index changed/new files, delete removed files.
@@ -2030,6 +2516,13 @@ pub fn update_directory_incremental(
         eprintln!("Loaded {} files from index", existing_files.len());
     }
 
+    // Files already in the index are only re-read when they change, so a
+    // minified file an older index kept would never be noticed; until the
+    // filter has run over every file once, unchanged files are checked too.
+    let minified_filter_recorded =
+        db::get_metadata_value(conn, MINIFIED_FILTER_KEY)?.as_deref() == Some("1");
+    let check_unchanged_for_minified = minified::enabled() && !minified_filter_recorded;
+
     // 2. Build the list of (walk_dir, path_anchor) pairs. `path_anchor` is the
     //    base used for `strip_prefix` when computing rel_path — keeping it equal
     //    to the outer root for include sub-paths means the DB stays consistent
@@ -2065,8 +2558,12 @@ pub fn update_directory_incremental(
     let mut files_to_parse: Vec<PendingUpdateFile> = Vec::new();
     let mut current_paths: std::collections::HashSet<(String, String)> =
         std::collections::HashSet::new();
+    // Build files are collected regardless of extension: `build.gradle.kts`,
+    // `pom.xml`, `ya.make` are not parsed as sources but define the module graph.
+    let mut module_files: Vec<PathBuf> = Vec::new();
 
     for (walk_dir, anchor) in &walk_specs {
+        let anchor_key = db::normalize_root_for_storage(anchor);
         let is_git = has_git_repo(walk_dir) || has_git_repo(anchor);
         let arc_root = find_arc_root(walk_dir).or_else(|| find_arc_root(anchor));
         let mut builder = WalkBuilder::new(walk_dir);
@@ -2094,70 +2591,90 @@ pub fn update_directory_incremental(
                 builder.add_ignore(root_gitignore);
             }
         }
-        let walker = builder.build();
+        // A parallel walk, sorted afterwards so the outcome does not depend
+        // on thread timing. Only the order changed files are written in (and
+        // so the ids they get) differs from the former serial walk order.
+        let (tx, rx) = crossbeam_channel::unbounded::<PathBuf>();
+        let (module_tx, module_rx) = crossbeam_channel::unbounded::<PathBuf>();
+        builder
+            .threads(effective_num_threads())
+            .build_parallel()
+            .run(|| {
+                let tx = tx.clone();
+                let module_tx = module_tx.clone();
+                Box::new(move |entry| {
+                    if let Ok(entry) = entry {
+                        if entry.file_type().is_some_and(|t| t.is_file())
+                            && entry.file_name().to_str().is_some_and(is_module_file)
+                        {
+                            let _ = module_tx.send(entry.path().to_path_buf());
+                        }
+                        let is_supported = entry
+                            .path()
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            .map(parsers::is_supported_extension)
+                            .unwrap_or(false);
+                        if is_supported {
+                            let _ = tx.send(entry.into_path());
+                        }
+                    }
+                    ignore::WalkState::Continue
+                })
+            });
+        drop(tx);
+        drop(module_tx);
+        let mut walked: Vec<PathBuf> = rx.into_iter().collect();
+        walked.sort_unstable();
+        let mut walked_modules: Vec<PathBuf> = module_rx.into_iter().collect();
+        walked_modules.sort_unstable();
+        module_files.extend(walked_modules);
+        let schema_files = if is_git || arc_root.is_some() {
+            rails_schema_files(anchor, walk_dir, exclude_matcher)
+        } else {
+            Vec::new()
+        };
 
-        for entry in walker.filter_map(|e| e.ok()) {
-            let is_supported = entry
-                .path()
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(parsers::is_supported_extension)
-                .unwrap_or(false);
-            if !is_supported {
+        // Stat in parallel but decide in walk order: which pending file comes
+        // first sets the order changed files are written, and so their ids.
+        let paths: Vec<PathBuf> = walked.into_iter().chain(schema_files).collect();
+        let stats = stat_mtime_size_parallel(&paths);
+        for (file_path, (file_mtime, file_size)) in paths.into_iter().zip(stats) {
+            let rel_path = crate::relative_path(&anchor, &file_path);
+            let key = (anchor_key.clone(), rel_path);
+            if current_paths.contains(&key) {
+                continue;
+            }
+            // Left out of `current_paths`, a minified file already in the
+            // index is removed below like a deleted one.
+            if minified::skip_by_name(&file_path) {
                 continue;
             }
 
-            let file_path = entry.path().to_path_buf();
-            let rel_path = file_path
-                .strip_prefix(anchor)
-                .unwrap_or(&file_path)
-                .to_string_lossy()
-                .to_string();
-            let root_key = db::normalize_root_for_storage(anchor);
-
-            let (file_mtime, file_size) = fs::metadata(&file_path)
-                .ok()
-                .map(|metadata| {
-                    let mtime = metadata
-                        .modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(0);
-                    (mtime, metadata.len() as i64)
-                })
-                .unwrap_or((0, 0));
-
-            let need_parse = match existing_files.get(&(root_key.clone(), rel_path.clone())) {
+            let need_parse = match existing_files.get(&key) {
                 Some((_, db_mtime, db_size)) => file_mtime != *db_mtime || file_size != *db_size,
                 None => true,
             };
+            if (need_parse || check_unchanged_for_minified) && minified::skip(&file_path, None) {
+                continue;
+            }
 
             if need_parse {
                 files_to_parse.push(PendingUpdateFile::Regular {
                     root: anchor.clone(),
+                    root_key: anchor_key.clone(),
                     path: file_path,
                 });
             }
-            current_paths.insert((root_key, rel_path));
+            current_paths.insert(key);
         }
     }
 
     let root_key = db::normalize_root_for_storage(root);
-    for (file_path, rel_path) in collect_node_modules_dts_files(root) {
-        let (file_mtime, file_size) = fs::metadata(&file_path)
-            .ok()
-            .map(|metadata| {
-                let mtime = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                (mtime, metadata.len() as i64)
-            })
-            .unwrap_or((0, 0));
-
+    let dts_files = collect_node_modules_dts_files(root);
+    let dts_paths: Vec<PathBuf> = dts_files.iter().map(|(path, _)| path.clone()).collect();
+    let dts_stats = stat_mtime_size_parallel(&dts_paths);
+    for ((file_path, rel_path), (file_mtime, file_size)) in dts_files.into_iter().zip(dts_stats) {
         let need_parse = match existing_files.get(&(root_key.clone(), rel_path.clone())) {
             Some((_, db_mtime, db_size)) => file_mtime != *db_mtime || file_size != *db_size,
             None => true,
@@ -2204,6 +2721,7 @@ pub fn update_directory_incremental(
                 del_file_stmt.execute(rusqlite::params![root_path, path])?;
             }
         }
+        db::bump_index_generation(&tx)?;
         tx.commit()?;
     }
 
@@ -2233,14 +2751,17 @@ pub fn update_directory_incremental(
                 .par_iter()
                 .filter_map(|pending| {
                     let result = match pending {
-                        PendingUpdateFile::Regular { root, path } => parse_file(root, path),
+                        PendingUpdateFile::Regular {
+                            root,
+                            root_key,
+                            path,
+                        } => parse_file_keyed(root, root_key, path).ok().flatten(),
                         PendingUpdateFile::NodeModulesDts {
                             path,
                             rel_path,
                             root_path,
-                        } => parse_dts_file(path, rel_path, root_path),
-                    }
-                    .ok();
+                        } => parse_dts_file(path, rel_path, root_path).ok(),
+                    };
                     let c = parsed_count_clone.fetch_add(1, Ordering::Relaxed) + 1;
                     if progress && c % 500 == 0 {
                         eprintln!("Parsed {} / {} changed files...", c, total_files);
@@ -2267,12 +2788,118 @@ pub fn update_directory_incremental(
     if all_planned_files_written && (has_planned_mutations || was_dirty) {
         db::complete_index_update(conn)?;
     }
+    if minified::enabled() != minified_filter_recorded {
+        record_minified_filter(conn)?;
+    }
+
+    // The module graph is derived from build files, not from parsed symbols,
+    // so an added, removed or edited build file needs a separate refresh.
+    let fingerprint = build_files_fingerprint(&module_files);
+    match db::get_build_files_fingerprint(conn)? {
+        Some(stored) if stored != fingerprint => {
+            refresh_module_graph(conn, root, &module_files, false)?;
+            db::set_build_files_fingerprint(conn, &fingerprint)?;
+        }
+        // First update after a rebuild: the graph was just derived from these files.
+        None => db::set_build_files_fingerprint(conn, &fingerprint)?,
+        Some(_) => {}
+    }
 
     Ok((updated_count, files_to_parse.len(), deleted_paths.len()))
 }
 
-/// Index modules from build.gradle files (Android) and Package.swift (iOS)
+/// Module `kind` for targets declared in a Swift manifest, keyed by file name.
+fn swift_manifest_kind(file_name: &str) -> Option<&'static str> {
+    match file_name {
+        "Package.swift" => Some("spm"),
+        "Project.swift" => Some("tuist"),
+        _ => None,
+    }
+}
+
+/// Target name of a Swift module row, the key its dependents refer to it by.
+/// Swift module names cannot contain `.`, so the last segment of a
+/// disambiguated `pkg.dir.Target` name is the target itself.
+fn swift_target_name(module_name: &str) -> &str {
+    module_name.rsplit('.').next().unwrap_or(module_name)
+}
+
+/// Declare modules for every target of the given Swift manifests. A module is
+/// named after its target — the Swift `import` name — unless that name is
+/// declared more than once or already taken, in which case every such target
+/// gets a manifest-qualified `dir.path.Target` name so none silently wins.
+fn index_swift_manifest_modules(
+    conn: &Connection,
+    root: &Path,
+    manifests: &[&Path],
+) -> Result<usize> {
+    let mut declared = Vec::new();
+    let mut unread = Vec::new();
+    for manifest in manifests {
+        let (Some(kind), Some(dir)) = (
+            manifest
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(swift_manifest_kind),
+            manifest.parent(),
+        ) else {
+            continue;
+        };
+        let Ok(content) = crate::encoding::read_file_to_string(manifest) else {
+            continue;
+        };
+        let parsed = swift_manifest::parse_manifest(&content);
+        if parsed.declares_project && parsed.targets.is_empty() {
+            unread.push(crate::relative_path(&root, &manifest));
+        }
+        for target in parsed.targets {
+            declared.push((kind, dir, target));
+        }
+    }
+    db::set_unread_module_manifests(conn, &unread)?;
+
+    let mut name_counts: HashMap<&str, usize> = HashMap::new();
+    for (_, _, target) in &declared {
+        *name_counts.entry(target.name.as_str()).or_default() += 1;
+    }
+
+    let mut count = 0;
+    for (kind, dir, target) in &declared {
+        let taken: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM modules WHERE name = ?1)",
+            rusqlite::params![target.name],
+            |row| row.get(0),
+        )?;
+        let module_name = if taken || name_counts[target.name.as_str()] > 1 {
+            let dir_rel = crate::relative_path(&root, &dir);
+            if dir_rel.is_empty() {
+                target.name.clone()
+            } else {
+                format!("{}.{}", dir_rel.replace('/', "."), target.name)
+            }
+        } else {
+            target.name.clone()
+        };
+        let target_dir = swift_manifest::target_dir(dir, target);
+        let module_path = crate::relative_path(&root, &target_dir);
+        conn.execute(
+            "INSERT OR IGNORE INTO modules (name, path, kind) VALUES (?1, ?2, ?3)",
+            rusqlite::params![module_name, module_path, kind],
+        )?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Index modules from build.gradle files (Android) and Package.swift / Tuist Project.swift (iOS)
 pub fn index_modules(conn: &Connection, root: &Path) -> Result<usize> {
+    let files = collect_module_files(root);
+    index_modules_from_files(conn, root, &files)
+}
+
+/// Build files (Gradle, SwiftPM/Tuist manifests, Maven, ya.make, Python, Perl)
+/// under `root`, honouring the same ignore rules as indexing.
+pub fn collect_module_files(root: &Path) -> Vec<PathBuf> {
     use ignore::WalkBuilder;
 
     let is_git = has_git_repo(root);
@@ -2303,8 +2930,64 @@ pub fn index_modules(conn: &Connection, root: &Path) -> Result<usize> {
         })
         .map(|e| e.path().to_path_buf())
         .collect();
+    files
+}
 
-    index_modules_from_files(conn, root, &files)
+/// Re-derive the module list from build files, keeping the id of every module
+/// that still exists. Resources, XML/storyboard usages and assets reference
+/// modules by id with `ON DELETE CASCADE`, so deleting and re-inserting all
+/// modules would silently drop them.
+pub fn sync_modules_from_files(conn: &Connection, root: &Path, files: &[PathBuf]) -> Result<usize> {
+    let scratch = Connection::open_in_memory()?;
+    db::init_db(&scratch)?;
+    let count = index_modules_from_files(&scratch, root, files)?;
+    let fresh: Vec<(String, String, Option<String>)> = scratch
+        .prepare("SELECT name, path, kind FROM modules")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    let unread = db::get_unread_module_manifests(&scratch)?;
+
+    let fresh_names: std::collections::HashSet<&str> =
+        fresh.iter().map(|(name, _, _)| name.as_str()).collect();
+    let existing: Vec<String> = conn
+        .prepare("SELECT name FROM modules")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut upsert = tx.prepare_cached(
+            "INSERT INTO modules (name, path, kind) VALUES (?1, ?2, ?3)
+             ON CONFLICT(name) DO UPDATE SET path = excluded.path, kind = excluded.kind",
+        )?;
+        for (name, path, kind) in &fresh {
+            upsert.execute(rusqlite::params![name, path, kind])?;
+        }
+        let mut delete = tx.prepare_cached("DELETE FROM modules WHERE name = ?1")?;
+        for name in existing
+            .iter()
+            .filter(|name| !fresh_names.contains(name.as_str()))
+        {
+            delete.execute(rusqlite::params![name])?;
+        }
+    }
+    db::set_unread_module_manifests(&tx, &unread)?;
+    tx.commit()?;
+    Ok(count)
+}
+
+/// Rebuild modules, their dependencies and transitive closure from the given
+/// build files, keeping the ids of modules that still exist.
+pub fn refresh_module_graph(
+    conn: &mut Connection,
+    root: &Path,
+    files: &[PathBuf],
+    progress: bool,
+) -> Result<(usize, usize)> {
+    let module_count = sync_modules_from_files(conn, root, files)?;
+    let dep_count = index_module_dependencies(conn, root, files, progress)?;
+    build_transitive_deps(conn, progress)?;
+    Ok((module_count, dep_count))
 }
 
 /// Index modules from a pre-collected list of module files (avoids re-walking the filesystem)
@@ -2315,13 +2998,7 @@ pub fn index_modules_from_files(
 ) -> Result<usize> {
     let mut count = 0;
 
-    // Regex to extract SPM targets from Package.swift
-    static SPM_TARGET_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"\.(?:target|testTarget|binaryTarget)\s*\(\s*name:\s*["']([^"']+)["']"#)
-            .unwrap()
-    });
-
-    let spm_target_re = &*SPM_TARGET_RE;
+    let mut swift_manifests: Vec<&Path> = Vec::new();
 
     // Outer repository root — used to normalize ya.make module paths so they match PEERDIR
     // entries, which are written relative to the outer repo root, not the rebuild root.
@@ -2334,11 +3011,7 @@ pub fn index_modules_from_files(
             // Android/Gradle modules
             if name_str == "build.gradle" || name_str == "build.gradle.kts" {
                 if let Some(parent) = path.parent() {
-                    let module_path = parent
-                        .strip_prefix(root)
-                        .unwrap_or(parent)
-                        .to_string_lossy()
-                        .to_string();
+                    let module_path = crate::relative_path(&root, &parent);
 
                     // Convert path to module name (e.g., features/payments/api -> features.payments.api)
                     let module_name = module_path.replace('/', ".");
@@ -2353,40 +3026,10 @@ pub fn index_modules_from_files(
                 }
             }
 
-            // iOS/SPM modules (Package.swift)
-            if name_str == "Package.swift" {
-                if let Some(parent) = path.parent() {
-                    let package_path = parent
-                        .strip_prefix(root)
-                        .unwrap_or(parent)
-                        .to_string_lossy()
-                        .to_string();
-
-                    // Read Package.swift and extract targets
-                    if let Ok(content) = crate::encoding::read_file_to_string(path) {
-                        for caps in spm_target_re.captures_iter(&content) {
-                            let target_name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                            if !target_name.is_empty() {
-                                let module_name = if package_path.is_empty() {
-                                    target_name.to_string()
-                                } else {
-                                    format!("{}.{}", package_path.replace('/', "."), target_name)
-                                };
-                                let module_path = if package_path.is_empty() {
-                                    target_name.to_string()
-                                } else {
-                                    format!("{}/{}", package_path, target_name)
-                                };
-
-                                conn.execute(
-                                    "INSERT OR IGNORE INTO modules (name, path) VALUES (?1, ?2)",
-                                    rusqlite::params![module_name, module_path],
-                                )?;
-                                count += 1;
-                            }
-                        }
-                    }
-                }
+            // iOS modules (Package.swift / Tuist Project.swift) need a global view
+            // of target names for collision handling; declared after this loop.
+            if swift_manifest_kind(&name_str).is_some() {
+                swift_manifests.push(path.as_path());
             }
 
             // Perl modules (.pm files with package declarations)
@@ -2400,11 +3043,7 @@ pub fn index_modules_from_files(
                         for caps in re.captures_iter(&content) {
                             let package_name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                             if !package_name.is_empty() {
-                                let module_path = path
-                                    .strip_prefix(root)
-                                    .unwrap_or(path)
-                                    .to_string_lossy()
-                                    .to_string();
+                                let module_path = crate::relative_path(&root, &path);
 
                                 conn.execute(
                                     "INSERT OR IGNORE INTO modules (name, path) VALUES (?1, ?2)",
@@ -2420,11 +3059,7 @@ pub fn index_modules_from_files(
             // Maven modules (pom.xml)
             if name_str == "pom.xml" {
                 if let Some(parent) = path.parent() {
-                    let module_path = parent
-                        .strip_prefix(root)
-                        .unwrap_or(parent)
-                        .to_string_lossy()
-                        .to_string();
+                    let module_path = crate::relative_path(&root, &parent);
 
                     if let Ok(content) = crate::encoding::read_file_to_string(path) {
                         static ARTIFACT_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -2466,11 +3101,7 @@ pub fn index_modules_from_files(
                     .unwrap_or_else(|| parent.to_path_buf());
 
                     let module_name = rel.to_string_lossy().replace('\\', "/");
-                    let module_path = parent
-                        .strip_prefix(root)
-                        .unwrap_or(parent)
-                        .to_string_lossy()
-                        .to_string();
+                    let module_path = crate::relative_path(&root, &parent);
 
                     if !module_name.is_empty() {
                         conn.execute(
@@ -2485,11 +3116,7 @@ pub fn index_modules_from_files(
             // Python modules (pyproject.toml, setup.py, setup.cfg)
             if name_str == "pyproject.toml" || name_str == "setup.py" || name_str == "setup.cfg" {
                 if let Some(parent) = path.parent() {
-                    let module_path = parent
-                        .strip_prefix(root)
-                        .unwrap_or(parent)
-                        .to_string_lossy()
-                        .to_string();
+                    let module_path = crate::relative_path(&root, &parent);
 
                     // Use directory name as module name
                     let module_name = if module_path.is_empty() {
@@ -2527,8 +3154,31 @@ pub fn index_modules_from_files(
                     }
                 }
             }
+
+            // Ruby gems (`*.gemspec`): a Rails engine or a gem vendored in the
+            // repository, named by its directory like a Python module.
+            if name_str.ends_with(".gemspec") {
+                if let Some(parent) = path.parent() {
+                    let module_path = crate::relative_path(&root, &parent);
+                    let module_name = if module_path.is_empty() {
+                        name_str.trim_end_matches(".gemspec").to_string()
+                    } else {
+                        module_path.replace('/', ".")
+                    };
+                    if !module_name.is_empty() {
+                        conn.execute(
+                            "INSERT OR IGNORE INTO modules (name, path) VALUES (?1, ?2)",
+                            rusqlite::params![module_name, module_path],
+                        )?;
+                        count += 1;
+                    }
+                }
+            }
         }
     }
+
+    swift_manifests.sort();
+    count += index_swift_manifest_modules(conn, root, &swift_manifests)?;
 
     Ok(count)
 }
@@ -2599,14 +3249,32 @@ fn extract_python_module_name(content: &str) -> Option<String> {
         .map(|m| m.as_str().to_string())
 }
 
-/// Collect build files (Gradle, Maven, ya.make, Python) from module paths in DB (for standalone rebuild modules/deps)
+/// Collect build files (Gradle, Maven, ya.make, Python, Swift manifests) from module paths in DB (for standalone rebuild modules/deps)
 pub fn collect_build_files_from_db(conn: &Connection, root: &Path) -> Result<Vec<PathBuf>> {
-    let mut stmt = conn.prepare("SELECT path FROM modules")?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut stmt = conn.prepare("SELECT path, kind FROM modules")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+    })?;
     let mut files = Vec::new();
+    let mut seen_manifests = std::collections::HashSet::new();
     for row in rows {
-        let module_path = row?;
+        let (module_path, kind) = row?;
         let dir = root.join(&module_path);
+        if matches!(kind.as_deref(), Some("spm" | "tuist")) {
+            // A Swift module's path is its source directory; the manifest that
+            // declares it lives in an ancestor directory.
+            let manifest = dir
+                .ancestors()
+                .take_while(|d| d.starts_with(root))
+                .flat_map(|d| [d.join("Project.swift"), d.join("Package.swift")])
+                .find(|p| p.is_file());
+            if let Some(manifest) = manifest {
+                if seen_manifests.insert(manifest.clone()) {
+                    files.push(manifest);
+                }
+            }
+            continue;
+        }
         for name in &[
             "build.gradle.kts",
             "build.gradle",
@@ -2718,6 +3386,57 @@ fn strip_kt_line_comments(s: &str) -> String {
     out
 }
 
+/// Convert a stored Gradle module path to the accessor emitted by Gradle's
+/// type-safe project accessors feature. Filesystem path components retain the
+/// project hierarchy, while punctuation inside each component is a word
+/// boundary (`design-icon`, `design_icon`, and `design.icon` all become
+/// `designIcon`).
+fn gradle_project_accessor(module_path: &str) -> Option<String> {
+    let components: Vec<String> = module_path
+        .split(['/', '\\'])
+        .filter(|component| !component.is_empty())
+        .map(|component| {
+            let mut accessor = String::with_capacity(component.len());
+            let mut capitalize_next = false;
+            for ch in component.chars() {
+                if matches!(ch, '-' | '_' | '.') {
+                    capitalize_next = true;
+                } else if capitalize_next {
+                    accessor.extend(ch.to_uppercase());
+                    capitalize_next = false;
+                } else {
+                    accessor.push(ch);
+                }
+            }
+            accessor
+        })
+        .filter(|component| !component.is_empty())
+        .collect();
+
+    (!components.is_empty()).then(|| components.join("."))
+}
+
+/// Resolve an accessor without guessing when two real Gradle project paths
+/// normalize to the same generated accessor. Exact module-name lookups stay
+/// first for backwards compatibility with already-supported declarations.
+fn resolve_gradle_module_id(
+    accessor: &str,
+    module_ids: &HashMap<String, i64>,
+    accessor_candidates: &HashMap<String, Vec<(String, i64)>>,
+) -> std::result::Result<Option<i64>, Vec<String>> {
+    match accessor_candidates.get(accessor).map(Vec::as_slice) {
+        // Some module names are already written exactly as an accessor. Keep
+        // that compatibility only when normalization does not reveal another
+        // real project path with the same generated accessor.
+        None => Ok(module_ids.get(accessor).copied()),
+        Some([(_, module_id)]) => Ok(Some(*module_id)),
+        Some(candidates) => Err(candidates
+            .iter()
+            .map(|(module_name, _)| module_name.clone())
+            .collect()),
+    }
+}
+
 /// Parse module dependencies from collected build files (Gradle, Maven, ya.make, Python)
 pub fn index_module_dependencies(
     conn: &mut Connection,
@@ -2776,19 +3495,62 @@ pub fn index_module_dependencies(
 
     let mono_root = find_arc_root(root);
 
-    // First, ensure all modules are indexed and get their IDs
-    let module_ids: std::collections::HashMap<String, i64> = {
-        let mut stmt = conn.prepare("SELECT id, name FROM modules")?;
+    // First, ensure all modules are indexed and get their IDs. Gradle's
+    // generated accessors must be derived from the stored filesystem path:
+    // dots in a directory name are word boundaries, while path separators are
+    // hierarchy boundaries.
+    let module_rows: Vec<(String, String, i64)> = {
+        let mut stmt = conn.prepare("SELECT name, path, id FROM modules ORDER BY name")?;
         let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(0)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
         })?;
-        let mut map = std::collections::HashMap::new();
-        for row in rows {
-            let (name, id) = row?;
-            map.insert(name, id);
-        }
-        map
+        rows.collect::<Result<Vec<_>, _>>()?
     };
+    let module_ids: HashMap<String, i64> = module_rows
+        .iter()
+        .map(|(name, _, id)| (name.clone(), *id))
+        .collect();
+    let mut gradle_accessor_candidates: HashMap<String, Vec<(String, i64)>> = HashMap::new();
+    for (module_name, module_path, module_id) in &module_rows {
+        if let Some(accessor) = gradle_project_accessor(module_path) {
+            gradle_accessor_candidates
+                .entry(accessor)
+                .or_default()
+                .push((module_name.clone(), *module_id));
+        }
+    }
+    for candidates in gradle_accessor_candidates.values_mut() {
+        candidates.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        candidates.dedup_by_key(|(_, module_id)| *module_id);
+    }
+
+    // Swift dependencies refer to targets by bare name, across manifests; a
+    // manifest's own targets are identified by their source directory.
+    let mut swift_modules = SwiftModuleIds::default();
+    {
+        let mut stmt =
+            conn.prepare("SELECT name, path, id FROM modules WHERE kind IN ('spm', 'tuist')")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (name, path, id) = row?;
+            swift_modules
+                .by_target
+                .entry(swift_target_name(&name).to_string())
+                .or_default()
+                .push(id);
+            swift_modules.by_path.entry(path).or_insert(id);
+        }
+    }
 
     if progress {
         eprintln!("Found {} modules in index", module_ids.len());
@@ -2824,8 +3586,14 @@ pub fn index_module_dependencies(
             let root_buf = root.to_path_buf();
             let mono_root = mono_root.clone();
             let module_ids = Arc::new(module_ids.clone());
+            let gradle_accessor_candidates = Arc::new(gradle_accessor_candidates);
+            let swift_modules = Arc::new(swift_modules);
+            let ambiguous_gradle_refs = Arc::new(Mutex::new(std::collections::BTreeMap::<
+                String,
+                Vec<String>,
+            >::new()));
 
-            pool.install(|| {
+            let edges = pool.install(|| {
                 gradle_files
                     .par_iter()
                     .flat_map_iter(|path| {
@@ -2834,6 +3602,10 @@ pub fn index_module_dependencies(
                             Some(p) => p,
                             None => return Vec::new(),
                         };
+
+                        if swift_manifest_kind(file_name).is_some() {
+                            return swift_manifest_edges(path, parent, &root_buf, &swift_modules);
+                        }
 
                         let source_module_name: String = match file_name {
                             "ya.make" => {
@@ -2848,11 +3620,7 @@ pub fn index_module_dependencies(
                                 rel.to_string_lossy().replace('\\', "/")
                             }
                             "pyproject.toml" | "setup.py" | "setup.cfg" => {
-                                let module_path = parent
-                                    .strip_prefix(&root_buf)
-                                    .unwrap_or(parent)
-                                    .to_string_lossy()
-                                    .to_string();
+                                let module_path = crate::relative_path(&&root_buf, &parent);
                                 if module_path.is_empty() {
                                     if file_name == "pyproject.toml" {
                                         crate::encoding::read_file_to_string(path)
@@ -2877,11 +3645,7 @@ pub fn index_module_dependencies(
                                     module_path.replace('/', ".")
                                 }
                             }
-                            _ => parent
-                                .strip_prefix(&root_buf)
-                                .unwrap_or(parent)
-                                .to_string_lossy()
-                                .replace('/', "."),
+                            _ => crate::relative_path(&&root_buf, &parent).replace('/', "."),
                         };
 
                         let module_id = match module_ids.get(&source_module_name) {
@@ -2976,11 +3740,27 @@ pub fn index_module_dependencies(
                             _ => {
                                 let mut inserted: std::collections::HashSet<(i64, i64)> =
                                     std::collections::HashSet::new();
+                                let resolve_accessor =
+                                    |accessor: &str| match resolve_gradle_module_id(
+                                        accessor,
+                                        &module_ids,
+                                        &gradle_accessor_candidates,
+                                    ) {
+                                        Ok(module_id) => module_id,
+                                        Err(candidates) => {
+                                            ambiguous_gradle_refs
+                                                .lock()
+                                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                                .entry(accessor.to_string())
+                                                .or_insert(candidates);
+                                            None
+                                        }
+                                    };
                                 for caps in projects_dep_re.captures_iter(&content) {
                                     let dep_kind =
                                         caps.get(1).map(|m| m.as_str()).unwrap_or("implementation");
                                     let dep_name = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-                                    if let Some(&dep_id) = module_ids.get(dep_name) {
+                                    if let Some(dep_id) = resolve_accessor(dep_name) {
                                         if inserted.insert((module_id, dep_id)) {
                                             edges.push((module_id, dep_id, dep_kind.to_string()));
                                         }
@@ -3021,7 +3801,20 @@ pub fn index_module_dependencies(
                         edges
                     })
                     .collect()
-            })
+            });
+
+            let ambiguous_gradle_refs = ambiguous_gradle_refs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for (accessor, candidates) in ambiguous_gradle_refs.iter() {
+                eprintln!(
+                    "Warning: ambiguous Gradle project accessor `projects.{}` matches modules {}; dependency skipped",
+                    accessor,
+                    candidates.join(", ")
+                );
+            }
+
+            edges
         };
 
         edges.sort_unstable();
@@ -3037,6 +3830,56 @@ pub fn index_module_dependencies(
     tx.commit()?;
 
     Ok(dep_count)
+}
+
+#[derive(Default)]
+struct SwiftModuleIds {
+    by_target: HashMap<String, Vec<i64>>,
+    by_path: HashMap<String, i64>,
+}
+
+/// Dependency edges declared by the targets of one Swift manifest. A
+/// dependency resolves to a target of the same manifest first, then to the
+/// only workspace target with that name; ambiguous or external names are skipped.
+fn swift_manifest_edges(
+    manifest: &Path,
+    manifest_dir: &Path,
+    root: &Path,
+    modules: &SwiftModuleIds,
+) -> Vec<(i64, i64, String)> {
+    let Ok(content) = crate::encoding::read_file_to_string(manifest) else {
+        return Vec::new();
+    };
+    let targets = swift_manifest::parse_manifest(&content).targets;
+    let local_id = |target: &swift_manifest::ManifestTarget| {
+        let dir = swift_manifest::target_dir(manifest_dir, target);
+        let rel = crate::relative_path(&root, &dir);
+        modules.by_path.get(&rel).copied()
+    };
+
+    let mut edges = Vec::new();
+    for target in &targets {
+        let Some(module_id) = local_id(target) else {
+            continue;
+        };
+        for dep in &target.dependencies {
+            let local = targets
+                .iter()
+                .find(|t| t.name == dep.name)
+                .and_then(local_id);
+            let dep_id =
+                local.or_else(
+                    || match modules.by_target.get(&dep.name).map(Vec::as_slice) {
+                        Some([only]) => Some(*only),
+                        _ => None,
+                    },
+                );
+            if let Some(dep_id) = dep_id.filter(|id| *id != module_id) {
+                edges.push((module_id, dep_id, dep.kind.clone()));
+            }
+        }
+    }
+    edges
 }
 
 /// Get dependencies of a module
@@ -3168,11 +4011,7 @@ pub fn index_xml_usages(
                 xml_layout_files
                     .par_iter()
                     .flat_map_iter(|xml_path| {
-                        let rel_path = xml_path
-                            .strip_prefix(&root_buf)
-                            .unwrap_or(xml_path)
-                            .to_string_lossy()
-                            .to_string();
+                        let rel_path = crate::relative_path(&&root_buf, &xml_path);
                         let module_id = module_lookup.find(&rel_path);
                         let content = match crate::encoding::read_file_to_string(xml_path) {
                             Ok(content) => content,
@@ -3354,11 +4193,7 @@ pub fn index_resources(
 
         // First pass: index resource definitions
         for res_path in res_files {
-            let rel_path = res_path
-                .strip_prefix(root)
-                .unwrap_or(res_path)
-                .to_string_lossy()
-                .to_string();
+            let rel_path = crate::relative_path(&root, &res_path);
 
             let module_id = module_lookup.find(&rel_path);
 
@@ -3715,11 +4550,7 @@ pub fn index_storyboard_usages(
         )?;
 
         for sb_path in storyboard_files {
-            let rel_path = sb_path
-                .strip_prefix(root)
-                .unwrap_or(sb_path)
-                .to_string_lossy()
-                .to_string();
+            let rel_path = crate::relative_path(&root, &sb_path);
 
             // Find module for this file
             let module_id = module_lookup.find(&rel_path);
@@ -3845,11 +4676,7 @@ pub fn index_ios_assets(
 
         // Index assets from .xcassets directories
         for xcassets_dir in xcassets_dirs {
-            let rel_xcassets = xcassets_dir
-                .strip_prefix(root)
-                .unwrap_or(xcassets_dir)
-                .to_string_lossy()
-                .to_string();
+            let rel_xcassets = crate::relative_path(&root, &xcassets_dir);
 
             let module_id = module_lookup.find(&rel_xcassets);
 
@@ -3866,11 +4693,7 @@ pub fn index_ios_assets(
                                 "imageset" | "colorset" | "appiconset" | "launchimage" | "dataset"
                             ) {
                                 if let Some(name) = path.file_stem().and_then(|n| n.to_str()) {
-                                    let rel_path = path
-                                        .strip_prefix(root)
-                                        .unwrap_or(path)
-                                        .to_string_lossy()
-                                        .to_string();
+                                    let rel_path = crate::relative_path(&root, &path);
 
                                     let asset_type = IosAssetType::from_extension(ext);
                                     asset_stmt.execute(rusqlite::params![
@@ -4075,9 +4898,43 @@ pub fn index_ios_package_managers(conn: &Connection, root: &Path, progress: bool
     Ok(count)
 }
 
-fn collect_node_modules_dts_files(root: &Path) -> Vec<(PathBuf, String)> {
-    use ignore::WalkBuilder;
+/// Rails schema dumps under `root` (`db/schema.rb`, `db/<database>_schema.rb`)
+/// that lie inside `walk_dir` and outside the configured excludes.
+///
+/// They are indexed even when ignore rules hide them: teams often gitignore
+/// the dump because every migration regenerates it, yet it is the only place
+/// that declares a model's columns. Like `node_modules` type declarations, it
+/// is generated but describes code the project uses.
+fn rails_schema_files(
+    root: &Path,
+    walk_dir: &Path,
+    exclude: Option<&ignore::gitignore::Gitignore>,
+) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(root.join("db")) else {
+        return Vec::new();
+    };
+    let mut found: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == "schema.rb" || name.ends_with("_schema.rb"))
+        })
+        .filter(|path| path.starts_with(walk_dir))
+        .filter(|path| {
+            exclude.is_none_or(|matcher| {
+                !path.starts_with(matcher.path())
+                    || !matcher.matched_path_or_any_parents(path, false).is_ignore()
+            })
+        })
+        .collect();
+    found.sort();
+    found
+}
 
+fn collect_node_modules_dts_files(root: &Path) -> Vec<(PathBuf, String)> {
     let node_modules = root.join("node_modules");
     if !node_modules.exists() || !node_modules.is_dir() {
         return Vec::new();
@@ -4133,44 +4990,52 @@ fn collect_node_modules_dts_files(root: &Path) -> Vec<(PathBuf, String)> {
     // Walk each resolved package dir for .d.ts files.
     // follow_links=false — already resolved top-level symlinks.
     // Store (abs_path, rel_path) pairs for correct DB storage.
-    let mut dts_files: Vec<(PathBuf, String)> = Vec::new();
+    // Thousands of small package walks run in parallel and are concatenated
+    // in package order, so the list comes out exactly as a serial walk's.
+    let per_package: Vec<Vec<(PathBuf, String)>> = pkg_map
+        .par_iter()
+        .map(|(pkg_dir, nm_prefix)| walk_package_dts(pkg_dir, nm_prefix))
+        .collect();
+    per_package.concat()
+}
 
-    for (pkg_dir, nm_prefix) in &pkg_map {
-        let mut builder = WalkBuilder::new(pkg_dir);
-        builder
-            .hidden(false)
-            .git_ignore(false)
-            .git_exclude(false)
-            .follow_links(false)
-            .max_depth(Some(8))
-            .filter_entry(|entry| {
-                if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                    if let Some(name) = entry.file_name().to_str() {
-                        if name == "node_modules" || name.starts_with('.') {
-                            return false;
-                        }
+fn walk_package_dts(pkg_dir: &Path, nm_prefix: &str) -> Vec<(PathBuf, String)> {
+    use ignore::WalkBuilder;
+
+    let mut dts_files: Vec<(PathBuf, String)> = Vec::new();
+    let mut builder = WalkBuilder::new(pkg_dir);
+    builder
+        .hidden(false)
+        .git_ignore(false)
+        .git_exclude(false)
+        .follow_links(false)
+        .max_depth(Some(8))
+        .filter_entry(|entry| {
+            if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name == "node_modules" || name.starts_with('.') {
+                        return false;
                     }
                 }
-                true
-            });
+            }
+            true
+        });
 
-        for entry in builder.build().filter_map(|e| e.ok()) {
-            let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.ends_with(".d.ts") {
-                    // Map resolved path back to node_modules/... relative path
-                    let sub_path = path.strip_prefix(pkg_dir).unwrap_or(path).to_string_lossy();
-                    let rel_path = if sub_path.is_empty() || sub_path == "." {
-                        nm_prefix.clone()
-                    } else {
-                        format!("{}/{}", nm_prefix, sub_path)
-                    };
-                    dts_files.push((path.to_path_buf(), rel_path));
-                }
+    for entry in builder.build().filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name.ends_with(".d.ts") {
+                // Map resolved path back to node_modules/... relative path
+                let sub_path = crate::relative_path(&pkg_dir, &path);
+                let rel_path = if sub_path.is_empty() || sub_path == "." {
+                    nm_prefix.to_string()
+                } else {
+                    format!("{}/{}", nm_prefix, sub_path)
+                };
+                dts_files.push((path.to_path_buf(), rel_path));
             }
         }
     }
-
     dts_files
 }
 
@@ -4224,41 +5089,24 @@ pub fn index_node_modules_dts(conn: &mut Connection, root: &Path, progress: bool
 
     let num_threads = effective_num_threads();
 
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(num_threads)
-        .stack_size(RAYON_WORKER_STACK_SIZE)
-        .build()
-        .map_err(|e| anyhow::anyhow!("Failed to build thread pool: {}", e))?;
-
     let mut total_count = 0;
     let root_path = db::normalize_root_for_storage(root);
-
-    for chunk in dts_files.chunks(chunk_size) {
-        let counter = parsed_global.clone();
-        let total = total_files;
-        let root_path = root_path.clone();
-
-        let parsed_files: Vec<ParsedFile> = pool.install(|| {
-            chunk
-                .par_iter()
-                .filter_map(|(abs_path, rel_path)| {
-                    let result = parse_dts_file(abs_path, rel_path, &root_path).ok();
-                    let c = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if progress && c % 1000 == 0 {
-                        eprintln!("Parsed {} / {} .d.ts files...", c, total);
-                    }
-                    result
-                })
-                .collect()
-        });
-
-        write_batch_to_db(
-            conn,
-            parsed_files,
-            &mut total_count,
-            WriteMode::FreshRebuild,
-        )?;
-    }
+    parse_and_write_in_order(
+        conn,
+        &dts_files,
+        num_threads,
+        chunk_size,
+        &|(abs_path, rel_path): &(PathBuf, String)| {
+            let result = parse_dts_file(abs_path, rel_path, &root_path).ok();
+            let c = parsed_global.fetch_add(1, Ordering::Relaxed) + 1;
+            if progress && c % 1000 == 0 {
+                eprintln!("Parsed {} / {} .d.ts files...", c, total_files);
+            }
+            result
+        },
+        &mut total_count,
+        |_| {},
+    )?;
 
     if progress {
         eprintln!("Indexed {} .d.ts files from node_modules", total_count);
@@ -4285,11 +5133,16 @@ fn parse_dts_file(file_path: &Path, rel_path: &str, root_path: &str) -> Result<P
             symbols: vec![],
             qualified_names: HashMap::new(),
             refs: vec![],
+            words: None,
         });
     }
 
     let content = crate::encoding::read_file_to_string(file_path)?;
-    let (symbols, refs) = parsers::parse_file_symbols(&content, parsers::FileType::TypeScript)?;
+    // Symbols only: a .d.ts is indexed so that a library's exported types resolve,
+    // and its internal references would otherwise dominate `usages`/`refs` output
+    // for common names, pushing the project's own code past the result limit.
+    let mut symbols = parsers::parse_file_symbols_only(&content, parsers::FileType::TypeScript)?;
+    parsers::treesitter::typescript::name_default_export(&mut symbols, rel_path);
 
     Ok(ParsedFile {
         rel_path: rel_path.to_string(),
@@ -4298,7 +5151,8 @@ fn parse_dts_file(file_path: &Path, rel_path: &str, root_path: &str) -> Result<P
         size,
         symbols,
         qualified_names: HashMap::new(),
-        refs,
+        refs: Vec::new(),
+        words: None,
     })
 }
 
@@ -4486,7 +5340,7 @@ no_ignore: true
         let content = "a".repeat(1_100_000);
         fs::write(&large_file, &content).unwrap();
 
-        let result = parse_file(dir.path(), &large_file).unwrap();
+        let result = parse_file(dir.path(), &large_file).unwrap().unwrap();
         assert!(result.symbols.is_empty(), "should skip large files");
         assert!(result.refs.is_empty());
     }
@@ -4497,7 +5351,7 @@ no_ignore: true
         let kt_file = dir.path().join("Test.kt");
         fs::write(&kt_file, "class TestClass {\n    fun doSomething() {}\n}\n").unwrap();
 
-        let result = parse_file(dir.path(), &kt_file).unwrap();
+        let result = parse_file(dir.path(), &kt_file).unwrap().unwrap();
         assert!(result.symbols.iter().any(|s| s.name == "TestClass"));
         assert!(result.symbols.iter().any(|s| s.name == "doSomething"));
     }
@@ -4512,7 +5366,7 @@ no_ignore: true
         )
         .unwrap();
 
-        let result = parse_file(dir.path(), &swift_file).unwrap();
+        let result = parse_file(dir.path(), &swift_file).unwrap().unwrap();
         assert!(result.symbols.iter().any(|s| s.name == "MyView"));
         assert!(result.symbols.iter().any(|s| s.name == "setup"));
     }
@@ -4527,7 +5381,7 @@ no_ignore: true
         )
         .unwrap();
 
-        let result = parse_file(dir.path(), &py_file).unwrap();
+        let result = parse_file(dir.path(), &py_file).unwrap().unwrap();
         assert!(result.symbols.iter().any(|s| s.name == "Service"));
         assert!(result.symbols.iter().any(|s| s.name == "process"));
     }
@@ -4548,6 +5402,48 @@ no_ignore: true
         assert_eq!(strip_py_version("foo[extra]==1.0"), "foo");
         assert_eq!(strip_py_version("foo ~= 2.0"), "foo");
         assert_eq!(strip_py_version("foo ; python_version>='3.8'"), "foo");
+    }
+
+    #[test]
+    fn stack_marker_scan_stops_at_entry_budget() {
+        let dir = TempDir::new().unwrap();
+        for index in 0..12 {
+            fs::write(dir.path().join(format!("file-{index}.txt")), "x").unwrap();
+        }
+        let limits = StackScanLimits {
+            max_entries: 3,
+            ..StackScanLimits::default()
+        };
+
+        let scan = scan_stack_markers(dir.path(), limits);
+
+        assert!(scan.truncated);
+        assert_eq!(scan.entries.len(), 3);
+    }
+
+    #[test]
+    fn stack_detection_reports_exhausted_gradle_read_budget() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("shared/src/commonMain/kotlin")).unwrap();
+        fs::write(
+            root.join("shared/build.gradle.kts"),
+            "plugins { kotlin(\"multiplatform\") }",
+        )
+        .unwrap();
+        let limits = StackScanLimits {
+            max_gradle_bytes: 8,
+            ..StackScanLimits::default()
+        };
+
+        let detection = detect_stacks_with_limits(root, limits, false);
+
+        assert!(detection.scan_truncated);
+        assert!(!detection.is_kmp);
+        assert_eq!(
+            serde_json::to_value(&detection).unwrap()["scan_truncated"],
+            true
+        );
     }
 
     #[test]
@@ -4614,6 +5510,64 @@ no_ignore: true
         let dep_names: Vec<String> = deps.iter().map(|(n, _, _)| n.clone()).collect();
         assert!(dep_names.contains(&"lib/a".to_string()));
         assert!(dep_names.contains(&"lib/b".to_string()));
+    }
+
+    #[test]
+    fn gemspec_directories_are_ruby_modules() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("engines/billing")).unwrap();
+        fs::write(root.join("engines/billing/billing.gemspec"), "").unwrap();
+        fs::write(root.join("toolkit.gemspec"), "").unwrap();
+        assert!(is_module_file("billing.gemspec"));
+
+        let conn = Connection::open_in_memory().unwrap();
+        db::init_db(&conn).unwrap();
+        let files = vec![
+            root.join("engines/billing/billing.gemspec"),
+            root.join("toolkit.gemspec"),
+        ];
+        assert_eq!(index_modules_from_files(&conn, root, &files).unwrap(), 2);
+        let modules: Vec<(String, String)> = conn
+            .prepare("SELECT name, path FROM modules ORDER BY name")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            modules,
+            vec![
+                ("engines.billing".to_string(), "engines/billing".to_string()),
+                ("toolkit".to_string(), String::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn project_label_names_every_stack_or_falls_back_to_the_project_type() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("Gemfile"), "").unwrap();
+        fs::write(dir.path().join("package.json"), "{}").unwrap();
+        let label = project_label(dir.path());
+        assert!(label.contains("Ruby"), "{label}");
+        assert!(label.contains("Web"), "{label}");
+        assert!(label.contains(" + "), "{label}");
+
+        let empty = TempDir::new().unwrap();
+        assert_eq!(project_label(empty.path()), ProjectType::Unknown.as_str());
+    }
+
+    #[test]
+    fn project_label_ignores_build_markers_inside_test_fixtures() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        for fixture in ["tests/fixtures/java/pom.xml", "src/test/ios/Package.swift"] {
+            let path = dir.path().join(fixture);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "").unwrap();
+        }
+        assert_eq!(project_label(dir.path()), "Rust");
     }
 
     #[test]

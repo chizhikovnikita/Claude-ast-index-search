@@ -7,8 +7,9 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use colored::Colorize;
@@ -16,6 +17,9 @@ use colored::Colorize;
 use crate::db;
 use crate::encoding;
 use crate::indexer;
+
+#[cfg(windows)]
+mod windows_worker;
 
 fn start_encoding_tracking(verbose: bool) {
     encoding::VERBOSE_DECODE.store(verbose, Ordering::Relaxed);
@@ -74,11 +78,59 @@ fn init_rebuild_schema(conn: &rusqlite::Connection) -> Result<()> {
     db::init_db_for_rebuild(conn)
 }
 
+/// Manifests whose targets could not be read leave their modules out of the
+/// graph; surface them under `--verbose` only, like other rebuild diagnostics.
+fn report_unread_manifests(conn: &rusqlite::Connection, verbose: bool) -> Result<()> {
+    if verbose {
+        let unread = db::get_unread_module_manifests(conn)?;
+        if !unread.is_empty() {
+            eprintln!(
+                "[verbose] could not read targets from {} manifest(s), their modules are missing: {}",
+                unread.len(),
+                unread.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
 fn finalize_rebuild_schema(conn: &rusqlite::Connection, verbose: bool) -> Result<()> {
     let t = Instant::now();
     db::finalize_db_after_rebuild(conn)?;
     if verbose {
         eprintln!("[verbose] finalize_db_after_rebuild in {:?}", t.elapsed());
+    }
+    Ok(())
+}
+
+/// Keep what `hotspots --collect` gathered: the history depends on the
+/// repository, not on the index a full rebuild starts over.
+fn carry_git_history(conn: &rusqlite::Connection, root: &Path, verbose: bool) -> Result<()> {
+    let t = Instant::now();
+    let carry = db::carry_git_history(conn, root, |history| {
+        super::git_signals::history_carry_rejection(root, history)
+    })?;
+    match carry {
+        db::GitHistoryCarry::Absent => {}
+        db::GitHistoryCarry::Kept(history) => println!(
+            "{}",
+            format!(
+                "Kept the collected git history ({} commit(s) analyzed)",
+                history.live_commits
+            )
+            .dimmed()
+        ),
+        db::GitHistoryCarry::Dropped(reason) => println!(
+            "{}",
+            format!(
+                "Collected git history not kept: {reason}. \
+                 Run 'ast-index hotspots --collect' to collect it again."
+            )
+            .yellow()
+        ),
+    }
+    if verbose {
+        eprintln!("[verbose] carry_git_history in {:?}", t.elapsed());
     }
     Ok(())
 }
@@ -106,6 +158,18 @@ fn build_exclude_matcher(
         gb.add_line(None, p).ok();
     }
     gb.build().ok()
+}
+
+fn test_full_refresh_pause() -> Result<()> {
+    if let Some(path) = std::env::var_os("AST_INDEX_TEST_REFRESH_STARTED_FILE") {
+        std::fs::write(path, b"started")?;
+    }
+    if let Ok(delay) = std::env::var("AST_INDEX_TEST_REFRESH_DELAY_MS") {
+        if let Ok(delay) = delay.parse::<u64>() {
+            std::thread::sleep(Duration::from_millis(delay));
+        }
+    }
+    Ok(())
 }
 
 fn snapshot_subtrees(root: &Path, verbose: bool) -> Result<Vec<db::Subtree>> {
@@ -392,6 +456,7 @@ pub fn cmd_rebuild(
     }
     let t = Instant::now();
     let _lock = db::acquire_rebuild_guard(root)?;
+    test_full_refresh_pause()?;
     if verbose {
         eprintln!("[verbose] lock acquired in {:?}", t.elapsed());
     }
@@ -423,8 +488,19 @@ pub fn cmd_rebuild(
         eprintln!("[verbose] opening new DB...");
     }
     let t = Instant::now();
-    let mut conn = db::open_staged_db(root, staged.db_path())?;
+    // A partial rebuild only refills its own tables; starting from an empty
+    // generation would publish an index with everything else missing.
+    let seed_from_live = index_type != "all" && db::db_exists(root);
+    let mut conn = if seed_from_live {
+        let conn = db::open_seeded_staged_db(root, &live_db, staged.db_path())?;
+        // Re-attached from `saved_subtrees` below.
+        conn.execute("DELETE FROM subtrees", [])?;
+        conn
+    } else {
+        db::open_staged_db(root, staged.db_path())?
+    };
     init_rebuild_schema(&conn)?;
+    indexer::record_project_label(&conn, root)?;
     if verbose {
         eprintln!(
             "[verbose] staged DB opened + schema created in {:?}",
@@ -555,6 +631,11 @@ pub fn cmd_rebuild(
 
             let t = Instant::now();
             let module_count = indexer::index_modules_from_files(&conn, root, &all_module_files)?;
+            db::set_build_files_fingerprint(
+                &conn,
+                &indexer::build_files_fingerprint(&all_module_files),
+            )?;
+            report_unread_manifests(&conn, verbose)?;
             if verbose {
                 eprintln!(
                     "[verbose] index_modules: {} modules in {:?}",
@@ -747,6 +828,7 @@ pub fn cmd_rebuild(
             println!("{}", "Rebuilding symbols index...".cyan());
             conn.execute("DELETE FROM symbols", [])?;
             conn.execute("DELETE FROM files", [])?;
+            db::bump_index_generation(&conn)?;
             let walk = indexer::index_directory_with_config(
                 &mut conn,
                 root,
@@ -760,8 +842,14 @@ pub fn cmd_rebuild(
         "modules" => {
             println!("{}", "Rebuilding modules index...".cyan());
             conn.execute("DELETE FROM module_deps", [])?;
-            conn.execute("DELETE FROM modules", [])?;
-            let module_count = indexer::index_modules(&conn, root)?;
+            // Sync instead of delete-and-reinsert: resources, XML/storyboard
+            // usages and assets reference modules by id with ON DELETE CASCADE.
+            let module_files = indexer::collect_module_files(root);
+            let module_count = indexer::sync_modules_from_files(&conn, root, &module_files)?;
+            db::set_build_files_fingerprint(
+                &conn,
+                &indexer::build_files_fingerprint(&module_files),
+            )?;
 
             if index_deps {
                 println!("{}", "Indexing module dependencies...".cyan());
@@ -805,6 +893,10 @@ pub fn cmd_rebuild(
         _ => {}
     }
 
+    // A seeded generation already holds the live history.
+    if !seed_from_live {
+        carry_git_history(&conn, root, verbose)?;
+    }
     if verbose {
         eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
     }
@@ -840,6 +932,7 @@ fn cmd_rebuild_sub_projects(
     }
     let t = Instant::now();
     let _lock = db::acquire_rebuild_guard(root)?;
+    test_full_refresh_pause()?;
     if verbose {
         eprintln!("[verbose] lock acquired in {:?}", t.elapsed());
     }
@@ -884,6 +977,7 @@ fn cmd_rebuild_sub_projects(
     let staged = IndexStaging::create(&live_db, "rebuild")?;
     let mut conn = db::open_staged_db(root, staged.db_path())?;
     init_rebuild_schema(&conn)?;
+    indexer::record_project_label(&conn, root)?;
     if verbose {
         eprintln!("[verbose] staged DB opened in {:?}", t.elapsed());
     }
@@ -1062,6 +1156,8 @@ fn cmd_rebuild_sub_projects(
     // Index modules and dependencies from collected build files
     let t = Instant::now();
     let module_count = indexer::index_modules_from_files(&conn, root, &all_module_files)?;
+    db::set_build_files_fingerprint(&conn, &indexer::build_files_fingerprint(&all_module_files))?;
+    report_unread_manifests(&conn, verbose)?;
     if verbose {
         eprintln!(
             "[verbose] index_modules: {} modules in {:?}",
@@ -1147,6 +1243,7 @@ fn cmd_rebuild_sub_projects(
             success_count, total_files, module_count, dep_count, trans_count, fail_count
         ).green()
     );
+    carry_git_history(&conn, root, verbose)?;
     if verbose {
         eprintln!("{}", format!("Total time: {:?}", start.elapsed()).dimmed());
     }
@@ -1159,7 +1256,7 @@ fn cmd_rebuild_sub_projects(
 }
 
 /// Incrementally update the index
-pub fn cmd_update(root: &Path, verbose: bool) -> Result<()> {
+fn run_update_once(root: &Path, verbose: bool) -> Result<()> {
     let start = Instant::now();
     let _mutation_guard = db::acquire_rebuild_guard(root)?;
     start_encoding_tracking(verbose);
@@ -1227,6 +1324,236 @@ pub fn cmd_update(root: &Path, verbose: bool) -> Result<()> {
     Ok(())
 }
 
+fn test_update_fault_injection() -> Result<()> {
+    if let Some(path) = std::env::var_os("AST_INDEX_TEST_UPDATE_STARTED_FILE") {
+        std::fs::write(path, b"started")?;
+    }
+    if let Ok(delay) = std::env::var("AST_INDEX_TEST_UPDATE_DELAY_MS") {
+        if let Ok(delay) = delay.parse::<u64>() {
+            std::thread::sleep(Duration::from_millis(delay));
+        }
+    }
+    if let Some(path) = std::env::var_os("AST_INDEX_TEST_UPDATE_FAIL_ONCE_FILE") {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+            anyhow::bail!("injected update failure");
+        }
+    }
+    Ok(())
+}
+
+fn run_update_worker(root: &Path, debounce_ms: u64, verbose: bool, token: u64) -> Result<bool> {
+    if let Some(path) = std::env::var_os("AST_INDEX_TEST_WORKER_BEFORE_LOCK_FILE") {
+        std::fs::write(path, b"before-lock")?;
+    }
+    if std::env::var_os("AST_INDEX_TEST_WORKER_EXIT_BEFORE_LOCK").is_some() {
+        anyhow::bail!("injected worker exit before lock acquisition");
+    }
+
+    // Exactly one process owns the current claim. It may wait through the
+    // tiny old-leader lock handoff, while superseded stale-token processes
+    // exit without joining a process herd.
+    let _worker = loop {
+        if db::read_update_coordinator_state(root)?.worker_claim != Some(token) {
+            return Ok(false);
+        }
+        if let Some(worker) = db::try_acquire_update_worker(root)? {
+            break worker;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    if !db::acknowledge_update_worker_start(root, token)? {
+        return Ok(false);
+    }
+
+    loop {
+        let state = db::read_update_coordinator_state(root)?;
+        if state.requested_generation <= state.completed_generation {
+            if !db::finish_update_worker_if_idle(root, token)? {
+                continue;
+            }
+            if let Some(path) = std::env::var_os("AST_INDEX_TEST_UPDATE_BEFORE_EXIT_FILE") {
+                std::fs::write(path, b"before-exit")?;
+            }
+            if let Ok(delay) = std::env::var("AST_INDEX_TEST_UPDATE_EXIT_DELAY_MS") {
+                if let Ok(delay) = delay.parse::<u64>() {
+                    std::thread::sleep(Duration::from_millis(delay));
+                }
+            }
+            return Ok(true);
+        }
+
+        let mut target = state.requested_generation;
+        if debounce_ms > 0 {
+            loop {
+                std::thread::sleep(Duration::from_millis(debounce_ms));
+                let latest = db::read_update_coordinator_state(root)?;
+                if latest.requested_generation == target {
+                    break;
+                }
+                target = latest.requested_generation;
+            }
+        }
+
+        let result = (|| -> Result<()> {
+            anyhow::ensure!(
+                db::db_exists(root),
+                "index not found; run 'ast-index rebuild' before requesting background updates"
+            );
+            test_update_fault_injection()?;
+            run_update_once(root, verbose)
+        })();
+        match result {
+            Ok(()) => db::complete_update_generation(root, target)?,
+            Err(error) => {
+                if !db::record_update_failure_and_finish(root, token, target, &error)? {
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+    }
+}
+
+fn default_update_wait_timeout() -> Duration {
+    Duration::from_millis(
+        std::env::var("AST_INDEX_UPDATE_WAIT_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(30_000),
+    )
+}
+
+fn spawn_update_launcher(root: &Path, debounce_ms: u64, verbose: bool, token: u64) -> Result<()> {
+    if let Some(path) = std::env::var_os("AST_INDEX_TEST_LAUNCH_STARTED_FILE") {
+        std::fs::write(path, b"launch-started")?;
+    }
+    if let Ok(delay) = std::env::var("AST_INDEX_TEST_LAUNCH_FAIL_DELAY_MS") {
+        if let Ok(delay) = delay.parse::<u64>() {
+            std::thread::sleep(Duration::from_millis(delay));
+            anyhow::bail!("injected launcher failure");
+        }
+    }
+    let executable = std::env::current_exe().context("failed to resolve ast-index executable")?;
+    let mut command = Command::new(executable);
+    command
+        .current_dir(root)
+        .arg("update")
+        .arg("--coordinator-launch")
+        .arg("--coordinator-claim")
+        .arg(token.to_string())
+        .arg("--debounce-ms")
+        .arg(debounce_ms.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    if verbose {
+        command.arg("--verbose");
+    }
+    let output = command.output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "failed to launch background update worker: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(())
+}
+
+pub fn cmd_update_background(root: &Path, debounce_ms: u64, verbose: bool) -> Result<()> {
+    anyhow::ensure!(
+        db::db_exists(root),
+        "index not found; run 'ast-index rebuild' before requesting background updates"
+    );
+    let request = db::request_update_generation(root)?;
+    if let Some(token) = request.claim_token {
+        if let Err(error) = spawn_update_launcher(root, debounce_ms, verbose, token) {
+            db::clear_update_worker_schedule(root, token)?;
+            db::fail_update_generation(root, request.generation, &error)?;
+            return Err(error);
+        }
+    }
+    println!(
+        "Queued background index update generation {}.",
+        request.generation
+    );
+    Ok(())
+}
+
+pub fn ensure_pending_update_worker(root: &Path, debounce_ms: u64) -> Result<()> {
+    let Some(token) = db::claim_pending_update_worker(root)? else {
+        return Ok(());
+    };
+    if let Err(error) = spawn_update_launcher(root, debounce_ms, false, token) {
+        db::clear_update_worker_schedule(root, token)?;
+        let generation = db::snapshot_requested_update_generation(root)?;
+        db::fail_update_generation(root, generation, &error)?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub fn cmd_update_coordinator_launch(
+    root: &Path,
+    debounce_ms: u64,
+    verbose: bool,
+    token: u64,
+) -> Result<()> {
+    let executable = std::env::current_exe().context("failed to resolve ast-index executable")?;
+    let (log, _log_lease) = db::create_update_worker_log(root)?;
+    #[cfg(windows)]
+    {
+        return windows_worker::spawn(root, &executable, &log, debounce_ms, verbose, token);
+    }
+    #[cfg(not(windows))]
+    {
+        let stderr = log.try_clone()?;
+        let mut command = Command::new(executable);
+        command
+            .current_dir(root)
+            .arg("update")
+            .arg("--coordinator-worker")
+            .arg("--coordinator-claim")
+            .arg(token.to_string())
+            .arg("--debounce-ms")
+            .arg(debounce_ms.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(stderr));
+        if verbose {
+            command.arg("--verbose");
+        }
+        command.spawn().context("failed to spawn update worker")?;
+        Ok(())
+    }
+}
+
+pub fn cmd_update_coordinator_worker(
+    root: &Path,
+    debounce_ms: u64,
+    verbose: bool,
+    token: u64,
+) -> Result<()> {
+    run_update_worker(root, debounce_ms, verbose, token).map(|_| ())
+}
+
+pub fn cmd_update(root: &Path, verbose: bool) -> Result<()> {
+    if !db::db_exists(root) {
+        println!(
+            "{}",
+            "Index not found. Run 'ast-index rebuild' first.".red()
+        );
+        return Ok(());
+    }
+    let request = db::request_update_generation(root)?;
+    if let Some(token) = request.claim_token {
+        // Foreground update is the claimed leader; no launcher is needed.
+        run_update_worker(root, 0, verbose, token)?;
+    }
+    db::wait_for_update_generation(root, request.generation, default_update_wait_timeout())?;
+    Ok(())
+}
+
 /// Restore index from a .db file
 pub fn cmd_restore(root: &Path, db_file: &str) -> Result<()> {
     let src = std::path::Path::new(db_file);
@@ -1234,6 +1561,7 @@ pub fn cmd_restore(root: &Path, db_file: &str) -> Result<()> {
     // Serialize before allocating or populating a staging generation. This
     // also recovers validated staging directories abandoned by a dead writer.
     let _mutation_guard = db::acquire_rebuild_guard(root)?;
+    test_full_refresh_pause()?;
     let dest = db::get_db_path(root)?;
     let dest_dir = dest
         .parent()
@@ -1411,9 +1739,11 @@ pub fn cmd_stats(root: &Path, format: &str) -> Result<()> {
     let stats = db::get_stats(&conn)?;
     let db_path = db::get_db_path(root)?;
     let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+    let project = db::get_metadata_value(&conn, crate::indexer::PROJECT_LABEL_KEY)?;
 
     if format == "json" {
         let result = serde_json::json!({
+            "project": project,
             "stats": stats,
             "db_size_bytes": db_size,
             "db_path": db_path.display().to_string(),
@@ -1423,6 +1753,9 @@ pub fn cmd_stats(root: &Path, format: &str) -> Result<()> {
     }
 
     println!("{}", "Index Statistics:".bold());
+    if let Some(project) = &project {
+        println!("  Project:    {}", project);
+    }
     println!("  Files:      {}", stats.file_count);
     println!("  Symbols:    {}", stats.symbol_count);
     println!("  Refs:       {}", stats.refs_count);

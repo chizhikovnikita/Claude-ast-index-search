@@ -54,7 +54,10 @@ fn direct_connection_migration_joins_callers_transaction() {
     .unwrap();
 
     let tx = conn.transaction().unwrap();
-    assert_eq!(db::get_extra_roots(&tx).unwrap(), vec!["/legacy/root"]);
+    assert_eq!(
+        db::get_extra_roots(&tx).unwrap(),
+        vec![db::normalize_root_for_storage(Path::new("/legacy/root"))]
+    );
     tx.rollback().unwrap();
 
     let legacy: String = conn
@@ -187,8 +190,10 @@ fn legacy_extra_roots_migrate_on_first_read() {
     // First call triggers the migration.
     let roots = db::get_extra_roots(&conn).unwrap();
     assert_eq!(roots.len(), 2);
-    assert!(roots.iter().any(|r| r == "/Users/u/p/grut"));
-    assert!(roots.iter().any(|r| r == "/Users/u/p/adv"));
+    assert!(roots.contains(&db::normalize_root_for_storage(Path::new(
+        "/Users/u/p/grut"
+    ))));
+    assert!(roots.contains(&db::normalize_root_for_storage(Path::new("/Users/u/p/adv"))));
 
     let subtrees = db::list_subtrees(&conn).unwrap();
     assert_eq!(subtrees.len(), 2);

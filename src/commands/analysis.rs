@@ -28,8 +28,18 @@ pub fn cmd_unused_symbols(
 
     let conn = db::open_db_leased(root)?;
 
+    // `--module` accepts a module name (`features.surge.impl`, `:core:utils`)
+    // as well as a raw path prefix; names resolve to the module's directory.
+    let module_path = match module {
+        Some(m) => match db::find_module_id_by_name(&conn, m)? {
+            Some(id) => db::get_module_path(&conn, id)?.map(|p| format!("{}/", p.trim_end_matches('/'))),
+            None => Some(m.to_string()),
+        },
+        None => None,
+    };
+
     // Build query based on filters
-    let (sql, filter_param) = if let Some(mod_path) = module {
+    let (sql, filter_param) = if let Some(mod_path) = module_path.as_deref() {
         (
             r#"
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
@@ -74,6 +84,7 @@ pub fn cmd_unused_symbols(
                 qualified_name: row.get(1)?,
                 kind: row.get(2)?,
                 line: row.get(3)?,
+                end_line: None,
                 signature: row.get(4)?,
                 path: row.get(5)?,
                 root_path: None,
@@ -87,6 +98,7 @@ pub fn cmd_unused_symbols(
                 qualified_name: row.get(1)?,
                 kind: row.get(2)?,
                 line: row.get(3)?,
+                end_line: None,
                 signature: row.get(4)?,
                 path: row.get(5)?,
                 root_path: None,
@@ -99,11 +111,12 @@ pub fn cmd_unused_symbols(
     let mut unused: Vec<&db::SearchResult> = Vec::new();
 
     for sym in &symbols {
-        // Check refs table
+        // References are recorded under the last segment of a qualified name,
+        // and Ruby indexes `class Billing::Invoice` under its full name.
         let ref_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM refs WHERE name = ?1 LIMIT 1",
-                params![sym.name],
+                params![db::last_name_segment(&sym.name)],
                 |row| row.get(0),
             )
             .unwrap_or(0);

@@ -73,7 +73,7 @@ fn text_mode_prefixes_subtree_paths() {
         stdout.contains("[extra]"),
         "expected [extra] prefix, got: {stdout}"
     );
-    assert!(stdout.contains("/extra/src/lib.rs"));
+    assert!(stdout.replace('\\', "/").contains("/extra/src/lib.rs"));
 }
 
 #[test]
@@ -90,7 +90,7 @@ fn text_mode_does_not_prefix_primary_paths() {
         !stdout.contains("[extra]") && !stdout.contains("[main]"),
         "primary-project paths must not get a subtree prefix, got: {stdout}"
     );
-    assert!(stdout.contains("/main/src/lib.rs"));
+    assert!(stdout.replace('\\', "/").contains("/main/src/lib.rs"));
 }
 
 #[test]
@@ -101,7 +101,7 @@ fn json_mode_keeps_raw_path_without_prefix() {
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    let path = parsed[0]["path"].as_str().unwrap();
+    let path = parsed["items"][0]["path"].as_str().unwrap();
     assert!(!path.starts_with("["), "JSON path must be raw, got: {path}");
-    assert!(path.contains("/extra/src/lib.rs"));
+    assert!(Path::new(path).ends_with(Path::new("extra").join("src/lib.rs")));
 }

@@ -160,13 +160,20 @@ fn open_db_migrates_legacy_schemas_atomically_and_idempotently() {
         let subtrees = db::list_subtrees(&conn).unwrap();
         assert_eq!(subtrees.len(), 2);
         assert_eq!(subtrees[0].name, "adv");
-        assert_eq!(subtrees[0].canonical_path, "/legacy/adv");
+        assert_eq!(
+            subtrees[0].canonical_path,
+            db::normalize_root_for_storage(Path::new("/legacy/adv"))
+        );
         assert_eq!(subtrees[0].original_path, "/legacy/adv");
         assert_eq!(subtrees[1].name, "grut");
-        assert_eq!(subtrees[1].canonical_path, "/legacy/grut");
+        assert_eq!(
+            subtrees[1].canonical_path,
+            db::normalize_root_for_storage(Path::new("/legacy/grut"))
+        );
 
         assert!(column_exists(&conn, "files", "root_path"));
         assert!(column_exists(&conn, "symbols", "qualified_name"));
+        assert!(column_exists(&conn, "symbols", "end_line"));
         assert!(schema_object_exists(
             &conn,
             "index",
@@ -426,12 +433,12 @@ fn open_db_migrates_legacy_schemas_atomically_and_idempotently() {
         serde_json::json!([
             {
                 "name": "alpha",
-                "canonical_path": "/legacy/alpha",
+                "canonical_path": db::normalize_root_for_storage(Path::new("/legacy/alpha")),
                 "original_path": "/legacy/alpha"
             },
             {
                 "name": "beta",
-                "canonical_path": "/legacy/beta",
+                "canonical_path": db::normalize_root_for_storage(Path::new("/legacy/beta")),
                 "original_path": "/legacy/beta"
             }
         ])

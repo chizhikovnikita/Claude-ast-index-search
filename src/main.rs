@@ -24,6 +24,7 @@ Index Management:
   clear                  Clear index database
   version                Show version
   watch                  Watch for file changes and auto-update
+  watch-status           Report whether this project has an active watcher
 
 Search & Navigation:
   explore                Ranked relevant symbols' source + neighbours + tests (one-shot; --rwr for graph)
@@ -86,6 +87,8 @@ Perl:
 Project Insights:
   map                    Show compact project map (key types per directory)
   conventions            Detect project conventions (architecture, frameworks, naming)
+  hotspots               Rank files by Git history (churn, bugfix ratio, authors, age)
+  graph                  Symbol dependency graph: dependents, impact, path, cycles, top
 
 Project Configuration:
   add-root               Add additional source root
@@ -120,8 +123,7 @@ struct Cli {
 
     /// Restrict search/listing commands to a single named subtree.
     /// Use `subtree list` to discover names. Conflicts with `--local`.
-    /// May trim the result below `--limit` because the cap is applied to
-    /// the unfiltered SQL query.
+    /// Filtering is applied before pagination and `--limit`.
     #[arg(long, global = true)]
     subtree: Option<String>,
 
@@ -150,6 +152,9 @@ enum Commands {
         /// Max results
         #[arg(short, long, default_value = "50")]
         limit: usize,
+        /// Filter by file path
+        #[arg(long)]
+        in_file: Option<String>,
     },
     /// Show call hierarchy (callers tree up) for a function
     CallTree {
@@ -161,6 +166,9 @@ enum Commands {
         /// Max callers per level
         #[arg(short, long, default_value = "10")]
         limit: usize,
+        /// Filter by file path
+        #[arg(long)]
+        in_file: Option<String>,
     },
     /// Find @Provides/@Binds for a type
     Provides {
@@ -305,6 +313,18 @@ enum Commands {
         /// Verbose logging with timing
         #[arg(long, short)]
         verbose: bool,
+        /// Queue the update through the project freshness coordinator
+        #[arg(long)]
+        background: bool,
+        /// Trailing debounce window for background update requests
+        #[arg(long, default_value_t = 500)]
+        debounce_ms: u64,
+        #[arg(long, hide = true)]
+        coordinator_launch: bool,
+        #[arg(long, hide = true)]
+        coordinator_worker: bool,
+        #[arg(long, hide = true)]
+        coordinator_claim: Option<u64>,
     },
     /// Restore index from a .db file
     Restore {
@@ -317,6 +337,9 @@ enum Commands {
     Search {
         /// Search query
         query: String,
+        /// Include each matched symbol's source body
+        #[arg(long)]
+        with_content: bool,
         /// Filter symbols by type: class, interface, function, property
         #[arg(long, short = 't')]
         r#type: Option<String>,
@@ -332,6 +355,15 @@ enum Commands {
         /// Fuzzy search (exact → prefix → contains)
         #[arg(long)]
         fuzzy: bool,
+        /// Re-rank files and symbols by a preset: proven (safe to copy),
+        /// hotspots (frequently fixed), risky (dangerous to touch), central
+        /// (structurally central). Needs `hotspots --collect` and/or `graph build`
+        #[arg(long, value_parser = ["proven", "hotspots", "risky", "central"])]
+        rank: Option<String>,
+        /// With --rank: leave test files (spec/, tests/, *_test.*, *.spec.*, ...) out
+        /// of the ranked Files and Symbols sections
+        #[arg(long, requires = "rank")]
+        exclude_tests: bool,
     },
     /// Find files by name
     File {
@@ -348,6 +380,9 @@ enum Commands {
     Symbol {
         /// Symbol name (exact match; omit when using --pattern)
         name: Option<String>,
+        /// Include each matched symbol's source body
+        #[arg(long)]
+        with_content: bool,
         /// Glob pattern for symbol name (e.g. "*Mailer", "*Email*Service*")
         #[arg(long, short = 'p')]
         pattern: Option<String>,
@@ -391,6 +426,9 @@ enum Commands {
     Implementations {
         /// Parent class/interface name
         parent: String,
+        /// Include each implementation's source body
+        #[arg(long)]
+        with_content: bool,
         /// Max results
         #[arg(short, long, default_value = "20")]
         limit: usize,
@@ -507,6 +545,12 @@ enum Commands {
         /// Max results per section
         #[arg(short, long, default_value = "20")]
         limit: usize,
+        /// Filter by file path
+        #[arg(long)]
+        in_file: Option<String>,
+        /// Filter by module path
+        #[arg(long)]
+        module: Option<String>,
     },
     /// Explore an area: ranked relevant symbols' source + tests, in one shot
     Explore {
@@ -534,10 +578,14 @@ enum Commands {
         #[arg(long)]
         module: Option<String>,
     },
-    /// Show symbols in a file
+    /// Show symbols in a file with the lines they span
     Outline {
         /// File path
         file: String,
+        /// List every symbol: schema dump columns are otherwise folded into a
+        /// count on their table
+        #[arg(long)]
+        full: bool,
     },
     /// Show imports in a file
     Imports {
@@ -563,6 +611,44 @@ enum Commands {
         /// Print VCS/root/timing diagnostics to stderr
         #[arg(long)]
         verbose: bool,
+    },
+    /// Rank files by Git history signals (churn, bugfix ratio, authors, age)
+    Hotspots {
+        /// Collect new Git history into the index before reporting
+        #[arg(long)]
+        collect: bool,
+        /// Discard collected signals and rescan the whole history (implies --collect)
+        #[arg(long)]
+        full: bool,
+        /// Max files to list
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+        /// Skip files with fewer commits than this
+        #[arg(long, default_value = "1")]
+        min_commits: i64,
+        /// Only report files whose path starts with this prefix
+        #[arg(long)]
+        path: Option<String>,
+        /// Leave test files out of the list; percentiles still rank every file
+        #[arg(long)]
+        exclude_tests: bool,
+        /// Ranking key: score, commits, churn, relative-churn, fixes, authors, recent
+        #[arg(long, default_value = "score")]
+        sort: String,
+        /// Git subprocess wall-clock timeout in milliseconds (collection only)
+        #[arg(long, default_value = "600000")]
+        timeout_ms: u64,
+        /// Commits per `git log` window during collection
+        #[arg(long, default_value = "2000")]
+        window: usize,
+        /// Print collection diagnostics to stderr
+        #[arg(long)]
+        verbose: bool,
+    },
+    /// Symbol dependency graph: dependents, dependencies, impact, paths, cycles, centrality
+    Graph {
+        #[command(subcommand)]
+        action: GraphAction,
     },
     // === iOS Commands ===
     /// Find class usages in storyboards/xibs (iOS)
@@ -678,7 +764,7 @@ enum Commands {
     Conventions,
     /// Find potentially unused symbols
     UnusedSymbols {
-        /// Filter by module path
+        /// Filter by module name or path prefix
         #[arg(long)]
         module: Option<String>,
         /// Only check exported (capitalized) symbols
@@ -710,6 +796,12 @@ enum Commands {
     },
     /// Watch for file changes and auto-update index
     Watch,
+    /// Report whether this project has an active watcher
+    WatchStatus {
+        /// Suppress output and communicate status only through the exit code
+        #[arg(long)]
+        quiet: bool,
+    },
     /// Clear index database for current project
     Clear,
     /// Show version
@@ -780,21 +872,214 @@ enum SubtreeAction {
     List,
 }
 
+#[derive(clap::Args)]
+struct GraphSymbolArgs {
+    /// Only symbols whose file path contains this substring
+    #[arg(long)]
+    in_file: Option<String>,
+    /// Only symbols of this kind (class, function, property, ...)
+    #[arg(long)]
+    kind: Option<String>,
+}
+
+impl GraphSymbolArgs {
+    fn filter(self) -> commands::graph::SymbolFilter {
+        commands::graph::SymbolFilter {
+            in_file: self.in_file,
+            kind: self.kind,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum GraphAction {
+    /// Build (or rebuild) the symbol graph from the current index
+    Build {
+        /// Print build phases and timings to stderr
+        #[arg(long)]
+        verbose: bool,
+    },
+    /// Show whether the graph is built and fresh, with edge counts per confidence level
+    Status,
+    /// Symbols that depend on SYMBOL (incoming edges), with resolution confidence
+    Dependents {
+        /// Symbol name, `Outer::Name`, or `Class#member`
+        symbol: String,
+        #[command(flatten)]
+        filter: GraphSymbolArgs,
+        /// Also list edges whose target name is ambiguous
+        #[arg(long)]
+        include_ambiguous: bool,
+        /// For a class, also cover every definition inside it
+        #[arg(long)]
+        members: bool,
+        /// Leave out dependents defined in test files
+        #[arg(long)]
+        exclude_tests: bool,
+        /// Max edges to list
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+        /// Rebuild the graph first when it is missing or stale
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// Symbols SYMBOL depends on (outgoing edges), with resolution confidence
+    Dependencies {
+        /// Symbol name, `Outer::Name`, or `Class#member`
+        symbol: String,
+        #[command(flatten)]
+        filter: GraphSymbolArgs,
+        /// Also list edges whose target name is ambiguous
+        #[arg(long)]
+        include_ambiguous: bool,
+        /// For a class, also cover every definition inside it
+        #[arg(long)]
+        members: bool,
+        /// Max edges to list
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+        /// Rebuild the graph first when it is missing or stale
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// Blast radius: transitive dependents of SYMBOL per depth, symbols and files
+    Impact {
+        /// Symbol name, `Outer::Name`, or `Class#member`
+        symbol: String,
+        #[command(flatten)]
+        filter: GraphSymbolArgs,
+        /// How many hops of dependents to follow
+        #[arg(short, long, default_value = "3")]
+        depth: usize,
+        /// Also follow ambiguous edges (upper bound)
+        #[arg(long)]
+        include_ambiguous: bool,
+        /// For a class, also seed with every definition inside it
+        #[arg(long)]
+        members: bool,
+        /// Neither count nor follow dependents defined in test files
+        #[arg(long)]
+        exclude_tests: bool,
+        /// Max affected symbols to list
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+        /// Rebuild the graph first when it is missing or stale
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// Shortest dependency path(s) from FROM to TO; a class stands for itself and its members
+    Path {
+        /// Starting symbol (e.g. an entry point)
+        from: String,
+        /// Destination symbol
+        to: String,
+        /// Restrict FROM to files whose path contains this substring
+        #[arg(long)]
+        from_file: Option<String>,
+        /// Restrict TO to files whose path contains this substring
+        #[arg(long)]
+        to_file: Option<String>,
+        /// Give up beyond this many hops
+        #[arg(long, default_value = "8")]
+        max_depth: usize,
+        /// Max shortest paths to list
+        #[arg(long, default_value = "3")]
+        max_paths: usize,
+        /// Also follow ambiguous edges
+        #[arg(long)]
+        include_ambiguous: bool,
+        /// Rebuild the graph first when it is missing or stale
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// Dependency cycles (strongly connected components over resolved edges)
+    Cycles {
+        /// Max components to list
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+        /// Smallest component size to report
+        #[arg(long, default_value = "2")]
+        min_size: usize,
+        /// Only components with a member under this path prefix
+        #[arg(long)]
+        path: Option<String>,
+        /// Rebuild the graph first when it is missing or stale
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// Most central symbols (PageRank, fan-in, fan-out or transitive dependents)
+    Top {
+        /// Ranking key: pagerank, fan-in, fan-out, dependents
+        #[arg(long, default_value = "pagerank")]
+        sort: String,
+        /// Max symbols to list
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+        /// Only symbols of this kind (class, function, ...)
+        #[arg(long)]
+        kind: Option<String>,
+        /// Only symbols under this path prefix
+        #[arg(long)]
+        path: Option<String>,
+        /// Skip symbols defined in test files
+        #[arg(long)]
+        exclude_tests: bool,
+        /// Rebuild the graph first when it is missing or stale
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// Graph metrics (fan-in/out, dependents, PageRank) for one or more symbols
+    Metrics {
+        /// Symbol names, `Outer::Name`, or `Class#member`
+        #[arg(required = true, num_args = 1..)]
+        symbols: Vec<String>,
+        #[command(flatten)]
+        filter: GraphSymbolArgs,
+        /// Max symbols to list
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+        /// Rebuild the graph first when it is missing or stale
+        #[arg(long)]
+        refresh: bool,
+    },
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     // Export the chosen output format so deeply-nested helpers (PathResolver,
     // formatters in subagents) can branch on text vs JSON without us
     // threading `format` through every signature.
     std::env::set_var("AST_INDEX_FORMAT", cli.format.as_str());
-    if matches!(&cli.command, Commands::Changed { .. }) && cli.subtree.is_some() {
+    // Both commands read the working tree's own VCS history rather than the
+    // indexed symbol tables, so a subtree filter has nothing to filter.
+    if cli.subtree.is_some() {
+        if let Some(name) = match &cli.command {
+            Commands::Changed { .. } => Some("changed"),
+            Commands::Hotspots { .. } => Some("hotspots"),
+            _ => None,
+        } {
+            return Err(anyhow::anyhow!(
+                "--subtree is not supported by '{name}'; invoke it from the desired directory"
+            ));
+        }
+    }
+    if (cli.subtree.is_some() || cli.local)
+        && matches!(
+            &cli.command,
+            Commands::Graph {
+                action: GraphAction::Build { .. } | GraphAction::Status
+            }
+        )
+    {
         return Err(anyhow::anyhow!(
-            "--subtree is not supported by 'changed'; invoke it from the desired directory"
+            "--subtree/--local do not apply to 'graph build' or 'graph status': \
+             the graph always spans every indexed root; pass them to graph queries instead"
         ));
     }
     // Conflict guard: --subtree and --local both narrow the workspace, but
     // they narrow it differently, so combining them is meaningless.
     if cli.subtree.is_some() && cli.local {
-        eprintln!("{}", "Error: --subtree and --local are mutually exclusive.");
+        eprintln!("Error: --subtree and --local are mutually exclusive.");
         std::process::exit(2);
     }
     if let Some(name) = &cli.subtree {
@@ -857,11 +1142,43 @@ fn main() -> Result<()> {
     }
     let _command_cache_lease = command_cache_lease;
 
+    let reads_index = !matches!(
+        &cli.command,
+        Commands::Rebuild { .. }
+            | Commands::Update { .. }
+            | Commands::Restore { .. }
+            | Commands::Clear
+            | Commands::Watch
+            | Commands::WatchStatus { .. }
+            | Commands::AddRoot { .. }
+            | Commands::RemoveRoot { .. }
+            | Commands::Subtree {
+                action: SubtreeAction::Add { .. } | SubtreeAction::Remove { .. }
+            }
+            | Commands::Version
+            | Commands::InstallClaudePlugin
+            | Commands::InstallCodexMcp { .. }
+            | Commands::DetectStacks
+            | Commands::InstallGitHooks { .. }
+            | Commands::Agrep { .. }
+            | Commands::Changed { .. }
+            | Commands::DbPath
+    );
+    if reads_index && db::db_exists(&root) {
+        let timeout = std::time::Duration::from_millis(
+            std::env::var("AST_INDEX_UPDATE_WAIT_TIMEOUT_MS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(30_000),
+        );
+        db::wait_for_pending_update(&root, timeout)?;
+    }
+
     // Compute directory scope: if cwd is inside project root, limit search to cwd subtree
     let cwd = std::env::current_dir().unwrap_or_default();
     let dir_prefix = if cwd != root {
-        cwd.strip_prefix(&root).ok().map(|rel| {
-            let mut s = rel.to_string_lossy().to_string();
+        cwd.strip_prefix(&root).ok().map(|_| {
+            let mut s = commands::relative_path(&root, &cwd);
             if !s.ends_with('/') {
                 s.push('/');
             }
@@ -878,12 +1195,14 @@ fn main() -> Result<()> {
         Commands::Callers {
             function_name,
             limit,
-        } => commands::grep::cmd_callers(&root, &function_name, limit),
+            in_file,
+        } => commands::grep::cmd_callers(&root, &function_name, limit, format, in_file.as_deref()),
         Commands::CallTree {
             function_name,
             depth,
             limit,
-        } => commands::grep::cmd_call_tree(&root, &function_name, depth, limit),
+            in_file,
+        } => commands::grep::cmd_call_tree(&root, &function_name, depth, limit, in_file.as_deref()),
         Commands::Provides { type_name, limit } => {
             commands::grep::cmd_provides(&root, &type_name, limit)
         }
@@ -934,6 +1253,7 @@ fn main() -> Result<()> {
             remember,
             max_files,
         } => {
+            let refresh_generation = db::snapshot_requested_update_generation(&root)?;
             if let Some(t) = threads {
                 std::env::set_var("AST_INDEX_THREADS", t.to_string());
             }
@@ -962,28 +1282,66 @@ fn main() -> Result<()> {
                 &paths,
             );
             if result.is_ok() {
+                db::acknowledge_full_refresh(&root, refresh_generation)?;
+                commands::management::ensure_pending_update_worker(&root, 0)?;
                 gc_stale_index_caches(&root);
             }
             result
         }
-        Commands::Update { verbose } => {
+        Commands::Update {
+            verbose,
+            background,
+            debounce_ms,
+            coordinator_launch,
+            coordinator_worker,
+            coordinator_claim,
+        } => {
             let had_index = db::db_exists(&root);
-            let result = commands::management::cmd_update(&root, verbose);
+            let result = if coordinator_worker {
+                commands::management::cmd_update_coordinator_worker(
+                    &root,
+                    debounce_ms,
+                    verbose,
+                    coordinator_claim.context("coordinator worker is missing its claim token")?,
+                )
+            } else if coordinator_launch {
+                commands::management::cmd_update_coordinator_launch(
+                    &root,
+                    debounce_ms,
+                    verbose,
+                    coordinator_claim.context("coordinator launcher is missing its claim token")?,
+                )
+            } else if background {
+                commands::management::cmd_update_background(&root, debounce_ms, verbose)
+            } else {
+                commands::management::cmd_update(&root, verbose)
+            };
             if result.is_ok() && had_index {
                 gc_stale_index_caches(&root);
             }
             result
         }
-        Commands::Restore { path } => commands::management::cmd_restore(&root, &path),
+        Commands::Restore { path } => {
+            let refresh_generation = db::snapshot_requested_update_generation(&root)?;
+            let result = commands::management::cmd_restore(&root, &path);
+            if result.is_ok() {
+                db::acknowledge_full_refresh(&root, refresh_generation)?;
+                commands::management::ensure_pending_update_worker(&root, 0)?;
+            }
+            result
+        }
         Commands::Stats => commands::management::cmd_stats(&root, format),
         // Index commands
         Commands::Search {
             query,
+            with_content,
             r#type,
             limit,
             in_file,
             module,
             fuzzy,
+            rank,
+            exclude_tests,
         } => {
             let scope = db::SearchScope {
                 in_file: in_file.as_deref(),
@@ -998,10 +1356,14 @@ fn main() -> Result<()> {
                 format,
                 &scope,
                 fuzzy,
+                rank.as_deref(),
+                exclude_tests,
+                with_content,
             )
         }
         Commands::Symbol {
             name,
+            with_content,
             pattern,
             r#type,
             limit,
@@ -1023,6 +1385,7 @@ fn main() -> Result<()> {
                 format,
                 &scope,
                 fuzzy,
+                with_content,
             )
         }
         Commands::Class {
@@ -1050,6 +1413,7 @@ fn main() -> Result<()> {
         }
         Commands::Implementations {
             parent,
+            with_content,
             limit,
             in_file,
             module,
@@ -1059,16 +1423,40 @@ fn main() -> Result<()> {
                 module: module.as_deref(),
                 dir_prefix: dir_prefix_ref,
             };
-            commands::index::cmd_implementations(&root, &parent, limit, format, &scope)
+            commands::index::cmd_implementations(
+                &root,
+                &parent,
+                limit,
+                format,
+                &scope,
+                with_content,
+            )
         }
-        Commands::Refs { symbol, limit } => {
-            commands::index::cmd_refs(&root, &symbol, limit, format)
+        Commands::Refs {
+            symbol,
+            limit,
+            in_file,
+            module,
+        } => {
+            let scope = db::SearchScope {
+                in_file: in_file.as_deref(),
+                module: module.as_deref(),
+                dir_prefix: dir_prefix_ref,
+            };
+            commands::index::cmd_refs(&root, &symbol, limit, format, &scope)
         }
         Commands::Explore {
             query,
             max_files,
             rwr,
-        } => commands::explore::cmd_explore(&root, &query, max_files, rwr, format),
+        } => {
+            let scope = db::SearchScope {
+                in_file: None,
+                module: None,
+                dir_prefix: dir_prefix_ref,
+            };
+            commands::explore::cmd_explore(&root, &query, max_files, rwr, format, &scope)
+        }
         Commands::Hierarchy {
             name,
             in_file,
@@ -1138,7 +1526,9 @@ fn main() -> Result<()> {
             exact,
             limit,
         } => commands::files::cmd_file(&root, &pattern, exact, limit, format),
-        Commands::Outline { file } => commands::files::cmd_outline(&root, &file),
+        Commands::Outline { file, full } => {
+            commands::files::cmd_outline(&root, &file, full, format)
+        }
         Commands::Imports { file } => commands::files::cmd_imports(&root, &file),
         Commands::Api { module_path, limit } => {
             commands::files::cmd_api(&root, &module_path, limit)
@@ -1148,6 +1538,167 @@ fn main() -> Result<()> {
             timeout_ms,
             verbose,
         } => commands::changed::cmd_changed(&root, base.as_deref(), timeout_ms, verbose, format),
+        Commands::Hotspots {
+            collect,
+            full,
+            limit,
+            min_commits,
+            path,
+            exclude_tests,
+            sort,
+            timeout_ms,
+            window,
+            verbose,
+        } => commands::git_signals::cmd_hotspots(
+            &root,
+            collect,
+            full,
+            limit,
+            min_commits,
+            path.as_deref(),
+            exclude_tests,
+            &sort,
+            timeout_ms,
+            window,
+            verbose,
+            format,
+        ),
+        Commands::Graph { action } => match action {
+            GraphAction::Build { verbose } => {
+                commands::graph::cmd_graph_build(&root, verbose, format)
+            }
+            GraphAction::Status => commands::graph::cmd_graph_status(&root, format),
+            GraphAction::Dependents {
+                symbol,
+                filter,
+                include_ambiguous,
+                members,
+                exclude_tests,
+                limit,
+                refresh,
+            } => commands::graph::cmd_graph_edges(
+                &root,
+                &symbol,
+                commands::graph::Direction::Dependents,
+                include_ambiguous,
+                members,
+                exclude_tests,
+                &filter.filter(),
+                limit,
+                refresh,
+                format,
+            ),
+            GraphAction::Dependencies {
+                symbol,
+                filter,
+                include_ambiguous,
+                members,
+                limit,
+                refresh,
+            } => commands::graph::cmd_graph_edges(
+                &root,
+                &symbol,
+                commands::graph::Direction::Dependencies,
+                include_ambiguous,
+                members,
+                false,
+                &filter.filter(),
+                limit,
+                refresh,
+                format,
+            ),
+            GraphAction::Impact {
+                symbol,
+                filter,
+                depth,
+                include_ambiguous,
+                members,
+                exclude_tests,
+                limit,
+                refresh,
+            } => commands::graph::cmd_graph_impact(
+                &root,
+                &symbol,
+                depth,
+                include_ambiguous,
+                members,
+                exclude_tests,
+                &filter.filter(),
+                limit,
+                refresh,
+                format,
+            ),
+            GraphAction::Path {
+                from,
+                to,
+                from_file,
+                to_file,
+                max_depth,
+                max_paths,
+                include_ambiguous,
+                refresh,
+            } => commands::graph::cmd_graph_path(
+                &root,
+                &from,
+                &to,
+                max_depth,
+                max_paths,
+                include_ambiguous,
+                &commands::graph::SymbolFilter {
+                    in_file: from_file,
+                    kind: None,
+                },
+                &commands::graph::SymbolFilter {
+                    in_file: to_file,
+                    kind: None,
+                },
+                refresh,
+                format,
+            ),
+            GraphAction::Cycles {
+                limit,
+                min_size,
+                path,
+                refresh,
+            } => commands::graph::cmd_graph_cycles(
+                &root,
+                limit,
+                min_size,
+                path.as_deref(),
+                refresh,
+                format,
+            ),
+            GraphAction::Top {
+                sort,
+                limit,
+                kind,
+                path,
+                exclude_tests,
+                refresh,
+            } => commands::graph::cmd_graph_top(
+                &root,
+                &sort,
+                limit,
+                kind.as_deref(),
+                path.as_deref(),
+                exclude_tests,
+                refresh,
+                format,
+            ),
+            GraphAction::Metrics {
+                symbols,
+                filter,
+                limit,
+                refresh,
+            } => commands::graph::cmd_graph_metrics(
+                &root,
+                &symbols,
+                &filter.filter(),
+                limit,
+                refresh,
+                format,
+            ),
+        },
         // Android commands
         Commands::XmlUsages { class_name, module } => {
             commands::android::cmd_xml_usages(&root, &class_name, module.as_deref())
@@ -1241,6 +1792,13 @@ fn main() -> Result<()> {
             SubtreeAction::List => commands::management::cmd_subtree_list(&root, format),
         },
         Commands::Watch => commands::watch::cmd_watch(&root),
+        Commands::WatchStatus { quiet } => {
+            if commands::watch::cmd_watch_status(&root, quiet, format)? {
+                Ok(())
+            } else {
+                std::process::exit(1);
+            }
+        }
         Commands::Clear => commands::management::cmd_clear(&root),
         Commands::Version => {
             println!("ast-index v{}", env!("CARGO_PKG_VERSION"));
@@ -1514,7 +2072,7 @@ fn cmd_install_git_hooks(root: &Path, force: bool, dry_run: bool) -> Result<()> 
             format!("Already installed (skipped): {}", skipped.join(", ")).dimmed()
         );
     }
-    println!("Each hook runs `ast-index update` in the background after the git operation.");
+    println!("Each hook queues a coordinated, trailing-debounced index update.");
     Ok(())
 }
 
@@ -1530,14 +2088,30 @@ fn git_hook_script() -> String {
          if ! command -v ast-index >/dev/null 2>&1; then\n\
            exit 0\n\
          fi\n\
-         # Skip if a watcher is already running for this tree.\n\
-         if pgrep -f \"ast-index watch\" >/dev/null 2>&1; then\n\
+         # Skip only if this tree's watcher owns its project-scoped lock.\n\
+         if ast-index watch-status --quiet >/dev/null 2>&1; then\n\
            exit 0\n\
          fi\n\
-         (ast-index update >/dev/null 2>&1 &) >/dev/null 2>&1\n\
+         if ! ast-index update --background --debounce-ms 500 >/dev/null; then\n\
+           echo \"ast-index: failed to queue background index update\" >&2\n\
+         fi\n\
          exit 0\n",
         GIT_HOOK_MARKER
     )
+}
+
+#[cfg(test)]
+mod git_hook_tests {
+    use super::git_hook_script;
+
+    #[test]
+    fn generated_hook_checks_the_current_projects_watch_lock() {
+        let script = git_hook_script();
+        assert!(script.contains("ast-index watch-status --quiet"));
+        assert!(script.contains("ast-index update --background --debounce-ms 500"));
+        assert!(!script.contains("update >/dev/null 2>&1 &"));
+        assert!(!script.contains("pgrep"));
+    }
 }
 
 fn resolve_git_hooks_dir(root: &Path) -> Result<PathBuf> {

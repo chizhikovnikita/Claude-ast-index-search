@@ -1,14 +1,17 @@
 //! Tree-sitter based Kotlin/Java parser
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use std::sync::LazyLock;
-use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
+use tree_sitter::{Language, Node, Query, QueryCursor, StreamingIterator, Tree};
 
 use super::{
-    line_text, node_line, node_text, parse_tree, walk_tree_preorder, LanguageParser, WalkControl,
+    node_line, node_text, parse_tree, signature_line, text_end_line, walk_tree_preorder,
+    LanguageParser, WalkControl,
 };
 use crate::db::SymbolKind;
-use crate::parsers::ParsedSymbol;
+use crate::parsers::{
+    extract_references_for_lang, truncate_context, FileType, ParsedRef, ParsedSymbol,
+};
 
 static KT_LANGUAGE: LazyLock<Language> = LazyLock::new(|| tree_sitter_kotlin_ng::LANGUAGE.into());
 
@@ -23,7 +26,7 @@ pub struct KotlinParser;
 
 impl LanguageParser for KotlinParser {
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
-        let tree = parse_tree(content, &KT_LANGUAGE)?;
+        let tree = parse_kotlin_tree(content)?;
         let mut symbols = Vec::new();
         let query = &*KT_QUERY;
         let mut cursor = QueryCursor::new();
@@ -43,10 +46,13 @@ impl LanguageParser for KotlinParser {
         let idx_func_name = idx("func_name");
         let idx_property_name = idx("property_name");
         let idx_typealias_name = idx("typealias_name");
+        let idx_definition = idx("definition");
 
         let mut matches = cursor.matches(query, tree.root_node(), content.as_bytes());
 
         while let Some(m) = matches.next() {
+            let end_line = find_capture(m, idx_definition).map(|c| text_end_line(content, &c.node));
+
             // Class or Interface declaration
             if let Some(name_cap) = find_capture(m, idx_class_name) {
                 let decl_cap = find_capture(m, idx_class_decl);
@@ -83,8 +89,9 @@ impl LanguageParser for KotlinParser {
                         name: name.to_string(),
                         kind,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents,
+                        end_line,
                     });
                 }
                 continue;
@@ -105,8 +112,9 @@ impl LanguageParser for KotlinParser {
                     name: name.to_string(),
                     kind: SymbolKind::Object,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents,
+                    end_line,
                 });
                 continue;
             }
@@ -119,22 +127,27 @@ impl LanguageParser for KotlinParser {
                     name: name.to_string(),
                     kind: SymbolKind::Function,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
 
             // Property declaration (val/var)
             if let Some(cap) = find_capture(m, idx_property_name) {
+                if !is_indexable_property_name(&cap.node) {
+                    continue;
+                }
                 let name = node_text(content, &cap.node);
                 let line = node_line(&cap.node);
                 symbols.push(ParsedSymbol {
                     name: name.to_string(),
                     kind: SymbolKind::Property,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -147,14 +160,169 @@ impl LanguageParser for KotlinParser {
                     name: name.to_string(),
                     kind: SymbolKind::TypeAlias,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
         }
 
         Ok(symbols)
+    }
+
+    fn extract_refs_for_lang(
+        &self,
+        content: &str,
+        _defined: &[ParsedSymbol],
+        _file_type: FileType,
+    ) -> Result<Vec<ParsedRef>> {
+        let tree = parse_kotlin_tree(content)?;
+        let masked = mask_non_reference_ranges(content, tree.root_node());
+        let mut refs = extract_references_for_lang(&masked, &[], Some(FileType::Kotlin))?;
+
+        // Reference matching happens against the masked, byte-for-byte aligned
+        // source, but users should see the original source line as context.
+        let original_lines: Vec<&str> = content.lines().collect();
+        for reference in &mut refs {
+            if let Some(line) = original_lines.get(reference.line.saturating_sub(1)) {
+                reference.context = truncate_context(line.trim());
+            }
+        }
+
+        Ok(refs)
+    }
+}
+
+/// The upstream grammar currently treats `suspend { ... }` as a type modifier
+/// and can recover by wrapping the entire containing declaration in one ERROR
+/// node. Reparse a byte-aligned copy where only that unambiguous stdlib-call
+/// token is made into an ordinary identifier. Keeping byte lengths identical
+/// means query captures still point into the original source.
+fn parse_kotlin_tree(content: &str) -> Result<Tree> {
+    let tree = parse_tree(content, &KT_LANGUAGE)?;
+    if !tree.root_node().has_error() {
+        return Ok(tree);
+    }
+
+    let mut suspend_lambda_ranges = Vec::new();
+    walk_tree_preorder(&tree.root_node(), |node| {
+        if node.kind() == "type_modifiers"
+            && node_text(content, &node).trim() == "suspend"
+            && next_non_whitespace_is(content, node.end_byte(), b'{')
+        {
+            suspend_lambda_ranges.push(node.byte_range());
+        }
+        WalkControl::Continue
+    });
+
+    if suspend_lambda_ranges.is_empty() {
+        return Ok(tree);
+    }
+
+    let mut recovered = content.as_bytes().to_vec();
+    for range in suspend_lambda_ranges {
+        // `susp_nd` is a valid identifier with the same byte length.
+        recovered[range.start + 4] = b'_';
+    }
+    let recovered = std::str::from_utf8(&recovered).map_err(|error| {
+        anyhow!("Kotlin suspend-lambda recovery produced invalid UTF-8: {error}")
+    })?;
+    let recovered_tree = parse_tree(recovered, &KT_LANGUAGE)?;
+    if recovered_tree.root_node().has_error() {
+        return Err(anyhow!(
+            "Kotlin parser could not recover from a suspend-lambda syntax error"
+        ));
+    }
+
+    Ok(recovered_tree)
+}
+
+fn next_non_whitespace_is(content: &str, offset: usize, expected: u8) -> bool {
+    content.as_bytes()[offset..]
+        .iter()
+        .find(|byte| !byte.is_ascii_whitespace())
+        .is_some_and(|byte| *byte == expected)
+}
+
+fn is_indexable_property_name(name: &Node<'_>) -> bool {
+    let Some(variable) = name.parent() else {
+        return false;
+    };
+    let Some(property) = variable
+        .parent()
+        .filter(|node| node.kind() == "property_declaration")
+    else {
+        return false;
+    };
+
+    property.parent().is_some_and(|parent| {
+        matches!(
+            parent.kind(),
+            "source_file" | "class_body" | "enum_class_body"
+        )
+    })
+}
+
+/// Replace non-code and declaration-name bytes with spaces while preserving
+/// line/byte offsets. String interpolation nodes are copied back verbatim so
+/// executable `${...}` and `$name` expressions remain visible to extraction.
+fn mask_non_reference_ranges(content: &str, root: Node<'_>) -> String {
+    let original = content.as_bytes();
+    let mut masked = original.to_vec();
+
+    walk_tree_preorder(&root, |node| match node.kind() {
+        "line_comment" | "block_comment" | "character_literal" | "package_header" | "import" => {
+            mask_range(&mut masked, node.byte_range());
+            WalkControl::SkipChildren
+        }
+        "string_literal" | "multiline_string_literal" => {
+            mask_range(&mut masked, node.byte_range());
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if child.kind() == "interpolation" {
+                    masked[child.byte_range()].copy_from_slice(&original[child.byte_range()]);
+                }
+            }
+            // Keep walking interpolation descendants: nested strings/comments
+            // inside `${...}` still need their own masking pass.
+            WalkControl::Continue
+        }
+        "identifier" if is_declaration_identifier(&node) => {
+            mask_range(&mut masked, node.byte_range());
+            WalkControl::SkipChildren
+        }
+        _ => WalkControl::Continue,
+    });
+
+    // Masking only replaces bytes with ASCII spaces, so valid UTF-8 remains valid.
+    String::from_utf8(masked).expect("Kotlin reference mask must preserve UTF-8")
+}
+
+fn mask_range(bytes: &mut [u8], range: std::ops::Range<usize>) {
+    for byte in &mut bytes[range] {
+        if *byte != b'\n' {
+            *byte = b' ';
+        }
+    }
+}
+
+fn is_declaration_identifier(node: &Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+
+    match parent.kind() {
+        "class_declaration" | "object_declaration" | "function_declaration" => parent
+            .child_by_field_name("name")
+            .is_some_and(|name| name.id() == node.id()),
+        "type_alias" => parent
+            .child_by_field_name("type")
+            .is_some_and(|name| name.id() == node.id()),
+        // These grammar nodes keep the declared name as a direct identifier;
+        // identifiers inside their nested type nodes remain references.
+        "variable_declaration" | "parameter" | "class_parameter" => true,
+        _ => false,
     }
 }
 
@@ -295,11 +463,18 @@ fn extract_type_name_from_specifier(
     None
 }
 
-/// Extract the first identifier (type name) from a node by walking its descendants.
-/// Used for constructor_invocation and other compound type nodes.
+/// Extract the type name from a compound type node (constructor_invocation,
+/// nullable_type, ...). Prefers the first nested user_type so qualified
+/// supertypes resolve to their simple name; falls back to the first identifier.
 fn extract_type_name_from_node(node: &tree_sitter::Node, content: &str) -> Option<String> {
     let mut found = None;
     walk_tree_preorder(node, |child| {
+        if child.kind() == "user_type" {
+            found = extract_user_type_name(&child, content);
+            if found.is_some() {
+                return WalkControl::Stop;
+            }
+        }
         if child.kind() == "identifier" {
             found = Some(node_text(content, &child).to_string());
             WalkControl::Stop
@@ -310,16 +485,15 @@ fn extract_type_name_from_node(node: &tree_sitter::Node, content: &str) -> Optio
     found
 }
 
-/// Extract the name from a user_type node.
-/// user_type -> identifier (possibly with type_arguments)
+/// Extract the simple name from a user_type node.
+/// A qualified type (`ru.yandex.Base<T>`) is a flat list of identifiers, so the
+/// last direct identifier is the type itself; type_arguments are not direct children.
 fn extract_user_type_name(node: &tree_sitter::Node, content: &str) -> Option<String> {
     let mut walker = node.walk();
-    for child in node.children(&mut walker) {
-        if child.kind() == "identifier" {
-            return Some(node_text(content, &child).to_string());
-        }
-    }
-    None
+    node.children(&mut walker)
+        .filter(|child| child.kind() == "identifier")
+        .last()
+        .map(|child| node_text(content, &child).to_string())
 }
 
 /// Find a capture by index in a match
@@ -334,6 +508,132 @@ fn find_capture<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qualified_supertypes_resolve_to_simple_names() {
+        let content = "abstract class Base<V : View>(c: Class<V>) : ru.yandex.common.Base<V>(c), a.b.Listener<V>, Plain\n";
+        let symbols = KOTLIN_PARSER.parse_symbols(content).unwrap();
+        let base = symbols.iter().find(|s| s.name == "Base").unwrap();
+        assert_eq!(
+            base.parents,
+            [
+                ("Base".to_string(), "extends".to_string()),
+                ("Listener".to_string(), "implements".to_string()),
+                ("Plain".to_string(), "implements".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn suspend_lambda_recovery_preserves_enclosing_and_later_declarations() {
+        let content = r#"package t
+
+interface IThing2 : IFeature {
+    suspend fun isEnabled(): Boolean
+
+    class Impl : IThing2 {
+        override suspend fun isEnabled(): Boolean {
+            val default = suspend { true }
+            return default()
+        }
+    }
+}
+
+interface LaterFeature
+
+class LaterImpl : LaterFeature
+"#;
+        let tree = parse_kotlin_tree(content).unwrap();
+        assert!(!tree.root_node().has_error());
+
+        let symbols = KOTLIN_PARSER.parse_symbols(content).unwrap();
+        for (name, kind) in [
+            ("IThing2", SymbolKind::Interface),
+            ("Impl", SymbolKind::Class),
+            ("LaterFeature", SymbolKind::Interface),
+            ("LaterImpl", SymbolKind::Class),
+        ] {
+            assert!(
+                symbols
+                    .iter()
+                    .any(|symbol| symbol.name == name && symbol.kind == kind),
+                "missing {kind:?} {name}: {symbols:?}"
+            );
+        }
+        assert_eq!(
+            symbols
+                .iter()
+                .filter(|symbol| symbol.name == "isEnabled")
+                .count(),
+            2
+        );
+        assert!(
+            !symbols.iter().any(|symbol| symbol.name == "default"),
+            "local val leaked into symbols: {symbols:?}"
+        );
+        let thing = symbols
+            .iter()
+            .find(|symbol| symbol.name == "IThing2")
+            .unwrap();
+        assert!(thing
+            .parents
+            .iter()
+            .any(|(parent, kind)| parent == "IFeature" && kind == "extends"));
+    }
+
+    #[test]
+    fn references_exclude_only_declaration_identifiers() {
+        let content = r#"class Engine(val id: String)
+
+fun buildDefaultEngine(): Engine = Engine(id = "default")
+fun recurse(): Engine { recurse(); return Engine("same-line") }
+"#;
+        let (symbols, refs) =
+            crate::parsers::parse_file_symbols(content, FileType::Kotlin).unwrap();
+        assert!(symbols.iter().any(|symbol| symbol.name == "Engine"));
+
+        let engine_lines: Vec<usize> = refs
+            .iter()
+            .filter(|reference| reference.name == "Engine")
+            .map(|reference| reference.line)
+            .collect();
+        assert_eq!(engine_lines, vec![3, 3, 4, 4]);
+        assert!(refs
+            .iter()
+            .any(|reference| reference.name == "recurse" && reference.line == 4));
+        assert!(!refs
+            .iter()
+            .any(|reference| reference.name == "Engine" && reference.line == 1));
+    }
+
+    #[test]
+    fn references_ignore_literals_and_comments_but_keep_interpolation_code() {
+        let content = r#"class Widget
+
+fun uses(widget: Widget) {
+    Widget() // Widget in an inline comment
+    val regular = "Widget ${Widget("Widget")} $widget"
+    val raw = """Widget
+        ${Widget()}
+        Widget"""
+    val character = 'W'
+    /* Widget in a block comment */
+    /** Widget in KDoc */
+}
+"#;
+        let (_, refs) = crate::parsers::parse_file_symbols(content, FileType::Kotlin).unwrap();
+        let widget_lines: Vec<usize> = refs
+            .iter()
+            .filter(|reference| reference.name == "Widget")
+            .map(|reference| reference.line)
+            .collect();
+
+        assert_eq!(widget_lines, vec![3, 4, 5, 7]);
+        assert!(refs
+            .iter()
+            .filter(|reference| reference.line == 5 || reference.line == 7)
+            .all(|reference| reference.context.contains("Widget")));
+    }
 
     #[test]
     fn test_parse_class() {
