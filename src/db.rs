@@ -3010,6 +3010,8 @@ fn sync_regular_file(path: &Path) -> Result<()> {
     );
     OpenOptions::new()
         .read(true)
+        // Windows FlushFileBuffers requires a handle with write access.
+        .write(cfg!(windows))
         .open(path)
         .and_then(|file| file.sync_all())
         .with_context(|| format!("failed to sync index file {}", path.display()))
